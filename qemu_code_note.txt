@@ -1,0 +1,312 @@
+QEMU code note
+
+QMP: QEMU Machine Protocol
+
+【ram_block_add】
+不是预先分配好的地址空间的情况下，调用关系：qemu_ram_alloc_internal --> ram_block_add --> phys_mem_alloc(=qemu_anon_ram_alloc, 此函数就是分配空间) --> qemu_ram_mmap
+qemu_ram_alloc_internal 函数结构略有点乱，做的事情是malloc 一个 RAMBlock 结构，并初始化一部分 field (RAMBlock 的 used_length，max_length 都是经过host page size 对齐的)，然后将其加入 ram_list 列表
+qemu_anon_ram_alloc 函数为了使分配得内存的起始地址和长度都是对齐的，煞费苦心的做了2次 mmap。
+
+add 的过程如注释所说，按照每个 RAMBLock 的大小，从大到小排列在 ram_list 列表中，但是注意，仅仅是按照size大小顺序排序，每个 block 的 offset 却没有这种大小顺序，
+offset 隐含了一个地址空间，这个地址空间的含义具体还不明（暂时当作CPU 物理地址空间理解），但是可以用来当作参考标准，来摆放 ram_list 中的 block
+比如 ram_list 可以长成下面的样子
+head --> [offset = 128, size = 16] --> [offset = 64, size = 10] --> [offset = 32, size = 4]
+find_ram_offset 函数遍历 ram_list 中所有的 block 来寻找合适的 offset 放置新的 block，有些小tricks处理可能的这种情况：两个block 之间的gap size 大于新的 RAMBlock size，那就将新 block 放在他们中间。
+
+cpu_physical_memory_set_dirty_range: 存储空间 划分为 pages(4096 bytes per page), 然后 DIRTY_MEMORY_BLOCK_SIZE(256 x 1024 x 8) 个 pages 为一个 block(和上面的block不是一个意思，上面的block是 RAMBlock的简写)。需要结合 dirty_memory_extend 函数一起看。此函数将 指定的 page (start 起 length 个 bit) 置 1
+dirty_memory_extend：每次发现新的存储区域的最后一个字节的地址，大于原有的，就会进来malloc新的bitmap，有个小trick：memcpy 的内容其实只是的指针，所以每次新malloc的bitmap部分只是新增加的部分；两步malloc，先分配很小指针空间，然后 bitmap_new 分配大头
+
+typedef struct {
+    struct rcu_head rcu;
+    unsigned long *blocks[]; //等同于二维指针，每个元素是 long 形指针，指向一个 long 数组(malloc出来的，其实不算数组，用“数组”方便后面的表达)，long数组每个bit代表 1 个page，共 DIRTY_MEMORY_BLOCK_SIZE 个 page，所以根据一个long 有多少bit，可以计算出 这个“long数组”需要malloc多少byte
+} DirtyMemoryBlocks;
+
+
+【find_ram_offset】
+ram_list 中的RamBlock是按block size大小，从大到小排列。两个QLIST_FOREACH_RCU的作用是：第一个QLIST_FOREACH_RCU遍历到每一个元素，并存到变量block中，第二个QLIST_FOREACH_RCU是为了找到距离(以地址为单位)第一次遍历得到的block最近的的next_block。也就是说，两次遍历，得到的是地址空间中两个相邻的两个元素。然后在所有两两一对(相邻的)的block中，找到两个block中间gap最小的那一对，也就是将把新加的RamBlock插入在gap最小的这一对中间。
+
+之所以qemu_ram_alloc_internal有size, max_size两个参数，看起来是为了resizeable ram准备的，其他情况二者是相等的。
+
+
+【bitmap_set】
+void bitmap_set(unsigned long *map, long start, long nr)
+
+map 是一个long类型的指针数组。假设包含4个元素，则是4个long 指针，假设在32bit机器上，则是 4 x 4 x 8=128bit，从start bit开始的nr个bit，set为1。 这里面有个小trick，一个long元素中，bit set的顺序是从最低bit到最高bit。
+一个long整数的样子 为 (31)|__|__|__|__|(0)，而不是符合人类阅读习惯的从低(左)到高(右)的增长。还是以4个long元素为例子，单个long整数如前面的图示，4个long在内存中如下：array[0]-->array[3]
+ (31)|__|__|__|__|(0) ,(31)|__|__|__|__|(0) ,(31)|__|__|__|__|(0) ,(31)|__|__|__|__|(0)   -- 逗号用于使图示的整数看得清晰，实际4个long紧密的连在一起，但是bit order是这里的一个关键点。
+
+假设从第35bit开始set 4个bit，则图示为
+(31)|__|__|__|__|(0) ,(31)|__|__|__|_F|(0) ,(31)|__|__|__|__|(0) ,(31)|__|__|__|__|(0)  --注意这个F，就是我们set的4个bit，是从第二个long的最低bit开始的！这就解释了关于之前对bitmap设置的疑惑，就是因为整个128bit，并不是从0-127，从左到右的简单排列！
+
+
+【时钟类型】
+QEMU_CLOCK_REALTIME：最终调用 #if CLOCK_MONOTONIC clock_gettime(CLOCK_MONOTONIC) #else gettimeofday() 。
+
+    CLOCK_MONOTONIC   这个时间表示自epoch以来的时间，以秒和纳秒为单位，这个时间值不会被人为设置系统时间的操作而影响
+    Clock that cannot be set and represents monotonic time since some  unspecified starting point.  This clock is not affected by discontinuous jumps in the system time (e.g., if the
+    system administrator manually changes the  clock), but is affected by the incremental adjustments performed by adjtime(3) and NTP.
+
+QEMU_CLOCK_HOST: 最终调用 gettimeofday()。这个时间表示自epoch以来的时间，以秒和微妙为单位，但这个时间值会被人为设置的系统时间所影响
+
+    get the time as well as a time‐zone. gives the number of seconds and microseconds since the  Epoch. The  time  returned  by gettimeofday() is affected by discontinuous jumps
+    in the system time (e.g., if the system administrator manually changes the system time).  If you need  a  mono‐tonically increasing clock, see clock_gettime(2).
+
+QEMU_CLOCK_VIRTUAL: 最终调用 clock_gettime, 返回值是加上一个offset的结果，这个offset是在vm_start()时使用clock_gettime()初始化来的
+
+
+
+【qemu module /object 架构】：(module包含device，machine，还有qapi等)
+
+MODULE_INIT_BLOCK/MACHINE/QAPI/QOM，对应4个TAILQ队列，主要是MACHINE和QOM(设备)。所有的MACHINE/QOM都是TypeInfo数据结构，且有继承关系，每个TypeInfo对应一个class和instance数据结构，class和instance也是有继承关系。main函数执行之前，执行constructor，将所有 TypeInfo 的初始化函数保存各自的TAILQ队列里。main函数通过module_call_init(type) 执行对应TAILQ队列中 TypeInfo 初始化函数，所有这些初始化函数都是通过type_register函数，用TypeInfo数据初始化相应的TypeImpl(惟独未初始化其中的TypeImpl *parent_type 和 ObjectClass *class)，然后保存在全局的 HashTable 中，其 Key/Value 是 TypeImpl name/TypeImpl指针。object_class_get_list(TYPE_MACHINE, false)，此函数将遍历出 HashTable 中所有item(TypeImpl结构)，调用 type_initialize 继续初始化其之前未初始化的两个成员: parent_type & class，然后找出(class对应的)TypeImpl的祖先是TYPE_MACHINE，且该Type是非抽象的那些class，将这些class放入一个GSList单链表中待用。
+
+在main函数执行之前执行constructor函数，通过machine_init/type_init等函数将各类module(4种，MODULE_INIT_BLOCK/MACHINE/QAPI/QOM，每一个对应一个TAILQ数据结构)的实例的初始化函数存储在对应module type的TAILQ数据结构中，在main函数中通过调用module_call_init(type)，执行之前存好的初始化函数，初始化对应type的module的所有实例，所有的实例的该初始化函数的主要工作都是通过type_register函数，将该module实例的TypeInfo结构转为TypeImpl，并保存在 HashTable 中(key/value是 TypeImpl->name/TypeImpl指针本身)。函数type_new完成数据结构typeinfo到TypeImpl的转换，此函数中有两个TypeImpl的成员变量没有初始化： TypeImpl *parent_type 和 ObjectClass *class，此二者在type_initialize中被初始化，该函数主要负责初始化该Type对应的class。
+
+Interface也是一个TypeInfo结构，初始化为TypeImpl。假设有如下继承关系 A<--B<--C<--D，C的TypeInfo结构里指明的interface类型是 TYPE_HOTPLUG_HANDLER，注意！这个只是指明了C的interface的类型！实际的interface的初始化（在 type_initialize_interface） 中，是现场创建了一个新类型的TypeInfo，其name是interface对应的device的名字和interface type 名字组合在一起，比如TYPE_PC_MACHINE有TYPE_HOTPLUG_HANDLER的interface，初始化时候创建的新类型interface的TypeInfo名字是TYPE_PC_MACHINE:: TYPE_HOTPLUG_HANDLER，新类型interface的TypeImpl的class是TYPE_HOTPLUG_HANDLER对应的class，其interface基类InterfaceClass的成员：concrete_class指的是该interface所依附的设备TypeImpl，interface_type则顾名思义(本例中是TYPE_HOTPLUG_HANDLER对应的TypeImpl)
+
+2015-12-21: 每个TypeInfo(TypeImpl) 对应一个class 和 instance. class 和 instance各自的继承关系和TypeInfo一致。初始化class时，每个class独占一份内存数据结构(type_initialize如何处都会g_malloc)，并copy其parent class到自己。TypeImpl.class_base_init函数，如其描述，初始化某class之前，用来修改其copy parent class来的内容。正因为每一个class都是一个独立(指内存)的数据结构，所以在type_initialize中，需要parent = type_get_parent(parent);意思是对每一个class都要修改一遍，才能保证一致。
+
+在QOM模型中看起来每一个object都会作为一个child property，attach到i某个parent object上。通过-device/device_add 添加的设备（入口是qdev_device_add()），根据是否有id分别attach到 container object: peripheral/peripheral-anon。
+
+[QOM-tree] 是一个child property的关系链。Tips：一个property有若干meta data：name, type, value. 一个Object的property存储在Object,properties中，以hash table形式，其key/value 是 name/ObjectProperty *prop
+
+最顶层的object是一个type = “container”类型的Object，由object_get_root()创建，没有名字。然后它add一个name = “machine”的child property，在vl.c: line 4xxx:  object_property_add_child(object_get_root(), "machine", OBJECT(current_machine), &error_abort);
+
+qdev_get_machine()是用来获得这个name = "machine"的child property的Object(current_machine)。current_machine这个Object下面是有很多很多child property的，看下有多少地方调用qdev_get_machine()即知。“machine”下面比较重要的几个child property是："/unattached", "/peripheral", "/peripheral-anon"。“unattached” 是一个"container"类型的Object，所有的on-board设备Object(也即那些不是通过-device/device_add来的设备)均是 “unattached” 的child property, 看device_set_realized()。 没有owner的MemoryRegion也被当作"unattached"的child property。所有on-board device（也即：不是通过-device/device_add创建）都是unattached的child property。
+
+qdev_get_peripheral(), qdev_get_peripheral_anon 用来创建上一段中所说的另两个child property，这两个Object都是"container"类型的。call chain：main()->qdev_machine_init()->qdev_get_peripheral()/qdev_get_peripheral_anon()。所有通过device_add的设备，根据设备是否设置了id，被add为"/peripheral"或"/peripheral-anon"的child propery，参见qdev_device_add()
+
+【关于设备(TYPE_DEVICE)的初始化】首先，只有非抽象的Instance才会真正实例化，即-device/device_add的driver这种。class的初始化和instance不同(回忆下：typeImpl对应一个class和instance，这三者都有各自的继承关系)，class的初始化是每个typeImpl对应一份class数据的内存空间，继承关系体现在，sub-class会copy其parent-class的内容(然后也许会修改parent-class在自己内存空间的内容)。而instance的初始化则不然，每个TypeImpl对应的Instance只有一份内存，然后instance继承关系上从头到尾调用instance_init函数来初始化这部分数据，各自初始化各自的部分，sub-instance可能会修改parent-instance中的内容。
+
+【关于设备(TYPE_DEVICE)的realize】都是通过object_property_set_bool(OBJECT(dev), true, "realized", &err)，然后最终调用了 device_set_realized 函数。 "realized"这个property是在DeviceState的.instance_init函数device_initfn中添加的。其函数callstack是： device_set_realized-->DeviceClass.realize-->HotplugHandlerClass.plug
+关于device的函数： device_help_func 用于打印 -device的help信息，还有driver的help信息; device_init_func 用于添加并初始化device
+
+
+从某种角度来看，设备分两种：
+1. on-board device，随machine init而创建。通常使用qdev_create/qdev_try_create
+2. pluggable device, 也即通过-device/device_add 创建的的设备，可cold/hot plug
+-device 初始化流程(PCI为例)：device_init_func --> qdev_device_add(找到devcle class，初始化instance, set realized) --> device_set_realized --> DeviceClass.realize()(对PCI来说是pci_qdev_realize) --> PCIDeviceClass.realize()
+【Device的property】：TYPE_DEVICE 的 instance_init函数：device_initfn，会遍历其对应class的继承关系上的每一个class中的property(函数中do...while那部分)，然后批量加到其Object的property list中。也就是说，某个driver对应的object包含了其所有对应parent-class的property，以vfio为例：device_class_init 函数没有指定property，pci_device_class_init函数设置了pci_props，vfio_pci_dev_class_init函数则设置了vfio_pci_dev_properties。另外有一些分散的property添加，比如：object_instance_init 函数添加了type，device_initfn函数加了realized/hotpluggable/hotplugged/parent_bus， vfio_instance_init函数添加了bootindex。device_initfn的主要property添加动作，是自下往上将所有class的preoperty，以“legacy-”前缀添加一遍，然后以原始名字再添加一遍，也就是qdev_property_add_legacy/qdev_property_add_static做的事情。  但是真正显示为device的property还是要经过过滤的，qmp_device_list_properties函数中可以看出，而且，没有set方法的property也不会显示为device所有，最终此函数返回一个device可以显示出的property list，单向链表，后入者在尾部：prop_entry0<--prop_entry1<--prop_entry2<--prop_entry3<--prop_entry4<--prop_list_head(可移动的头)
+
+【关于Machine的初始化】：vl.c: current_machine = MACHINE(object_new(object_class_get_name(OBJECT_CLASS(machine_class)))); 每个instance_init函数为该Object加了一些property，详见：object_instance_init/machine_initfn/pc_machine_initfn。上述部分只是初级的初始化，真正的初始化是main函数的：machine_class->init(current_machine);具体倒Q35来说，init函数是pc_q35_init。其初始化中，pc_q35_init函数中初始化了一个Host bridge设备： Q35PCIHost，q35_host_realize是它的DeviceClass.realize函数
+QEMU支持的两个chipset: 
+    1. Intel Intel 440FX, 代码中缩写为：i440FX, reference: https://en.wikipedia.org/wiki/Intel_440FX
+    2. Q35
+
+【关于Bus】：Bus/Device间的关系：(TYPE_Q35_HOST_DEVICE) Q35PCIHost->parent_bus = main_system_bus。对Q35而言，其Host bridge的realize函数q35_host_realize中可以看出，Q35 Host bridge推出了一条叫“pcie.0”的pcie bus，这应该是PCIe Hierarchy的 root bus
+
+PCIBus.parent_dev: 只有PCI bridge的(PCIBus)sec_bus才有parent_dev = PCI bridge。代码中出现的"root bus"字样，是指由pci host所引出的那条bus，root bus是没有parent_dev的，可以参考pci.0和pcie.0创建过程。
+【pci_expander_bridge】: 从guest OS角度看，pxb设备是挂在pci 0号总线下的一个设备，与Host bridge在一个level上，其引出一条root bus，但与Host bridge属于同一个domain，也就是说bus编号时属于同一个domain。但从QEMU内部设备模型角度看，pxb就是整个层次架构中一个普通的pci桥设备，引出一个secondary bus
+！！【Q35 Bus Device 拓扑】: main_system_bus--> Q35PCIHost(device)-->pcie.0(bus # =0) --> 接了很多PCI compatible 的设备/控制器
+
+
+【关于PCI/PCIe】:
+1. pci_add_capability2： capability的添加形成一个link，添加顺序和link顺序不是一样的，有如下关系(0是config space header中capability prt的值，也是link head)：若添加顺序: 0-->1-->2-->3-->4-->5，则link顺序：0-->5-->4-->3-->2-->1
+2. PCI 和 PCIe 设备添加 capability的函数不同，且内容也有不同，对PCI而言是 pci_add_capability2，添加的capability(从spec推测，包括Power management, MSI/MISX, PCI Express等，其他的应该都是Vendor defined capability)都是属于PCI compatible config space，也就是前256 byte的空间里；PCIe是 pcie_add_capability，添加的是PCIe Extended Capabilities，其offset是在PCI compatible config space之后，即256 - 4095
+3. PCIe 的 slot/chassis/port:
+  a. port:  参考PCIe Spec figure 1-3, figure 7-1, 7-2, chapter 1.4，7.8.6 Link Capabilities Register(port number field). PCIe的port实际是与一个虚拟的PCI-PCI桥关联在一起，所以从数据结构上看， TYPE_PCIE_PORT继承自TYPE_PCI_BRIDGE，且instance中只多了个port number。
+  b. slot:  chassis和slot是两个关系紧密的概念. slot参考PCIe Spec chapter 7.8.2 PCI Express Capabilities Register(Slot Implemented field); 7.8.9 Physical Slot Number field. PCI-to-PCI Bridge Architecture Specification Revision 1.2, chapter 13.1.
+  c. chassis: spec 6.7.17.A Physical Slot Identifier (as defined in PCI Hot-Plug Specification, Revision 1.1, Section 1.5) consists of an optional chassis number and the physical slot number of the slot.
+  d. Physical Slot Number: A designation assigned by the Platform vendor that uniquely identifies a physical slot. For example, in a single-chassis system, it is commonly a slot number. In some multiple-chassis systems, it is a combination of chassis and slot number.
+  chassis是全局的，整个主板上可能只有一到多个chassis(称为single-chassis，multi-chassis)。在qemu代码中，由一个全局变量 chassis 表达(pcie_port.c)，chassis #是整个系统唯一的，默认是0，范围是0-255，在设置这个pci device property时，其值可不连续。当命令行所有PCI slot设备都不指定chassis参数时，所有slot设备默认在一个chassis 0上。
+  简明的说：一个系统中，有一到多个chassis(由chassis #表示,8bit)，每个chassis上可以有多个slot(由slot #表示,5bit)，不同chassis上的slot #可以相同。
+4. pci_bridge.c: 对于PCI-PCI bridge 或者 PCIe port/slot(本质上是个bridge)来说，此文件中的函数是操作bridge的通用函数，可以看到pci_bridge_type_info还是个抽象类型，具体到物理世界来说，有若干个bridge设备继承这个结构。比如有ioh3420 root port, xio3130 upstream port, xio3130 downstream port，他们的.init 函数都会调用pci_bridge_initfn来设置common的部分，每个设备根据其datasheet再设置各自specific的部分。具体的物理bridge设备model除了上述的3个port，还有：DEC 21154 PCI to PCI bridge，Intel i82801 bridge，pbm-bridge(这是sun 的sparc机器上的PCI bridge, pbm = pci bridge module)。可以看一下docs/pci_expander_bridge.txt， PXB，
+
+[PCIe extended configuration space] = 256M, 怎么计算的呢，每个function有4k的configuration space, 每个bus下面最多有，32个device，每个device最多8个function，host bridge下面最多支持256条bus，所以size = 256 bus * 32 device * 8 func * 4k space = 256M
+
+【QEMU Monitor/char/】-mon & -chardev 两个选项一起定义了一个可用的monitor；-monitor是一个定义的快捷方式选项; -qmp是一个定义qmp monitor的快捷方式选项。数据结构关系：struct Monitor 包含 CharDriverState *chr; ReadLineState *rs;(支持readline模式的monitor)。mon_cmd_t *cmd_table;（该monitor支持的所有命令）
+【APIC】：Refer:  https://en.wikipedia.org/wiki/Advanced_Programmable_Interrupt_Controller .  The first dedicated I/O APIC was the Intel 82093AA, which was intended for PIIX3-based systems. 
+
+
+【QEMU build system】
+1. configure 脚本会生成
+        config_host_mak="config-host.mak" 文件
+        config-all-disas.mak文件
+        config_target_mak=$target_dir/config-target.mak 文件(target_dir是CPU型号，比如i386, X86_64)
+        symlink "$source_path/Makefile.target" "$target_dir/Makefile"
+2. Makefile/Makefile.target不是自动生成的(由git log可知)，但在文件首 include 了 config-host.mak, config-all-devices.mak, config-all-disas.mak, rules.mak. Makefile中有规则生成 config-all-devices.mak. Makefile.target被 link 到 target 目录(configure中做的)，作为最后真正编译使用的Makefile
+
+【QEMU timer】
+timer的操作是要以某种clock的时间为基准的，QEMU中定义了4种clock type(QEMUClockType)，每一种clock都可以作为timer操作的foundation。clock下面的timer组织成list形式(QEMUTimerList)，每个clock下面可以有若干个timer list，也组织成list形式，也就是说，clock下面有timerlist的list。
+一个AioContext包含一个timer list group(QEMUTimerListGroup).
+timer_init & timer_new 都是初始化一个timer并将其放入默认的 timer list group main_loop_tlg 中。 aio_timer_init & aio_timer_new 初始化的timer则是放入AioContext中的timer list group中
+
+【QEMU IO框架】
+qemu_init_main_loop: 创建了两个AioContext: qemu_aio_context & iohandler_ctx, 这两个都attach到默认的GMainConext里(也是在主线程里)，都在Main loop的thread里。qemu_set_fd_handler/aio_set_fd_handler是将需要poll的fd存在iohandler_ctx中的node 链表里。而所有的 bottom halves 都存在 qemu_aio_context 下面。 Timer有待分析。。。
+
+aio_set_fd_handler: 将要poll的fd通过此函数，生成一个AioHandler结构的node(其中包含GPollFD)，添加到AioContext中的aio_handlers 链表中，然后将AioHandler.GPollFD的指针通过g_source_add_poll添加到AioContext的GSource中，所以现在，mainloop中的fd是指向AioContext中的GPollFD。然后在glib_pollfds_fill函数中，从GMainContext的所有GSource中，g_main_context_query 出已经ready等待被poll的fd集和，存在全局变量 gpollfds 中，然后qemu_poll_ns函数去poll gpollfds 中的fd们，然后glib_pollfds_poll->g_main_context_check,把poll出来的结果传递给mainloop检查Gsource是否ready被dispatch，是的话那就g_main_context_dispatch->***->aio_ctx_dispatch->aio_dispatch，处理所有bottom halves，fd，(AioContext专属的) timer list中的timer
+glib_pollfds_fill：从默认的GMaintext里面查找ready的fd，填充到数组 gpollfds 中，然后对比Gsource里面得到的timeout与timer list中最早expire的timer的timout值，找到一个最近需要处理的事件的timeout。 其中的do..while循环有巧妙之处，第一次循环时候，g_main_context_query的最后两个入参是NULL和0，导致其返回一个值，告诉我们已经准备好的fd个数，然后第二次循环就利用这个数值来 g_array_set_size，然后再一次g_main_context_query，然后就得到了已经ready等待poll的fd们了.
+
+
+glib函数解释(TBD)
+
+g_main_context_prepare (GMainContext *context, gint *priority);
+
+
+【RCU】
+每一个参与RCU机制的thread通过rcu_register_thread()将自己存到registry的线程list中
+
+
+【pci_default_write_config】：
+此函数用于写pci 设备配置空间的寄存器，其中的for 循环中的下两句略有些技巧。
+for (i = 0; i < l; val >>= 8, ++i) {
+
+    uint8_t wmask = d->wmask[addr + i];
+    uint8_t w1cmask = d->w1cmask[addr + i];
+    //一个寄存器bit的属性是唯一的，不会既是W，又是W1C
+
+    assert(!(wmask & w1cmask));
+
+    //前面的&，用来清0可写的bit；后面的&用于取出一个wmask中属性是可写的bit的值，二者 | 一下，就把 bit value 写入属性为可写的bit中了
+
+    d->config[addr + i] = (d->config[addr + i] & ~wmask) | (val & wmask); 
+    //  先&再~(取反)，就把属性为w1c的bit 置为0了   
+
+    d->config[addr + i] &= ~(val & w1cmask); /* W1C: Write 1 to Clear. */
+}
+整个for循环的意思是：写寄存器时，以8 bit为单位。这里的重点是：用户赋予这8bit 寄存器的值里，有的bit是W(可写)的，有的W1C的(写1清零)。
+而通过这两句，则分别照顾到了该 8 bit 中 的 W bit 和 W1C bit。
+
+
+【vfio_pci_read_config】
+vfio pci 设备中的config space 有2种：物理设备上的真实config space，通过fd读写； vfio pci也提供了一套设备config space, 存储在数据结构PCIDevice下面，这个config space是从物理设备上的内容初始化而来(读fd),然后就可以对软件的config space任性做改变了。
+Guest看到的设备config space中某个寄存器的内容，既可以是真实设备上来的(读fd)，也可以是vfio pci 模拟的，代码中通过emulated_config_bits来控制。
+emulated_config_bits 作为 config space中所有register bit的flag，1表示这个寄存器值由vfio-pci模拟，0表示来自物理设备
+根据需要，guest 读设备的config space时，根据emulated_config_bits来判断是返回真实设备上的，还是vfio pci 模拟出来的 config space，这些trick都在此函数中完成
+uint32_t vfio_pci_read_config(PCIDevice *pdev, uint32_t addr, int len)
+{//实际上 len 参数最多只能是4 byte，但没有对此入参做判断，从下面代码可以看出这个限制
+    ........
+    //用emulated_config_bits来标记(bit为1时)guest读取的config space哪儿些bit是vfio pci 模拟的。
+
+    memcpy(&emu_bits, vdev->emulated_config_bits + addr, len);//提取flag。下面将用来做mask
+    emu_bits = le32_to_cpu(emu_bits);
+    if (emu_bits) { //非0，说明4byte中，有bit是emulated的，则读取它vfio-pci emulated config space
+        emu_val = pci_default_read_config(pdev, addr, len);
+
+    }
+    if (~emu_bits & (0xffffffffU >> (32 - len * 8))) { //这是一个技巧，判断一下len长度的寄存器bit中，是否还有来自物理设备的，有，则通过读取fd来获得。32代表bit个数，所以入参len最多只能是4 byte
+        ssize_t ret;
+        ret = pread(vdev->vbasedev.fd, &phys_val, len, vdev->config_offset + addr);
+        ....
+        phys_val = le32_to_cpu(phys_val);
+    }
+    val = (emu_val & emu_bits) | (phys_val & ~emu_bits); //len x 8 个 register bit，通过这个技巧
+    return val;
+
+}
+
+
+下图中，每个TYPE_xxx 对应一个TypeInfo/TypeImpl(根据抽象与否可以分未：抽象/非抽象 2大类，非抽象的可以对应到现实设备)，注册到Module这个框架里时，又被分为MODULE_INIT_BLOCK/MACHINE/QAPI/QOM 4种，主要是MACHINE和QOM(对应设备)。
+每个 TypeInfo/TypeImpl 结构对应一个Class和Instance类型，有父子关系的TypeImpl中的class/instance也是有继承关系的，class的根是ObjectClass, 也即所有class都继承自ObjcectClass；Instance的根是Object，也即所有instance都继承自Object。
+
+Module 继承关系(TypeInfo/TypeImpl)如下图，除了TYPE_MACHINE下的叶子节点，其他(包括根，TYPE_OBJECT)都放在QOM qeueu里
+
+
+                                                           |<--BluhBluh
+
+                                                           |<--TYPE_IDE_BUS 
+
+                                                           |<--TYPE_SCSI_BUS
+                             |<-- TYPE_BUS <--|<-- TYPE_PCI_BUS<--TYPE_PCIE_BUS                         
+                             |                            |<--TYPE_SYSTEM_BUS: main_system_bus
+                             |<--TYPE_MEMORY_REGION
+                             |
+                             |<--"container"(container.c)
+
+                             |                                   |<--MIPS/ARM/PPC/SPARC等其他ISA(指令集架构)的机器   //每一种具体类型的MACHINE都是放在MACHINE qeueu里
+                             |                                   |
+TYPE_OBJECT <--|<-- TYPE_MACHINE<--|<--TYPE_PC_MACHINE(QOM queue, PC专指X86架构) <--  pc-q35-2.4-machine/ pc-i440fx-2.4-machine    //TYPE_PC_MACHINE的后代们都放在MACHINE queue里
+
+                            |
+                            |<-- TYPE_DEVICE <--|<--TYPE_PCI_DEVICE <--|<-- TYPE_PCI_BRIDGE <--|<-- TYPE_PCIE_PORT <--|<-- TYPE_PCIE_SLOT <--|<-- "ioh3420"
+                            |                                  |                                       |                                          |                                       |                                       |<-- xio3130-downstream
+                            |                                  |                                       |                                          |                                       |<-- x3130-upstream
+                            |                                  |                                       |                                          |                                       
+
+                            |                                  |                                       |                                          |<-- TYPE_PCI_BRIDGE_DEV <-- TYPE_PCI_BRIDGE_SEAT_DEV -- Refer: docs/pci_expander_bridge.txt
+
+                            |                                  |                                       |                                          |<-- "pbm-bridge"                    --\  (SUN Sparc specific)
+
+                            |                                  |                                       |                                          |<-- "dec-21154-p2p-bridge"     -- 这三个是物理世界中真实的PCI bridge设备
+
+                            |                                  |                                       |                                          |<-- "i82801b11-bridge"        --/  (Intel`s)
+
+                            |                                  |                                       |                                          
+
+                            |                                  |                                       |<--TYPE_MCH_PCI_DEVICE
+                            |                                  |                                       |<--TYPE_I440FX_PCI_DEVICE
+                            |                                  |                                       |<-- TYPE_PXB_DEVICE
+
+                            |                                  |                                       
+
+                            |                                  |<-- TYPE_CPU <--|<--TYPE_X86_CPU<--host-i386-cpu/host-x86_64-cpu
+                            |                                  |                            |<--ARM/ALPHA/CRIS/M68K 等其他CPU <--各cpu类型下还有子类型
+                            |                                  |                            |<--TYPE_MICROBLAZE_CPU
+                            |                                  |
+
+                            |                                  |<-- TYPE_SYS_BUS_DEVICE <--|<-- TYPE_PCI_HOST_BRIDGE <--|<-- TYPE_PCIE_HOST_BRIDGE <-- TYPE_Q35_HOST_DEVICE                           
+                            |                                  |                                                  |                                                     |<-- TYPE_I440FX_PCI_HOST_BRIDGE
+                            |                                  |                                                  |                                                     |<-- TYPE_PXB_HOST
+
+                            |                                  |                                                  |                                                     
+
+                            |                                  |                                                  |<-- TYPE_IOAPIC_COMMON <--|<-- "kvm-ioapic"
+
+                            |                                  |                                                                                                      |<-- "ioapic"
+
+                            |                                  |<-- TYPE_IDE_DEVICE
+                            |                                  |
+                            |                                  |<-- TYPE_VIO_SPAPR_DEVICE <-- TYPE_VIO_SPAPR_VTY_DEVICE
+
+                            |                                  |
+
+                            |                                  |<-- TYPE_APIC_COMMON <--|<-- "kvm-apic"
+
+                            |                                  |                                               |<-- "xen-apic"
+
+                            |                                  |                                               |<-- "apic"
+
+                            |                                  |
+
+                            | interface看起来继承关系很简单，如下图
+(ObjectClass) <---|----- (InterfaceClass) <------- (HotplugHandlerClass)
+
+                            |<-- TYPE_INTERFACE<--|<--TYPE_HOTPLUG_HANDLER   //这些叶子节点代表的类型算是基类型
+                            |                                       |<--TYPE_ACPI_DEVICE_IF (AcpiDeviceIfClass)
+
+                            |                                       |<--TYPE_TEST_IF
+                            |                                       |<--TYPE_FW_PATH_PROVIDER
+                            |                                       |<--bluh...
+                            |
+                            |     Accelerator 继承关系
+(ObjectClass) <---|-- (AccelClass) <------- (NULL，三个Accel都没有自己的class)
+                            |<-- TYPE_ACCEL<--|<--TYPE_TCG_ACCEL
+                                                            |<--TYPE_KVM_ACCEL
+
+                                                            |<--TYPE_XEN_ACCEL
+
+
+struct InterfaceClass
+{
+    ObjectClass parent_class;
+    /*< private >*/
+    ObjectClass *concrete_class; //指此interface实际附着的设备TypeImpl对应的class
+    Type interface_type; //看起来此变量指的是上面interface的基本类型的TypeImpl，即如TYPE_HOTPLUG_HANDLER，TYPE_ACPI_DEVICE_IF之类
+};
+
+sub-TypeImpl的interface是包含其parent TypeImpl的interface的，sub-TypeImpl在其parent TypeImpl->interface的基础上有自己的interface
+
+
+
+优化 pci_find_capability_at_offset 为inline？
+
+pcie_aer_msg
+
+
+machine初始化分析，以q35-2.5为例：
+
+
+DEFINE_Q35_MACHINE(v2_5, "pc-q35-2.5", NULL, pc_q35_2_5_machine_options);
+
+
+bug:
+1. object_initialize_with_type: g_assert(size >= type->instance_size); 冗余
