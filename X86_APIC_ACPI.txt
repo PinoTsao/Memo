@@ -1,0 +1,23 @@
+X86 APIC ACPI
+
+5f3b1a8b6737b09ce5df4ec9fad4ad271aecb5fb   替换了 LAPIC_ADDR_OVR
+
+tips:
+1. kernel 代码中看到 bios EBDA 地址是一个常数 0x40E, why? 来自于逻辑地址 40:0E. 参考1: http://stanislavs.org/helppc/ebda.html; 参考2: ACPI spec 5.2.5.1
+   EBDA is located in highest memory just under 640K on PS/2, word at BIOS Data Area 40:0E is segment address of EBDA. 也就是说, BDA 的地址 40:0E 处的2个byte 存放的是 EBDA 的 segment address. 怪不得代码中有 << 4 的操作.
+   这些内容帮助理解 acpi_find_root_pointer()
+
+trivial:
+1. arch/x86/kernel/cpu/cpu.h:  L11 缩进问题
+2. acpi_parse_entries_array: 入参 id 的冗余 优化
+3. tbutils.c : 函数注释不一致
+4.acpi_table_parse_madt 优化使用, 并且加注释. 函数返回值为找到的entry的数目
+
+Q：每个cpu上有一个local APIC，每个local APIC都有一组寄存器，是否是有多个set的寄存器，但是APIC寄存器的地址却是唯一的，这是为什么？
+A：1-23推测：在硬件上，local APIC的寄存器是per local APIC的，也就是说每个local apic 一套，但是这部分寄存器，对于每一个cpu来说，它的地址是相同的，也就是说，对于某寄存器A，每个cpu访问的地址都是 addr_A, 但是对应实际的物理存储区域，是不同的？？？
+      准备的参考：Volume 3, chapter 10.4.1: In MP system configurations, the APIC registers for Intel 64 or IA-32 processors on the system bus are initially mapped to the same 4-KByte region of the physical address space. Software has the option of changing initial mapping to a different 4-KByte region for all the local APICs or of mapping the APIC registers for each local APIC to its own 4-KByte region.
+
+Q: x86 的 CR4.PAE bit 开启后，物理地址扩展到大于32 bit，但具体是多少bit？ 在 Volume 3A 中的 chaper 4 paging 中，看到有说 40 bit, 还有 52 bit，What's the rule?
+A: 参考 Volume 3A, 4.1.4。具体物理地址多少bit，可能是 cpu-specific 的，但在每个 paging mode 的情况下，有上限
+• CPUID.80000008H:EAX[7:0] reports the physical-address width supported by the processor. (For processors that do not support CPUID function 80000008H, the width is generally 36 if CPUID.01H:EDX.PAE [bit 6] = 1 and 32 otherwise.) This width is referred to as MAXPHYADDR. MAXPHYADDR is at most 52.
+• CPUID.80000008H:EAX[15:8] reports the linear-address width supported by the processor. Generally, this value is 48 if CPUID.80000001H:EDX.LM [bit 29] = 1 and 32 otherwise. (Processors that do not support CPUID function 80000008H, support a linear-address width of 32.)

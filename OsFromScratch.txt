@@ -1,0 +1,28 @@
+OS From Scratch/Orange OS
+
+chapter1 & 3的示例，关于在real mode中初始化sgement descriptor的疑惑
+        ; 初始化数据段描述符
+        xor     eax, eax 
+        mov     ax, ds
+        shl     eax, 4
+        add     eax, LABEL_DATA
+        mov     word [LABEL_DESC_DATA + 2], ax
+        shr     eax, 16
+        mov     byte [LABEL_DESC_DATA + 4], al
+        mov     byte [LABEL_DESC_DATA + 7], ah
+
+上面这段的作用是：确定LABEL_DATA的线形地址，然后初始化其对应的segment descriptor。
+*org所指的起始位置，是指代码在所属代码段中的起始位置*
+示例的代码是数据和代码混合在一个binary文件中。当该可执行程序(无论是作为bootsector，还是dos下的.com文件[1])被加载执行时，加载进meory时，其cs寄存器是一个确定的值(bootsector是0，dos下的com文件是dos分配好的一个64k空间的起地址)。
+示例代码开始几句将其余的段寄存器都初始化和cs一样的值，有一种适用flat memory mode的意思。示例代码无论开头是否适用org伪指领，LABEL_DATA的地址无论是多少
+
+[1]http://blog.csdn.net/lophyxp/article/details/8426486
+
+chapter 6-d
+kernel.asm: hwint00中，离开内核栈后做的如下操作
+         mov     esp, [p_proc_ready]     ; 离开内核栈
+         lldt    [esp + P_LDT_SEL]
+         lea     eax, [esp + P_STACKTOP]
+         mov     dword [tss + TSS3_S_SP0], eax
+
+这是为了回到被中断进程做的准备，应该包括哪儿些呢，如上面4条指令所示，进程的ltdr应该准备好；然后进程的tss的esp0，其意思是，当该进程被中断，跳转到中断程序后，esp应该指向进程结构体proc的恰当位置，以便于保存该进程的上下文(寄存器内容)，看hwint00中断处理函数的开头部分就知道。保存好了后就可以切换到内核栈了，就可以做一些更复杂的操作
