@@ -1,8 +1,7 @@
-OS From Scratch/Orange OS
+Q1. 关于 chapter 3 下的示例在 real mode 中初始化 protect mode 下的 sgement descriptor 的 memo
 
-chapter1 & 3的示例，关于在real mode中初始化sgement descriptor的疑惑
         ; 初始化数据段描述符
-        xor     eax, eax 
+        xor     eax, eax ; 清零
         mov     ax, ds
         shl     eax, 4
         add     eax, LABEL_DATA
@@ -11,10 +10,11 @@ chapter1 & 3的示例，关于在real mode中初始化sgement descriptor的疑�
         mov     byte [LABEL_DESC_DATA + 4], al
         mov     byte [LABEL_DESC_DATA + 7], ah
 
-上面这段的作用是：确定LABEL_DATA的线形地址，然后初始化其对应的segment descriptor。
-*org所指的起始位置，是指代码在所属代码段中的起始位置*
-示例的代码是数据和代码混合在一个binary文件中。当该可执行程序(无论是作为bootsector，还是dos下的.com文件[1])被加载执行时，加载进meory时，其cs寄存器是一个确定的值(bootsector是0，dos下的com文件是dos分配好的一个64k空间的起地址)。
-示例代码开始几句将其余的段寄存器都初始化和cs一样的值，有一种适用flat memory mode的意思。示例代码无论开头是否适用org伪指领，LABEL_DATA的地址无论是多少
+上面这段的作用是：确定 LABEL_DATA 的线形地址，然后初始化其对应的 segment descriptor 中的 base address field。
+示例的代码是数据和代码混合在一个 raw binary 文件中。无论是作为 bootsector，还是 dos 下的 .com 文件[1],当该可执行程序被加载进 ram 执行时，可以知道，加载后其cs寄存器是一个确定的值(bootsector 是 0，dos下如何确认这个值还不清楚)。
+第三章下的示例代码一般开始几句将其余的段寄存器都初始化和cs一样的值，有一种适用 flat memory mode 的意思。
+
+real mode 下的内存管理很简单，每个 segment 的 size 都是 64k。无论是作为 boot sector，还是 dos 下的 .com 可执行文件(dos 是 single-user, single-tasking 的操作系统，所以每一个 .com 都是从相同的地址 0100h 开始执行)，被 load 到 ram 后，其 cs 是确定的，所以这个程序中看到的地址都是这个确定的 segment 中的 offset. 所以，汇编程序中的 Label 是距离 segment 起始位置的 offset，一般 segment 的起始地址都是0，但也可以通过 org 伪指令把第一条程序指令放在想要的地方，label 的值也就相应的加上这个 offset. 
 
 [1]http://blog.csdn.net/lophyxp/article/details/8426486
 
