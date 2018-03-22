@@ -1,0 +1,90 @@
+AER code note
+
+注意：
+1. AER驱动收到中断后，会判断 error 是 correctable 还是 uncorrectable.
+   因为对二者处理不同。 Correctable error 只是 clear 对应的 status 寄存器；
+   uncorrectable error, 会做recovery，重点是这个recovery包括什么？做的内容都在 do_recovery 函数中，
+   其中包括reset link，也就是做 bus reset(设置 secondary bus reset 的 bit)，Guest 和 Host 的 aer 驱动会对
+   都会走一遍 do_recovery。 下面的笔记都是针对 uncorrectable error 的处理流程
+
+
+1. AER 在 Host 上 kernel 代码流程：aer-inject 工具需要aer-inject驱动配合一起工作，很不幸，两个名字一样。
+   通过此工具inject的错误并没有真正放在设备的aer寄存器中，而是保存在该驱动内部的aer_error list中。函数调用关系如下
+    aer_inject_write
+		aer_inject //这里只是把注入的错误信息保存到内部aer_error list中，并没写入到对应的设备中，但给pci bus 设置了pci_ops_aer，其中有读写config space的函数
+			aer_irq //PCI Express AER Driver提供的函数，专门处理root port发送的aer中断。从root port中读aer的 root status & source id 寄存器，保存在内部数据结构中 e_sources 中，等待在aer_isr中处理
+				schedule_work(&rpc->dpc_handler); //rpc 表示 root port control，该数据结构在aer driver加载时初始化完成。dpc_handler = aer_isr
+					aer_isr //aer真正的处理函数。遍历e_sources得到一个aer错误，进入下面的函数处理
+						aer_isr_one_error
+							aer_process_err_devices
+								aer_print_error
+								handle_error_source
+								    if (correctable err)
+									    清除其status寄存器即可
+									else //是uncorrectable err，这是需要做recovery的
+									    do_recovery
+									
+2. host 上被vfio接管的设备，在被注入aer时，会通知其用户态驱动，也就是qemu中的vfio设备，此动作在kernel vfio驱动的操作调用关系：
+	do_recovery
+		broadcast_error_message(dev, state, "error_detected", report_error_detected);
+			report_error_detected
+				vfio_pci_aer_err_detected
+					eventfd_signal(vdev->err_trigger, 1);
+	
+	qemu中对应的代码：
+	    注册err handler： vfio_register_err_notifier
+		接收kernel 的err notify: vfio_err_notifier_handler. 在这函数中做vfio emulated device应该做的事情：将aer错误信息，以与硬件处理相同的逻辑传递给root port，并发送中断给guest处理
+		
+3. Guest 中 收到 reset 的请求有下面2种情况。如果 AER 是 uncorrectable error, aer 驱动会对设备做 reset link, 
+   就是下面的情况 2), bus 下的所有 device 都会被 reset
+		1). 对有flr功能的设备，直接做function level reset, qemu函数流程
+			pcie_cap_flr_write_config
+				pci_device_reset
+					qdev_reset_all
+						qdev_reset_one
+							device_reset
+								DeviceClass->reset //vfio-pci对应的是： vfio_pci_reset
+							
+		2). 如果Guest是做的bus reset:(则该bus下所有的device都要reset)
+			pci_bridge_write_config
+				qbus_reset_all
+					qdev_reset_one
+						device_reset
+							DeviceClass->reset //vfio_pci_reset，与1) 殊途同归
+						
+4. QEMU 中 reset
+    vfio_pci_reset
+	    ioctl(vdev->vbasedev.fd, VFIO_DEVICE_RESET) //这是对单个 function做 reset
+		vfio_pci_hot_reset_one
+		    vfio_pci_hot_reset
+			    ioctl(vdev->vbasedev.fd, VFIO_DEVICE_PCI_HOT_RESET, reset); // vfio-pci 驱动中, VFIO_DEVICE_PCI_HOT_RESET 的操作，会触发 host 上的bus reset
+				
+5. Guest kernel panic时，调用关系
+    igb_err_handler->igb_io_resume
+	    igb_up
+			igb_configure
+				igb_configure_tx
+					igb_configure_tx_ring
+					
+6. vfio 判断设备是否支持reset的判断优先级，__pci_dev_reset 函数中，优先级由高到低如下
+    pci_dev_specific_reset //设备有特定的reset方法
+	pcie_flr // pcie 的 function level reset 功能，见 pci express capability 的寄存器：Device Capabilities Register 和 Device Control Register 中有相应的bit
+	pci_af_flr //可能很少见，搜索没有发现有效信息
+	pci_pm_reset // Power management capability
+	pci_dev_reset_slot_function
+	pci_parent_bus_reset
+	
+
+大致流程图：
+               host                                      qemu               guest
+
+        broadcast: error_detected
+        +--> error_detected (VFIO)
+          +--> eventfd_signal   ----->               pcie_aer_msg ---------> broadcast: error_detected
+        *reset_link*                                                         +--> error_detected (real driver)
+																	         *reset_link* 
+        
+        broadcast: mmio/slot_reset                                           broadcast: mmio/slot_reset
+        broadcast: resume                                                    broadcast: resume 
+	
+*reset_link: Host 和 Guest 中的顺序无法保证，所以我们的patch需要串行化此操作，不然结果不可预测
