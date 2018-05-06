@@ -14,9 +14,23 @@ Q1. 关于 chapter 3 下的示例在 real mode 中初始化 protect mode 下的 
 示例的代码是数据和代码混合在一个 raw binary 文件中。无论是作为 bootsector，还是 dos 下的 .com 文件[1],当该可执行程序被加载进 ram 执行时，可以知道，加载后其cs寄存器是一个确定的值(bootsector 是 0，dos下如何确认这个值还不清楚)。
 第三章下的示例代码一般开始几句将其余的段寄存器都初始化和cs一样的值，有一种适用 flat memory mode 的意思。
 
+label 是什么？ 程序 load 进 ram 后，其所在的 linear address 已经确定，cs已经确定，也即 segment 已确定，程序中的各种 position 都是相对于本 segment 而言，所以 label 是在这个 segment 中的地址，或者说 offset，如果代码开始用 org 伪指令指定一个 offset，那 label 的值还要加上 org 的值。
+
 real mode 下的内存管理很简单，每个 segment 的 size 都是 64k。无论是作为 boot sector，还是 dos 下的 .com 可执行文件(dos 是 single-user, single-tasking 的操作系统，所以每一个 .com 都是从相同的地址 0100h 开始执行)，被 load 到 ram 后，其 cs 是确定的，所以这个程序中看到的地址都是这个确定的 segment 中的 offset. 所以，汇编程序中的 Label 是距离 segment 起始位置的 offset，一般 segment 的起始地址都是0，但也可以通过 org 伪指令把第一条程序指令放在想要的地方，label 的值也就相应的加上这个 offset. 
 
 [1]http://blog.csdn.net/lophyxp/article/details/8426486
+
+Q2. chapter3/b/pmtest2.asm
+LABEL_SEG_CODE32 下有一段代码输出一个字符串:
+
+.1:
+        lodsb ; The source operand is a memory location, the address of which is read from the DS:ESI or the DS:SI register, is read into al
+        test    al, al ; pino: 按位与，根据结果设置 SF, ZF, and PF status flags.
+        jz      .2 ; pino: jump if ZF is 0.
+        mov     [gs:edi], ax
+        add     edi, 2
+        jmp     .1  
+.2:     ; 显示完毕
 
 chapter 6-d
 kernel.asm: hwint00中，离开内核栈后做的如下操作
