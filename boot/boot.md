@@ -102,10 +102,97 @@ MBR 中的 boot.img 的工作就完成了。
 
 ### diskboot.img
 
-由 core.img 的图示可知，它的第一个 sector 的内容是 diskboot.img。diskboot.img 的工作是将 core.img 中剩余的部分继续加载到内存，并跳转过去执行。这个加载的动作本质上和 boot.S 一样，也是借助 BIOS 的 interrupt service。只不过 diskboot.img 需要加载多个 sector 而已。diskboot.img 需要知道 core.img 剩余部分所在的 sector，显然，这是安装 grub 的时候才会知道，grub 的安装程序将 core.img 占据的 sector 的信息写入 diskboot.img。
-
-diskboot.img 对应的源代码文件是 grub-core/boot/i386/pc/diskboot.S。diskboot.img 执行前的环境，也即寄存器，由 boot.img 设置，此时的环境如下：
+由 core.img 的图示可知，它的第一个 sector 的内容是 diskboot.img。diskboot.img 对应的源代码文件是 grub-core/boot/i386/pc/diskboot.S。diskboot.img 的执行环境，也即寄存器，由 boot.img 设置，此时的环境如下：
 
 1. 有可用的堆栈(SS 和 SP 已配置)。
 2. 寄存器 DL 中保存正确的引导驱动器。
 3. 寄存器 SI 保存着 DAP(Disk Address Packet) 的地址，DAP 定义在 boot.S 中，由 .macro scratch 实现。
+
+diskboot.img 的工作是将 core.img 中剩余的部分继续加载到内存，并跳转过去执行。diskboot.img 的工作本质上和 boot.img 一样，都是借助 BIOS 的 interrupt service 读取磁盘 sector 的内容到内存，只不过 diskboot.img 需要加载多个 sector 而已。
+
+diskboot.img 需要知道 core.img 剩余部分所在的 sector，显然，这是安装 grub 的时候才会知道，grub 的安装程序将 core.img 占据的 sector 的信息写入 diskboot.img。这部分空间在 diskboot.S 的尾部：
+
+	.org 0x200 - GRUB_BOOT_MACHINE_LIST_SIZE
+	LOCAL(firstlist):	/* this label has to be before the first list entry!!! */
+				/* fill the first data listing with the default */
+	blocklist_default_start:
+	/* this is the sector start parameter, in logical sectors from
+	   the start of the disk, sector 0 */
+	.long 2, 0
+	blocklist_default_len:
+	/* this is the number of sectors to read.  grub-mkimage
+	   will fill this up */
+	.word 0
+	blocklist_default_seg:
+	/* this is the segment of the starting address to load the data into */
+	.word (GRUB_BOOT_MACHINE_KERNEL_SEG + 0x20)
+
+对应了 grub 中的数据结构：
+
+	struct grub_pc_bios_boot_blocklist
+	{
+	  grub_uint64_t start;
+	  grub_uint16_t len;
+	  grub_uint16_t segment;
+	} GRUB_PACKED;
+
+为什么这段空间被标以 label: firstlist 呢？一个 blocklist 描述一段连续的磁盘区域，而在某些情况下，core.img 有可能被分成多块安装在磁盘上，所以可能存在多个 blocklist，如果有多个的时候，这段空间会紧挨着 firstlist 向 diskboot.img 开始的方向延伸。
+
+读取 sector 结束，通过下面的代码跳转到 0:0x8200 开始运行
+
+	LOCAL(bootit):
+	/* print a newline */
+	MSG(notification_done)
+	popw	%dx	/* this makes sure %dl is our "boot" drive */
+	ljmp	$0, $(GRUB_BOOT_MACHINE_KERNEL_ADDR + 0x200)
+
+跳转后的代码是 lzma_decompress.img 的内容。
+
+### lzma_decompress.img
+
+lzma_decompress.img 对应的源码是 grub-core/boot/i386/pc/startup_raw.S，此文件中又 include 同目录下的  "lzma_decode.S"，这是 lzma 的算法核心。它的工作是解压缩它后面的压缩代码，并跳转过去，由 core.img 的图示可知，跳转到 kernel.img，由名字可知，这是 grub 的核心代码，它对应的代码在 grub-core/kern 目录下。从某种意义上说，kernel.img 的代码才是 grub 真正的开始。
+
+startup_raw.S 的开头部分是一条跳转指令：
+
+	ljmp $0, $ABS(LOCAL (codestart))
+
+是为了跳过开头部分的数据区域，跳到真正的代码处：codestart。这块 special data area，看其名字：*GRUB_DECOMPRESSOR_MACHINE_COMPRESSED_SIZE*，*GRUB_DECOMPRESSOR_MACHINE_UNCOMPRESSED_SIZE*，应该是生成这些 image 时，由 grub 将数据填写到此处。
+
+将紧挨着 lzma_decompress.img 的数据(开始于 decompressor_end)解压缩到临时解压缩区域 *GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR* 处，并跳转过去执行，代码如下：
+
+	post_reed_solomon:
+
+	#ifdef ENABLE_LZMA
+		movl	$GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR, %edi
+	#ifdef __APPLE__
+		movl	$decompressor_end, %esi
+	#else
+		movl	$LOCAL(decompressor_end), %esi
+	#endif
+		pushl	%edi
+		movl	LOCAL (uncompressed_size), %ecx
+		leal	(%edi, %ecx), %ebx
+	/* Don't remove this push: it's an argument.  */
+		push 	%ecx
+		call	_LzmaDecodeA
+		pop	%ecx
+		/* _LzmaDecodeA clears DF, so no need to run cld */
+	popl	%esi
+	#endif
+
+	movl	LOCAL(boot_dev), %edx
+	movl	$prot_to_real, %edi
+	movl	$real_to_prot, %ecx
+	movl	$LOCAL(realidt), %eax
+	jmp	*%esi
+
+%edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR， 然后被 push 到 stack 上保存，调用 _LzmaDcodeA 函数后又 popl %esi，最后 jmp *%esi，也即 jmp 到 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR。
+
+### 安装 GRUB
+
+grub-mkimage 的作用是生成 core.img，虽然它的 man page 没有明确说明。一般情况下，core.img 是 grub-install 自动创建的，所以不需要手动调用 grub-mkimage，但是不代表不可以。
+由上面的图示可知 core.img = diskboot.img[1] + lzma_decompress.img[2] + kernel.img + <some mods>
+
+1. diskboot.img 用于硬盘启动的环境下，对于其他的情况，比如 CDROM，网络启动，这个 image 可以是 cdboot.img，pxeboot.img
+
+2. 由于 kernel.img + <mods> 是会被压缩的，所以必须有相应的解压缩代码，不同的压缩算法对应了不同的 decompress image，对于 x86，默认是 lzma。
