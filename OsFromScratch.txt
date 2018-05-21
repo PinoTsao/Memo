@@ -32,6 +32,24 @@ LABEL_SEG_CODE32 下有一段代码输出一个字符串:
         jmp     .1  
 .2:     ; 显示完毕
 
+Q3. chapter 3， h/pmtest8.asm 中关于页表切换的代码注释：
+
+        ; 在此假设内存是大于 8M 的
+        mov     eax, LinearAddrDemo
+        shr     eax, 22 ; shift right, 22 = 10 + 12, which is offset in page, page table index. Got Page dir index after shift.
+        mov     ebx, 4096 ; 4096 means the size(byte) of a page table. BTW, the size of paging struture all is 4k.
+        mul     ebx
+        mov     ecx, eax ; ecx = eax = 4 * 4096
+        mov     eax, LinearAddrDemo
+        shr     eax, 12 ; right shift 12 bits( and with following line) to get page table index
+        and     eax, 03FFh      ; 1111111111b (10 bits)
+        mov     ebx, 4 ; 4 means the size of page table entry.
+        mul     ebx ; eax = ebx = 4 * page table index
+        add     eax, ecx ; Means to get the page table entry corresponding to LinearAddrDemo. the result is offset in bytes from PageTblBase1.
+        add     eax, PageTblBase1
+        mov     dword [es:eax], ProcBar | PG_P | PG_USU | PG_RWW ; fill the page table entry of LinearAddrDemo with phy address of ProcBar
+
+
 chapter 6-d
 kernel.asm: hwint00中，离开内核栈后做的如下操作
          mov     esp, [p_proc_ready]     ; 离开内核栈

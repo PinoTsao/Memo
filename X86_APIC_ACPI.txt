@@ -21,3 +21,23 @@ Q: x86 的 CR4.PAE bit 开启后，物理地址扩展到大于32 bit，但具体
 A: 参考 Volume 3A, 4.1.4。具体物理地址多少bit，可能是 cpu-specific 的，但在每个 paging mode 的情况下，有上限
 • CPUID.80000008H:EAX[7:0] reports the physical-address width supported by the processor. (For processors that do not support CPUID function 80000008H, the width is generally 36 if CPUID.01H:EDX.PAE [bit 6] = 1 and 32 otherwise.) This width is referred to as MAXPHYADDR. MAXPHYADDR is at most 52.
 • CPUID.80000008H:EAX[15:8] reports the linear-address width supported by the processor. Generally, this value is 48 if CPUID.80000001H:EDX.LM [bit 29] = 1 and 32 otherwise. (Processors that do not support CPUID function 80000008H, support a linear-address width of 32.)
+
+Intel 手册 volumn 3 中 chapter 4 paging 一章中将 paging 分为 3 种 paging mode: 32-bit, PAE, IA-32e。linux kernel 代码中却使用 "2/3/4/5-level page table" 的说法，这里的 level 指的是 paging structure，有几个级别的 paging structure，就是 几 level page table.
+
+Roadmap:
+1. 将 paging 看完,可能还有中断，这些是基础。
+2. 研究 grub 如何加载内核，内核如何执行，bootloader 和 kernel 之间的互动
+
+BIOS 第一条指令 & later 流程：
+
+推理1：
+第一个发到 bus 上的地址肯定是 0xFFFFFFF0 ,关于这个地址的处理，有人说还是会 route 到 0xF000:0xFFF0, 也即 0xFFFF0 地址，我们假设这个说法是正确的（但机制不明），那以Q35 chipset 为例，PAM0 寄存器复位后默认是 DRAM disabled 的状态，也即所有到 0xF0000–0xFFFFF 的 access 都会 route 到 DMI，我理解此时即 route 到 rom 中去，毕竟 BIOS 都存储在 rom 中。BIOS 的第一条指令一般是：
+
+FFFFFFF0:    EA 5B E0 00 F0         jmp far ptr F000:E05B
+
+那么，这个长跳转会刷新 CS 寄存器为 0xF000，之后寻址指令都在 0xF0000 起始的 segment 内了。
+但没有做 Memory Shadowing 之前，到这个 segment 中的寻址都会 route 到 DMI(也即是 rom)。直到 Memory Shadowing 完成，rom 中的 BIOS 镜像被 copy 到 0xF0000 起始的 segment 内,
+BIOS 的执行也变成从 DRAM 中取址了。
+
+推理2：
+发到 bus 上的地址 0xFFFFFFF0 如果不存在 route 到 0xF000:0xFFF0(即 0xFFFF0)的说法，那么此地址必落在 rom 中的第一条 jmp 指令，刷新了 CS 寄存器，之后的取址都落在 0xF0000 起始的 segment 中，又因为PAM0复位后的状态表示此 segment 是 DRAM disabled 的状态，所以所有 access 被 route 到 DMI ....

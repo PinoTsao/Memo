@@ -1,0 +1,93 @@
+all: dist
+
+dist: DESTDIR=$(DISTDIR)/install
+dist: $(TARGS_DIST) dist-misc
+
+SUBSYSTEMS?=xen tools stubdom docs
+TARGS_DIST=$(patsubst %, dist-%, $(SUBSYSTEMS))
+
+dist-%: DESTDIR=$(DISTDIR)/install
+dist-%: install-%
+	@: # do nothing
+
+install-xen:
+	$(MAKE) -C xen install
+
+# Now, build process descend into subdir: xen
+# Note, double colon rule is used
+install:: include/config/auto.conf
+
+build install::
+ifneq ($(XEN_TARGET_ARCH),x86_32)
+	$(MAKE) -f Rules.mk _$@
+else
+	echo "*** Xen x86/32 target no longer supported!"
+endif
+
+
+include/config/%.conf: include/config/auto.conf.cmd $(KCONFIG_CONFIG)
+	$(MAKE) -f $(BASEDIR)/tools/kconfig/Makefile.kconfig ARCH=$(ARCH) SRCARCH=$(SRCARCH) HOSTCC="$(HOSTCC)" HOSTCXX="$(HOSTCXX)" silentoldconfig
+
+# Empty recipe，avoid implicit rule
+include/config/auto.conf.cmd: ;
+
+# Allow people to just run `make` as before and not force them to configure
+$(KCONFIG_CONFIG):
+	$(MAKE) -f $(BASEDIR)/tools/kconfig/Makefile.kconfig ARCH=$(ARCH) SRCARCH=$(SRCARCH) HOSTCC="$(HOSTCC)" HOSTCXX="$(HOSTCXX)" defconfig
+
+So, 对于 Xen 来说，如果用户没有显式的 make *config 来生成 .config 文件，则会通过 defconfig 来生成，然后再做 silentoldconig。
+ $(BASEDIR)/tools/kconfig/Makefile.kconfig 包含了 tools/kconfig 下的 Makefile 和 Makefile.host, Makefile.host 用于编译 kconfig 的 host program，
+# Makefile 则包含各种 config target，defconfig 就定义在其中。
+
+编译的重头落在这条 recipe: $(MAKE) -f Rules.mk _$@
+xen/Rule.mk 中又 include xen/Makefile, _install 定义在这里。捡拣重点：
+_install: $(TARGET)$(CONFIG_XEN_INSTALL_SUFFIX)
+
+因为 Rules.mk <include> Xen/Makefile <include> $(XEN_ROOT)/Config.mk <include> $(XEN_ROOT)/config/$(XEN_TARGET_ARCH).mk，所以有 config/x86_64.mk:CONFIG_XEN_INSTALL_SUFFIX := .gz
+Rule.mk 中有 TARGET := $(BASEDIR)/xen，xen/Makefile 中有 export BASEDIR := $(CURDIR)，所以
+_install: $(TARGET)$(CONFIG_XEN_INSTALL_SUFFIX)
+==》
+_install: <完整路径>/xen/xen.gz
+
+(TARGET).gz: $(TARGET)
+	gzip -n -f -9 < $< > $@.new
+	mv $@.new $@
+
+$(TARGET): delete-unfresh-files
+	...
+	$(MAKE) -f $(BASEDIR)/Rules.mk -C arch/$(TARGET_ARCH) $@
+
+xen/arch/x86/Makefile:
+
+$(TARGET): $(TARGET)-syms $(efi-y) boot/mkelf32
+
+$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+
+prelink.o: $(ALL_OBJS)
+	$(LD) $(LDFLAGS) -r -o $@ $^
+
+# In xen/Rules.mk
+ALL_OBJS-y               += $(BASEDIR)/common/built_in.o
+ALL_OBJS-y               += $(BASEDIR)/drivers/built_in.o
+ALL_OBJS-y               += $(BASEDIR)/xsm/built_in.o
+ALL_OBJS-y               += $(BASEDIR)/arch/$(TARGET_ARCH)/built_in.o
+ALL_OBJS-$(CONFIG_CRYPTO)   += $(BASEDIR)/crypto/built_in.o
+ALL_OBJS := $(ALL_OBJS-y)
+
+# In xen/arch/x86/Makefile
+ALL_OBJS := $(BASEDIR)/arch/x86/boot/built_in.o $(BASEDIR)/arch/x86/efi/built_in.o $(ALL_OBJS)
+
+# In xen/Rules.mk
+%/built_in.o: FORCE
+	$(MAKE) -f $(BASEDIR)/Rules.mk -C $* built_in.o
+
+built_in.o: $(obj-y)
+	$(LD) $(LDFLAGS) -r -o $@ $^
+
+因为有 -C $*，且 xen/Rules.mk 中有: include Makefile，以 $(BASEDIR)/common/built_in.o 为例，被 include 的 Makefile 是 $(BASEDIR)/common/Makefile，
+这个 Makefile 中定义的是 obj-y，subdir-y 等， 根 kernel 一样，每个目录下的所有 object file 被 link 为 built_in.o:
+
+obj-y += $(patsubst %/,%/built_in.o,$(subdir-y))
+
+
+
