@@ -35,20 +35,39 @@ include/config/auto.conf.cmd: ;
 $(KCONFIG_CONFIG):
 	$(MAKE) -f $(BASEDIR)/tools/kconfig/Makefile.kconfig ARCH=$(ARCH) SRCARCH=$(SRCARCH) HOSTCC="$(HOSTCC)" HOSTCXX="$(HOSTCXX)" defconfig
 
-So, 对于 Xen 来说，如果用户没有显式的 make *config 来生成 .config 文件，则会通过 defconfig 来生成，然后再做 silentoldconig。
- $(BASEDIR)/tools/kconfig/Makefile.kconfig 包含了 tools/kconfig 下的 Makefile 和 Makefile.host, Makefile.host 用于编译 kconfig 的 host program，
-# Makefile 则包含各种 config target，defconfig 就定义在其中。
+So, 对于 Xen 来说，如果用户没有显式的 make *config 来生成 .config 文件，则会通过 defconfig 来生成。
+$(BASEDIR)/tools/kconfig/Makefile.kconfig 包含了 tools/kconfig 下的 Makefile 和 Makefile.host,
+Makefile.host 用于编译 kconfig 的 host program，Makefile 则包含各种 config target，defconfig 就定义在其中。
 
-编译的重头落在这条 recipe: $(MAKE) -f Rules.mk _$@
-xen/Rule.mk 中又 include xen/Makefile, _install 定义在这里。捡拣重点：
+编译的重头落在这条 recipe:
+
+	$(MAKE) -f Rules.mk _$@
+
+而 xen/Rule.mk 中又 include xen/Makefile, _install 定义在这里：
+
 _install: $(TARGET)$(CONFIG_XEN_INSTALL_SUFFIX)
 
-因为 Rules.mk <include> Xen/Makefile <include> $(XEN_ROOT)/Config.mk <include> $(XEN_ROOT)/config/$(XEN_TARGET_ARCH).mk，所以有 config/x86_64.mk:CONFIG_XEN_INSTALL_SUFFIX := .gz
-Rule.mk 中有 TARGET := $(BASEDIR)/xen，xen/Makefile 中有 export BASEDIR := $(CURDIR)，所以
+Rules.mk 中 include 了
+	Makefile(此时是 xen/Makefile)
+	$(XEN_ROOT)/Config.mk
+	$(XEN_ROOT)/config/$(XEN_TARGET_ARCH).mk
+
+变量 TARGET 定义在 xen/Rule.mk 中:
+	TARGET := $(BASEDIR)/xen
+
+xen/Makefile 中有:
+	export BASEDIR := $(CURDIR)
+
+config/x86_64.mk 有:
+	CONFIG_XEN_INSTALL_SUFFIX := .gz
+
+所以将上面的 rule 扩展出来就是：
+
 _install: $(TARGET)$(CONFIG_XEN_INSTALL_SUFFIX)
 ==》
 _install: <完整路径>/xen/xen.gz
 
+# In xen/Makefile
 (TARGET).gz: $(TARGET)
 	gzip -n -f -9 < $< > $@.new
 	mv $@.new $@
@@ -85,9 +104,9 @@ built_in.o: $(obj-y)
 	$(LD) $(LDFLAGS) -r -o $@ $^
 
 因为有 -C $*，且 xen/Rules.mk 中有: include Makefile，以 $(BASEDIR)/common/built_in.o 为例，被 include 的 Makefile 是 $(BASEDIR)/common/Makefile，
-这个 Makefile 中定义的是 obj-y，subdir-y 等， 根 kernel 一样，每个目录下的所有 object file 被 link 为 built_in.o:
+这个 Makefile 中定义的是 obj-y，subdir-y 等， 跟 kernel 一样，每个目录下的所有 object file 被 link 为 built_in.o，子目录的 built_in.o 被 link 到父目录
+的 built_in.o 中：
 
-obj-y += $(patsubst %/,%/built_in.o,$(subdir-y))
-
-
+	subdir-y += $(filter %/,$(obj-y))
+	obj-y += $(patsubst %/,%/built_in.o,$(subdir-y))
 

@@ -156,9 +156,9 @@ startup_raw.S 的开头部分是一条跳转指令：
 
 	ljmp $0, $ABS(LOCAL (codestart))
 
-是为了跳过开头部分的数据区域，跳到真正的代码处：codestart。这块 special data area，看其名字：*GRUB_DECOMPRESSOR_MACHINE_COMPRESSED_SIZE*，*GRUB_DECOMPRESSOR_MACHINE_UNCOMPRESSED_SIZE*，应该是生成这些 image 时，由 grub 将数据填写到此处。
+是为了跳过开头部分的数据区域，跳到真正的代码处：codestart。这块 special data area，看其名字：*GRUB_DECOMPRESSOR_MACHINE_COMPRESSED_SIZE*，*GRUB_DECOMPRESSOR_MACHINE_UNCOMPRESSED_SIZE*，在 grub-mkimage 生成 core.img 时，由其将数据填写到此处。
 
-将紧挨着 lzma_decompress.img 的数据(开始于 decompressor_end)解压缩到临时解压缩区域 *GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR* 处，并跳转过去执行，代码如下：
+将紧挨着 lzma_decompress.img 的数据(开始于 decompressor_end)解压缩到临时解压缩区域 *GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR*(0x100000) 处，并跳转过去执行，代码如下：
 
 	post_reed_solomon:
 
@@ -190,9 +190,82 @@ startup_raw.S 的开头部分是一条跳转指令：
 
 ### 安装 GRUB
 
-grub-mkimage 的作用是生成 core.img，虽然它的 man page 没有明确说明。一般情况下，core.img 是 grub-install 自动创建的，所以不需要手动调用 grub-mkimage，但是不代表不可以。
-由上面的图示可知 core.img = diskboot.img[1] + lzma_decompress.img[2] + kernel.img + <some mods>
+安装 grub，需要系统中安装了 grub utility，然后通过 grub2-install 将 grub 安装到驱动器中(硬盘或者软盘)。官方文档中[科普](https://www.gnu.org/software/grub/manual/grub/html_node/Installation.html#Installation)了一些基础概念：
 
-1. diskboot.img 用于硬盘启动的环境下，对于其他的情况，比如 CDROM，网络启动，这个 image 可以是 cdboot.img，pxeboot.img
+>GRUB comes with boot images, which are normally put in the directory /usr/lib/grub/`<cpu>`-`<platform>` (for BIOS-based machines /usr/lib/grub/i386-pc). Hereafter, the directory where GRUB images are initially placed will be called the image directory, and the directory where the boot loader needs to find them (usually /boot) will be called the boot directory. 
 
-2. 由于 kernel.img + <mods> 是会被压缩的，所以必须有相应的解压缩代码，不同的压缩算法对应了不同的 decompress image，对于 x86，默认是 lzma。
+查看 image directory 会发现安装 grub bootloader 所需的所有东西都在这里了。
+安装的过程是生成 core.img 并安装，分别由命令 grub-mkimage 和 grub-setup 完成。
+
+grub-mkimage 的作用是生成 core.img，虽然它的 man page 没有明确说明。由上面的图示可知 core.img = diskboot.img[1] + lzma_decompress.img[2] + kernel.img + `<mods>`
+
+1. diskboot.img 用于硬盘启动的环境下，对于其他的情况有不同的 image，比如 CDROM 有 cdboot.img，网络启动，有 pxeboot.img。
+2. 由于 kernel.img 和 mods 一起被压缩，所以必须有相应的解压缩代码，不同的压缩算法对应了不同的 decompress image，对于 x86，默认是 lzma。
+
+grub-mkimage 的源代码在 util/grub-mkimage.c 中，代码结构比较清晰，解析命令行入参后调用函数 *grub_install_generate_image* 生成 image。具体内容如下。
+
+因为 grub-mkimage 时命令行必须传入需要添加的 modules，所以首先读取 moddep.lst，将传入的 module 和其依赖的 module 列出到 *path_list*：
+
+	path_list = grub_util_resolve_dependencies (dir, "moddep.lst", mods);
+
+找到 kernel.img：
+
+	kernel_path = grub_util_get_path (dir, "kernel.img");
+	...
+	if (image_target->voidp_sizeof == 4)
+	  kernel_img = grub_mkimage_load_image32 (kernel_path, total_module_size,
+					    &layout, image_target);
+	else
+	  kernel_img = grub_mkimage_load_image64 (kernel_path, total_module_size,
+					    &layout, image_target);
+
+将读取后的很多信息存在 *layout* 中。将 kernel.img 和 modules 打包在一起并通过函数 *compress_kernel* 压缩：
+
+	  compress_kernel (image_target, kernel_img, layout.kernel_size + total_module_size,
+		   &core_img, &core_size, comp);
+
+压缩后的数据由 *core_img* 表示，大小是 *core_size*。打包的数据长这样：
+
+![kernel & mod](grub_kern_mod.png)
+
+然后选择并读取相应的解压缩 image：
+
+	decompress_path = grub_util_get_path (dir, name);
+	decompress_size = grub_util_get_image_size (decompress_path);
+	decompress_img = grub_util_read_image (decompress_path);
+
+在上一节中我们已提到，**lzma_decompress.img** 中 special data 中的一些数据要由 grub-mkimage 写入，终于找到了:
+
+	if (image_target->decompressor_compressed_size != TARGET_NO_FIELD)
+		*((grub_uint32_t *) (decompress_img + image_target->decompressor_compressed_size))
+					= grub_host_to_target32 (core_size);
+
+	if (image_target->decompressor_uncompressed_size != TARGET_NO_FIELD)
+		*((grub_uint32_t *) (decompress_img + image_target->decompressor_uncompressed_size))
+					= grub_host_to_target32 (layout.kernel_size + total_module_size);
+
+即将 compressed data 压缩前后的 size 写入。
+
+最后，对于硬盘启动的情况来说，需要将 diskboot.img 添加到 lzma_decompress.img 之前，同时修改 diskboot.img，它才能在启动时知道去哪儿寻找 core.img。将 lzma_decomress.img + kernel.img + `<mods>` 的 size 转换为 sector 数：
+
+	num = ((core_size + GRUB_DISK_SECTOR_SIZE - 1) >> GRUB_DISK_SECTOR_BITS);
+
+找到 diskboot.img:
+
+	boot_path = grub_util_get_path (dir, "diskboot.img");
+	boot_size = grub_util_get_image_size (boot_path);
+	boot_path = grub_util_get_path (dir, "diskboot.img");
+	boot_size = grub_util_get_image_size (boot_path);
+	if (boot_size != GRUB_DISK_SECTOR_SIZE)
+	  grub_util_error (_("diskboot.img size must be %u bytes"),
+			   GRUB_DISK_SECTOR_SIZE);
+
+	boot_img = grub_util_read_image (boot_path);
+
+在 diskboot.img 那一节已经说过，image 的最后面是 blocklist 数据结构，由 grub-mkimage 来写入，这里就是了：
+
+	struct grub_pc_bios_boot_blocklist *block;
+	block = (struct grub_pc_bios_boot_blocklist *) (boot_img
+							  + GRUB_DISK_SECTOR_SIZE
+							  - sizeof (*block));
+	block->len = grub_host_to_target16 (num);
