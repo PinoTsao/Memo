@@ -262,10 +262,19 @@ grub-mkimage 的源代码在 util/grub-mkimage.c 中，代码结构比较清晰�
 
 	boot_img = grub_util_read_image (boot_path);
 
-在 diskboot.img 那一节已经说过，image 的最后面是 blocklist 数据结构，由 grub-mkimage 来写入，这里就是了：
+在 diskboot.img 一节已经说过，image 的最后面是 blocklist 数据结构，在安装 grub 的时候由 grub 的 utility 写入。blocklist 的 len 字段表示 core.img 中除了 diskboot.img 以外其他数据的长度(sector 为单位)，由 grub-mkimage 写入，代码就是这里：
 
 	struct grub_pc_bios_boot_blocklist *block;
 	block = (struct grub_pc_bios_boot_blocklist *) (boot_img
 							  + GRUB_DISK_SECTOR_SIZE
 							  - sizeof (*block));
 	block->len = grub_host_to_target16 (num);
+
+diskboot.img 的处理就结束了，将它写入到 core.img:
+
+	grub_util_write_image (boot_img, boot_size, out, outname);
+
+最后将 core.img 的剩余部分也写入 core.img 中：
+
+	grub_util_write_image (core_img, core_size, out, outname);
+
