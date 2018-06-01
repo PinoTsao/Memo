@@ -27,26 +27,30 @@ BIOS 执行到最后是从已设置的启动设备中读取指令到内存，并
 
 ## GRUB2
 
-BIOS 将硬盘 MBR 中的内容加载到 0000:7C00 并跳转到这个地址继续执行。为什么将 boot sector(MBR) 加载到这个比 32kb 小 1024 byte 的地址？ 这里有[一篇科普](http://www.ruanyifeng.com/blog/2015/09/0x7c00.html)。
+本节以硬盘启动为例，分析分析 grub2 的工作流程。[这篇材料](https://www.slideshare.net/MikeWang45/grub2-booting-process)可以作为很好的参考。下面提到 `grub` 的时候，泛指 grub 和 grub2 bootloader，仅当特指的时候，才使用 `grub2`
 
-接下来我们分析 grub2 是如何执行并将 OS 加载到内存执行的。这里有一篇很好的材料讲述了 [GRUB2 的启动过程](https://www.slideshare.net/MikeWang45/grub2-booting-process)
+BIOS 的最后工作是将硬盘 MBR(也叫 boot sector) 中的内容加载到地址 0000:7C00，并跳转过去继续执行。为什么将 MBR 加载到这个比 32kb 小 1024 byte 的地址？ 这里有[一篇科普](http://www.ruanyifeng.com/blog/2015/09/0x7c00.html)。使用 MBR 这个术语是为了和 VBR 区分，Master boot record 是指整个硬盘的第一个 sector，Volume boot record 是指一个分区的第一个 sector。
 
-grub2 的启动分为几个阶段：stage1，stage2，文件系统的剩余部分。stage1 是执行 MBR 中的代码，也就是我们常说的 boot sector； stage2 执行的代码存在 MBR 之后，第一个磁盘分区之前(以前这个 size 有 63 sector，今天普遍是 2048 个 sector)，由 boot sector 的代码加载到内存中执行，这里面包含了访问文件系统的驱动程序，可以从文件系统读取 stage2 的内容；stage2 包含读取文件系统上的 grub 的配置文件和其他模块等。所以，grub 的代码 image 被分为几个部分安装在硬盘中.
+很显然，仅仅 512 bytes 大小的 boot sector 是装不下一个功能强大的 grub 的，所以 grub 使用的方案是分成几个部分，第一部分(也是最小的)被安装在 MBR 中，其他的较大的部分放在别的位置，被 MBR 加载。用 grub 的术语讲，grub 被分为几个 stage：stage 1，stage 1.5，stage 2。对于 grub2 来说：
 
-具体来说，grub2 的代码 image 分为 3 个部分： MBR 中的 boot.img，stage2 区域的 core.img，文件系统中的模块。安装在硬盘上的 grub2 的布局如下图：
+* stage 1 是位于 MBR 中的 boot.img，用于加载 stage 1.5 的 core.img。(boot.img 在某些场景下也可以安装在 VBR 中)；
+* stage 1.5 是位于 MBR 和第一个磁盘分区之间(以前这个 size 有 63 个 sector，今天普遍是 2048 个 sector)的 core.img，它包含了访问文件系统的驱动程序，可以从文件系统读取 stage 2 的内容；
+* stage 2 是位于 /boot/grub 目录下的所有文件，包括配置文件和模块等。
 
-![grub](grub_images.png)
+安装在硬盘上的 grub2 的布局如下图：
+
+![grub](850px-GNU_GRUB_on_MBR_partitioned_hard_disk_drives.svg.png)
+
+简化版如下：
+![grub](grub_hdd_layout.png)
 
 core.img 又包含了多个 image 和模块，它的布局如下图：
 ![grub core image](core_image.png)
 
-boot.img 的功能是将 core.img 的第一个 sector 的内容(也即 diskboot.img)加载到内存执行，core.img 中剩余的部分由它的 diskboot.img 完成。
+### boot.img/MBR/boot sector
+boot.img 仅仅将 core.img 的第一个 sector 的内容(即 diskboot.img)加载到内存执行，core.img 中剩余的部分由它的 diskboot.img 继续加载到内存。boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。这里有一篇对[boot.img的完整分析](https://www.funtoo.org/Boot_image)，只是代码比较老，但整体逻辑是一样的，可以作为参考。
 
-### MBR/boot.img
-
-boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。这里有一篇对[boot.img的完整分析](https://www.funtoo.org/Boot_image)，只是代码比较老，但整体逻辑是一样的
-
-文件开始部分定义了两个宏，可以略过不看
+文件开头定义了两个宏，可以略过不看
 
 	.macro floppy
 	xxx
@@ -55,7 +59,7 @@ boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。这�
 	xxx
 	.endm
 
-boot sector 开始的部分为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间，前 12 bytes(0xB) 由 .marco scratch 实现。BPB 是一个存储在 VBR(volumn boot record) 中用来描述磁盘或者分区的物理布局的数据结构。在[这篇介绍](https://en.wikipedia.org/wiki/BIOS_parameter_block)的表：Format of full DOS 7.1 Extended BIOS Parameter Block (79 bytes) for FAT32 中，可以看出，BPB 起始位置是 boot sector 的 offset 0xB 处，也即12 bytes，正好是 .macro scratch 定义的大小；整个 BPB 的长度是 0x52 + 0x8 = 0x5a，正好是 grub2 代码中宏 *GRUB_BOOT_MACHINE_BPB_END* 的值。
+boot.s 的开头为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间，BPB 是一个存储在 VBR(volumn boot record) 中用来描述磁盘或者分区的物理布局的数据结构。但 BPB 空间对于 MBR 来说是不必要的，但因为 grub 使用同一个 boot.img 。前 12 bytes(0xB) 由 .marco scratch 实现。在[这篇介绍](https://en.wikipedia.org/wiki/BIOS_parameter_block)的表：Format of full DOS 7.1 Extended BIOS Parameter Block (79 bytes) for FAT32 中，可以看出，BPB 起始位置是 boot sector 的 offset 0xB 处，也即12 bytes，正好是 .macro scratch 定义的大小；整个 BPB 的长度是 0x52 + 0x8 = 0x5a，正好是 grub2 代码中宏 *GRUB_BOOT_MACHINE_BPB_END* 的值。
 
 接下来是一堆参数定义，有些字段是需要在安装 grub 的时候被写入的
 
@@ -190,18 +194,32 @@ startup_raw.S 的开头部分是一条跳转指令：
 
 ### 安装 GRUB
 
-安装 grub，需要系统中安装了 grub utility，然后通过 grub2-install 将 grub 安装到驱动器中(硬盘或者软盘)。官方文档中[科普](https://www.gnu.org/software/grub/manual/grub/html_node/Installation.html#Installation)了一些基础概念：
+安装 grub，需要系统中已安装 grub utility，然后通过 grub-install 将 grub 安装到驱动器中(硬盘或者软盘)。通常只需要指定安装的目标驱动器，比如，通常我们的电脑上只有一块硬盘，叫做 /dev/sda，则只需：
+
+	grub-install /dev/sda [-v]
+
+选项 -v 用来输出安装过程中的详细信息。想要更详细的输出信息，可以使用两个 `-v`
+
+官方文档中[科普](https://www.gnu.org/software/grub/manual/grub/html_node/Installation.html#Installation)了一些基础概念：
 
 >GRUB comes with boot images, which are normally put in the directory /usr/lib/grub/`<cpu>`-`<platform>` (for BIOS-based machines /usr/lib/grub/i386-pc). Hereafter, the directory where GRUB images are initially placed will be called the image directory, and the directory where the boot loader needs to find them (usually /boot) will be called the boot directory. 
 
 查看 image directory 会发现安装 grub bootloader 所需的所有东西都在这里了。
-安装的过程是生成 core.img 并安装，分别由命令 grub-mkimage 和 grub-setup 完成。
 
-grub-mkimage 的作用是生成 core.img，虽然它的 man page 没有明确说明。由上面的图示可知 core.img = diskboot.img[1] + lzma_decompress.img[2] + kernel.img + `<mods>`
+grub-install 的核心内容是：调用 grub-mkimage 生成 core.img，再调用 grub-bios-setup 安装 core.img 和 boot.img，通过 grub-install 的 `-v` 选项可以看出这一点，在我的测试环境中， `-v` 的输出有如下两条
+
+>grub-mkimage --directory '/usr/lib/grub/i386-pc' --prefix '(,msdos1)/grub' --output '/boot/grub/i386-pc/core.img'  --dtb '' --format 'i386-pc' --compression 'auto'  'ext2' 'part_msdos' 'biosdisk'
+
+>grub-bios-setup  --verbose     --directory='/boot/grub/i386-pc' --device-map='/boot/grub/device.map' '/dev/sda'
+
+grub-mkimage 的作用只是生成 core.img，虽然它的 man page 没有明确说明。由上面的图示可知 core.img = diskboot.img[1] + lzma_decompress.img[2] + kernel.img + `<mods>`
 
 1. diskboot.img 用于硬盘启动的环境下，对于其他的情况有不同的 image，比如 CDROM 有 cdboot.img，网络启动，有 pxeboot.img。
 2. 由于 kernel.img 和 mods 一起被压缩，所以必须有相应的解压缩代码，不同的压缩算法对应了不同的 decompress image，对于 x86，默认是 lzma。
 
+下面我们分别分析 grub-mkimage 和 grub-bios-setup 的细节，再回归到 grub-install。
+
+#### grub-mkimage
 grub-mkimage 的源代码在 util/grub-mkimage.c 中，代码结构比较清晰，解析命令行入参后调用函数 *grub_install_generate_image* 生成 image。具体内容如下。
 
 因为 grub-mkimage 时命令行必须传入需要添加的 modules，所以首先读取 moddep.lst，将传入的 module 和其依赖的 module 列出到 *path_list*：
@@ -278,3 +296,10 @@ diskboot.img 的处理就结束了，将它写入到 core.img:
 
 	grub_util_write_image (core_img, core_size, out, outname);
 
+#### grub-bios-setup
+
+man 手册中说：
+
+>Set up images to boot from a device. You should not normally run this program directly.  Use grub-install instead.
+
+它的源代码在 util/grub-setup.c
