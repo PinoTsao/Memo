@@ -39,16 +39,16 @@ BIOS 的最后工作是将硬盘 MBR(也叫 boot sector) 中的内容加载到�
 
 安装在硬盘上的 grub2 的布局如下图：
 
-![grub](850px-GNU_GRUB_on_MBR_partitioned_hard_disk_drives.svg.png)
+![grub](GNU_GRUB_on_MBR_partitioned_hard_disk_drives.png)
 
-简化版如下：
+简化版长这样：
 ![grub](grub_hdd_layout.png)
 
-core.img 又包含了多个 image 和模块，它的布局如下图：
+core.img 又包含了多个 image 和模块，它的布局如下：
 ![grub core image](core_image.png)
 
 ### boot.img/MBR/boot sector
-boot.img 仅仅将 core.img 的第一个 sector 的内容(即 diskboot.img)加载到内存执行，core.img 中剩余的部分由它的 diskboot.img 继续加载到内存。boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。这里有一篇对[boot.img的完整分析](https://www.funtoo.org/Boot_image)，只是代码比较老，但整体逻辑是一样的，可以作为参考。
+boot.img 仅仅将 core.img 的第一个 sector 的内容(即 diskboot.img)加载到内存执行，core.img 中剩余的部分由它的 diskboot.img 继续加载到内存。boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。这里有一篇对[boot.img的完整分析](https://www.funtoo.org/Boot_image)，虽然基于较老的代码，但整体逻辑是一样的，可以作为参考。
 
 文件开头定义了两个宏，可以略过不看
 
@@ -59,7 +59,7 @@ boot.img 仅仅将 core.img 的第一个 sector 的内容(即 diskboot.img)加�
 	xxx
 	.endm
 
-boot.s 的开头为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间，BPB 是一个存储在 VBR(volumn boot record) 中用来描述磁盘或者分区的物理布局的数据结构。但 BPB 空间对于 MBR 来说是不必要的，但因为 grub 使用同一个 boot.img 。前 12 bytes(0xB) 由 .marco scratch 实现。在[这篇介绍](https://en.wikipedia.org/wiki/BIOS_parameter_block)的表：Format of full DOS 7.1 Extended BIOS Parameter Block (79 bytes) for FAT32 中，可以看出，BPB 起始位置是 boot sector 的 offset 0xB 处，也即12 bytes，正好是 .macro scratch 定义的大小；整个 BPB 的长度是 0x52 + 0x8 = 0x5a，正好是 grub2 代码中宏 *GRUB_BOOT_MACHINE_BPB_END* 的值。
+boot.s 的开头为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间，BPB 是一个存储在 VBR(volumn boot record) 中用来描述磁盘或者分区的物理布局的数据结构。BPB 空间对于 MBR 来说是不必要的，但某些场景下 grub 使用同一个 boot.img 安装到 VBR 中，VBR 是可能需要 BPB 的，所以需要预留这部分空间。前 12 bytes(0xB) 由 .marco scratch 实现。在[这篇介绍](https://en.wikipedia.org/wiki/BIOS_parameter_block)的表：Format of full DOS 7.1 Extended BIOS Parameter Block (79 bytes) for FAT32 中，可以看出，BPB 起始位置是 boot sector 的 offset 0xB 处，也即12 bytes，正好是 .macro scratch 定义的大小；整个 BPB 的长度是 0x52 + 0x8 = 0x5a，正好是 grub2 代码中宏 *GRUB_BOOT_MACHINE_BPB_END* 的值。
 
 接下来是一堆参数定义，有些字段是需要在安装 grub 的时候被写入的
 
