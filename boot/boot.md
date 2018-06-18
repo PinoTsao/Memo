@@ -143,7 +143,7 @@ boot.S 第一指令是 jmp 到 after_BPB 处执行：
           * 如果是安装在软盘上的，这一段 do nothing. */
 		.org GRUB_BOOT_MACHINE_DRIVE_CHECK
 	boot_drive_check:
-		/*目前怀疑当grub 安装在HDD时，jmp 指令才会被 overwrite，进入下一条指令进行HDD相关判断。
+		/* 当 grub 安装在HDD时，jmp 指令才可能被 overwrite，进入下一条指令进行HDD相关判断。
 		 * 如果是安装在软盘时，则直接跳转到 3:进行软盘相关的判断。待确认*/
 	    jmp     3f	/* grub-setup may overwrite this jump. */
         testb   $0x80, %dl /* 如果 dl 的最高 bit 不是 1，结果为0，跳到 2，强赋值为 0x80 */
@@ -729,13 +729,15 @@ SUFFIX 宏分别定义在 util/grub-mkimage32.c：
 
 ![kernel & mod](grub_kern_mod.png)
 
-	/* 对于 i386-pc 来说，默认压缩方式是 GRUB_COMPRESSION_LZMA，选择并读取相应的解压缩 image */
+	/* 对于 i386-pc 来说，默认压缩方式是 GRUB_COMPRESSION_LZMA(参考全局变量 image_targets)，
+	 * 选择并读取相应的解压缩 image */
 	decompress_path = grub_util_get_path (dir, name);
 	decompress_size = grub_util_get_image_size (decompress_path);
 	decompress_img = grub_util_read_image (decompress_path);
 
 在前面小节中已提到，**lzma_decompress.img** 中 special data 中的一些数据要由 grub-mkimage 写入，这是其中两个:
 
+	/* 将 compressed data 压缩前后的 size 分别写入相应的位置 */
 	if (image_target->decompressor_compressed_size != TARGET_NO_FIELD)
 		*((grub_uint32_t *) (decompress_img + image_target->decompressor_compressed_size))
 					= grub_host_to_target32 (core_size);
@@ -744,39 +746,48 @@ SUFFIX 宏分别定义在 util/grub-mkimage32.c：
 		*((grub_uint32_t *) (decompress_img + image_target->decompressor_uncompressed_size))
 					= grub_host_to_target32 (layout.kernel_size + total_module_size);
 
-将 compressed data 压缩前后的 size 分别写入相应的位置。
+将压缩后的 kernel.img + mods 和 lzma_decompress.img 先 copy 到一个 buffer:
 
-最后，对于硬盘启动的情况来说，需要将 diskboot.img 添加到 lzma_decompress.img 之前，同时修改 diskboot.img，它才能在启动时知道去哪儿寻找 core.img。将 lzma_decomress.img + kernel.img + `<mods>` 的 size 转换为 sector 数：
+	full_size = core_size + decompress_size;
+    full_img = xmalloc (full_size);
+    memcpy (full_img, decompress_img, decompress_size);
+    memcpy (full_img + decompress_size, core_img, core_size);
 
+	free (core_img);
+	/* 继续用变量 core_img 和 core_size 表示 */
+	core_img = full_img;
+	core_size = full_size;
+	free (decompress_img);
+	free (decompress_path);
+
+最后，对于硬盘启动的情况来说，需要将 diskboot.img 添加到 lzma_decompress.img 之前，并修改 diskboot.img 结尾的blocklist 数据结构，它才能知道去哪儿寻找加载 core.img。
+
+	/* 将 lzma_decomress.img + kernel.img + <mods> 的 size 转换为 sector number */
 	num = ((core_size + GRUB_DISK_SECTOR_SIZE - 1) >> GRUB_DISK_SECTOR_BITS);
 
-找到 diskboot.img:
-
+	/* 找到 diskboot.img */
 	boot_path = grub_util_get_path (dir, "diskboot.img");
 	boot_size = grub_util_get_image_size (boot_path);
-	boot_path = grub_util_get_path (dir, "diskboot.img");
-	boot_size = grub_util_get_image_size (boot_path);
-	if (boot_size != GRUB_DISK_SECTOR_SIZE)
-	  grub_util_error (_("diskboot.img size must be %u bytes"),
-			   GRUB_DISK_SECTOR_SIZE);
-
+	...
 	boot_img = grub_util_read_image (boot_path);
-
-在 diskboot.img 一节已经说过，image 的最后面是 blocklist 数据结构，在安装 grub 的时候由 grub 的 utility 写入。blocklist 的 len 字段表示 core.img 中除了 diskboot.img 以外其他数据的长度(sector 为单位)，由 grub-mkimage 写入，代码就是这里：
-
-	struct grub_pc_bios_boot_blocklist *block;
-	block = (struct grub_pc_bios_boot_blocklist *) (boot_img
+	{
+	  /* 在 diskboot.img 一节说过，image 的最后面是 blocklist 数据结构。blocklist 的
+	   * len 字段表示 core.img 中除 diskboot.img 以外的 size(sector 为单位)。只写入 size，
+	   * 起始地址在安装的时候才知道 */
+	  struct grub_pc_bios_boot_blocklist *block;
+	  block = (struct grub_pc_bios_boot_blocklist *) (boot_img
 							  + GRUB_DISK_SECTOR_SIZE
 							  - sizeof (*block));
-	block->len = grub_host_to_target16 (num);
-
-diskboot.img 的处理就结束了，将它写入到 core.img:
-
+	  block->len = grub_host_to_target16 (num);
+	  ...
+	}
+	/* 先将 diskboot.img 写入最终的 core.img 的 buffer 中 */
 	grub_util_write_image (boot_img, boot_size, out, outname);
-
-最后将 core.img 的剩余部分也写入 core.img 中：
-
+	...
+	/* 再将剩余的内容写入 */
 	grub_util_write_image (core_img, core_size, out, outname);
+
+core.img 的生成过程就是这样简单。
 
 #### grub-bios-setup
 
@@ -784,7 +795,139 @@ man 手册中说：
 
 >Set up images to boot from a device. You should not normally run this program directly.  Use grub-install instead.
 
-它的源代码在 util/grub-setup.c
+正如上文中提到，在 `grub-install -v` 的输出中有：
+>grub-bios-setup  --verbose     --directory='/boot/grub2/i386-pc' --device-map='/boot/grub2/device.map' '/dev/sda'
+
+没有指定 boot image 和 core image 的时候，默认是 `--directory` 下的 boot.img 和 core.img。
+
+它的主要作用是将 core.img 和 boot.img 写入磁盘，源代码在 util/grub-setup.c，我们拣代码分析。和其他 grub utility 一样，开始是入参解析，然后作一堆初始化动作，看起来是为了访问 /boot 所在文件系统所需，最重要的代码就只有这个函数：
+
+	/* Do the real work.  */
+	GRUB_SETUP_FUNC (arguments.dir ? : DEFAULT_DIRECTORY,
+		   arguments.boot_file ? : DEFAULT_BOOT_FILE,
+		   arguments.core_file ? : DEFAULT_CORE_FILE,
+		   dest_dev, arguments.force,
+		   arguments.fs_probe, arguments.allow_floppy,
+		   arguments.add_rs_codes);
+
+奇妙的是，这个 GRUB_SETUP_FUNC 定义在根目录的 Makefile 中：
+
+	grub_bios_setup_CPPFLAGS = $(AM_CPPFLAGS) $(CPPFLAGS_PROGRAM) -DGRUB_SETUP_FUNC=grub_util_bios_setup
+
+但直接搜 grub_util_bios_setup 也找不到，原来定义在 util/setup. 中：
+
+	#ifdef GRUB_SETUP_BIOS
+	#define SETUP grub_util_bios_setup
+	#elif GRUB_SETUP_SPARC64
+	#define SETUP grub_util_sparc_setup
+	#else
+	#error "Shouldn't happen"
+	#endif
+
+	void
+	SETUP (const char *dir,
+	       const char *boot_file, const char *core_file,
+	       const char *dest, int force,
+	       int fs_probe, int allow_floppy,
+	       int add_rs_codes __attribute__ ((unused))) /* unused on sparc64 */
+	{
+	...
+	}
+
+下面来看函数 grub_util_bios_setup 的内容：
+
+	struct blocklists bl;
+
+	bl.first_sector = (grub_disk_addr_t) -1;
+
+	/* bl.current_segment = 0x8200，是 lzma_decompress.img 被编译 & 加载的地址 */
+	#ifdef GRUB_SETUP_BIOS
+		bl.current_segment =
+		    GRUB_BOOT_I386_PC_KERNEL_SEG + (GRUB_DISK_SECTOR_SIZE >> 4);
+	#endif
+	bl.last_length = 0;
+
+	/* 读取 boot.img 和 core.img */
+	boot_path = grub_util_get_path (dir, boot_file);
+	boot_size = grub_util_get_image_size (boot_path);
+	boot_img = grub_util_read_image (boot_path);
+
+	core_path = grub_util_get_path (dir, core_file);
+	core_size = grub_util_get_image_size (core_path);
+	core_img = grub_util_read_image (core_path);
+
+	/** 将 core.img 的 size 转换成 sector，即除 512 */
+	#ifdef GRUB_SETUP_BIOS
+		core_sectors = ((core_size + GRUB_DISK_SECTOR_SIZE - 1)
+			  >> GRUB_DISK_SECTOR_BITS);
+	#endif
+
+	/* 获取 diskboot.img 结尾的 blocklist 数据结构的地址 */
+	bl.first_block = (struct grub_boot_blocklist *) (core_img
+				   + GRUB_DISK_SECTOR_SIZE
+				   - sizeof (*bl.block));
+	...
+	/* 打开目的设备，即 /dev/sda */
+	dest_dev = grub_device_open (dest);
+	...
+	/* 省略一段 root device 分析，因为目前不确定它的含义。目前的理解是：一台 PC 上可能由很多块
+	 * 磁盘，安装了 grub 或操作系统那一块才叫 root device? 那么一般 PC 只有一块硬盘，它就是 root device */
+
+	#ifdef GRUB_SETUP_BIOS
+	  {
+		/* Read the original sector from the disk.  */
+    	tmp_img = xmalloc (GRUB_DISK_SECTOR_SIZE);
+    	if (grub_disk_read (dest_dev->disk, 0, 0, GRUB_DISK_SECTOR_SIZE, tmp_img))
+    	  grub_util_error ("%s", grub_errmsg);
+
+    	boot_drive_check = (grub_uint8_t *) (boot_img
+						  + GRUB_BOOT_MACHINE_DRIVE_CHECK);
+    	/* Copy the possible DOS BPB.  */
+    	memcpy (boot_img + GRUB_BOOT_MACHINE_BPB_START,
+	    tmp_img + GRUB_BOOT_MACHINE_BPB_START,
+	    GRUB_BOOT_MACHINE_BPB_END - GRUB_BOOT_MACHINE_BPB_START);
+		/* 上述源码注释已写的很清楚，无需赘述 */
+
+		/* If DEST_DRIVE is a hard disk, enable the workaround, which is
+		   for buggy BIOSes which don't pass boot drive correctly. Instead,
+		   they pass 0x00 or 0x01 even when booted from 0x80.  */
+		/* 上面的注释把 bug 解释的很清楚，关于 boot drive number 的问题在 boot.img
+		 * 一节已有解释。看起来一般x情况下都会改写 boot.img 中 boot_drive_check 处的 jmp 指令 */
+		if (!allow_floppy && !grub_util_biosdisk_is_floppy (dest_dev->disk))
+		{
+			/* Replace the jmp (2 bytes) with double nop's.  */
+			boot_drive_check[0] = 0x90;
+			boot_drive_check[1] = 0x90;
+		}
+		...
+		/* 清零原 diskboot.img 中 blocklist 结构体 */
+	    /* Clean out the blocklists.  */
+	    bl.block = bl.first_block;
+	    while (bl.block->len)
+		{
+			grub_memset (bl.block, 0, sizeof (*bl.block));
+
+			bl.block--;
+
+			if ((char *) bl.block <= core_img)
+			grub_util_error ("%s", _("no terminator in the core image"));
+		}
+		/* 在下面的函数中又重新写回，细节掠过 */
+		save_blocklists (sectors[i] + grub_partition_get_start (ctx.container),
+		       0, GRUB_DISK_SECTOR_SIZE, &bl);
+		...
+		/* 将 core.img 写入 */
+		/* Write the core image onto the disk.  */
+	    for (i = 0; i < nsec; i++)
+		  grub_disk_write (dest_dev->disk, sectors[i], 0,
+			       GRUB_DISK_SECTOR_SIZE,
+			       core_img + i * GRUB_DISK_SECTOR_SIZE);
+
+		/* 最后写入 boot.img */
+		/* Write the boot image onto the disk.  */
+	    if (grub_disk_write (dest_dev->disk, BOOT_SECTOR,
+			       0, GRUB_DISK_SECTOR_SIZE, boot_img))
+		    grub_util_error ("%s", grub_errmsg);
 
 
 ## APPENDIX
