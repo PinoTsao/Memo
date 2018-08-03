@@ -25,13 +25,13 @@ Power-up 后，寄存器 CR0 的值为 0x60000010，意味着将 CPU 置于关�
 
 BIOS 执行到最后是从已设置的启动设备中读取指令到内存，并跳转过去执行。我们以安装了 grub2 的硬盘启动为例说明。
 
-## GRUB2
+## GRUB2 启动流程
 
-本节以硬盘启动为例，分析分析 grub2 的工作流程。[这篇材料](https://www.slideshare.net/MikeWang45/grub2-booting-process)可以作为很好的参考。下面提到 `grub` 的时候，泛指 grub 和 grub2 bootloader，仅当特指的时候，才使用 `grub2`
+本节以只有一块硬盘的 PC 为例，基于 grub2 的代码分析 grub 的工作流程。这篇材料：[grub2-booting-process](https://www.slideshare.net/MikeWang45/grub2-booting-process) 可以作为很好的参考。
 
 BIOS 的最后工作是将硬盘 MBR(也叫 boot sector) 中的内容加载到地址 0000:7C00，并跳转过去继续执行。为什么将 MBR 加载到这个比 32kb 小 1024 byte 的地址？ 这里有[一篇科普](http://www.ruanyifeng.com/blog/2015/09/0x7c00.html)。使用 MBR 这个术语是为了和 VBR 区分，Master boot record 是指整个硬盘的第一个 sector，Volume boot record 是指一个分区的第一个 sector。
 
-很显然，仅仅 512 bytes 大小的 boot sector 是装不下一个功能强大的 grub 的，所以 grub 使用的方案是分成几个部分，第一部分(也是最小的)被安装在 MBR 中，其他的较大的部分放在别的位置，被 MBR 加载。用 grub 的术语讲，grub 被分为几个 stage：stage 1，stage 1.5，stage 2。对于 grub2 来说：
+很显然，仅仅 512 bytes 大小的 boot sector 是装不下一个功能强大的 grub 的，所以 grub 使用的方案是分成几个部分，第一部分(也是最小的)被安装在 MBR 中，其他的较大的部分放在别的位置，被 MBR 加载。用 grub 的术语讲，grub 的工作流程被分为几个 stage：stage 1，stage 1.5，stage 2。对于 grub2 来说：
 
 * stage 1 是位于 MBR 中的 boot.img，用于加载 stage 1.5 的 core.img。(boot.img 在某些场景下也可以安装在 VBR 中)；
 * stage 1.5 是位于 MBR 和第一个磁盘分区之间(以前这个 size 有 63 个 sector，今天普遍是 2048 个 sector)的 core.img，它包含了访问文件系统的驱动程序，可以从文件系统读取 stage 2 的内容；
@@ -116,10 +116,11 @@ BIOS 将控制权 transfer 到 grub 时会设置 DL 寄存器，指示一个 dri
 		/* save drive reference first thing! */
 		pushw	%dx
 
-driver number 属于 BIOS 的知识范畴，因为 bootloader 在使用 BIOS 的磁盘读写中断服务时才会使用这个值，所以 BIOS 对其有解释权，但没有找到准确的介绍，这两篇可以参考一下：
+driver number 属于 BIOS 的知识范畴，因为 bootloader 在使用 BIOS 的磁盘读写中断服务时才会使用这个值，所以 BIOS 对其有解释权，但没有找到准确的介绍，这几篇可以参考一下：
 
 1. [list the BIOS drive index](https://stackoverflow.com/questions/45891044/any-way-to-list-the-bios-drive-numbers-in-real-mode)
 2. [PC boot: dl register and drive number](https://stackoverflow.com/questions/11174399/pc-boot-dl-register-and-drive-number)
+3. [BIOS to MBR interface](https://en.wikipedia.org/wiki/Master_boot_record#BIOS_to_MBR_interface)
 
 简而言之，如果 boot drive 是硬盘，则 DL 的最高 bit 为 1，即驱动器号范围是 0x80 - 0x8f；如果是软盘，则最高 bit 为 0，即驱动器号范围是 0x0 - 0xF。
 
@@ -143,8 +144,9 @@ boot.S 第一指令是 jmp 到 after_BPB 处执行：
           * 如果是安装在软盘上的，这一段 do nothing. */
 		.org GRUB_BOOT_MACHINE_DRIVE_CHECK
 	boot_drive_check:
-		/* 当 grub 安装在HDD时，jmp 指令才可能被 overwrite，进入下一条指令进行HDD相关判断。
-		 * 如果是安装在软盘时，则直接跳转到 3:进行软盘相关的判断。待确认*/
+		/* 当 grub 安装在 HDD 时，某些有问题的 BIOS 会错误的设置 DL 寄存器，所以 jmp 指令
+		 * 才可能被 overwrite，进入下一条指令进行相关判断。如果是安装在软盘时，则不存在这个问题，
+		 * 直接跳转到 3:, 进行软盘相关的判断。可以参考上面的文章 <BIOS to MBR interface> */
 	    jmp     3f	/* grub-setup may overwrite this jump. */
         testb   $0x80, %dl /* 如果 dl 的最高 bit 不是 1，结果为0，跳到 2，强赋值为 0x80 */
         jz      2f
@@ -618,15 +620,431 @@ startup_raw.S 的开头部分是一条跳转指令：
 		 */
 		call EXT_C(grub_main)
 
-移动完 kernel.img，清零 bss 区域，然后跳到 C 函数 *grum_main*，这才进入 grub 的核心内容。待详细分析！
+移动完 kernel.img，清零 bss 区域，然后跳到 C 函数 *grum_main*，这才进入 grub 的核心内容。分析到这一步，可以暂停下，先去阅读“安装 GRUB”一节，再回来看 kernel.img 的流程。
 
-### 安装 GRUB
+#### grub_main
+
+从这个函数开始是 grub 核心内容
+
+	void __attribute__ ((noreturn)) grub_main (void)
+
+函数定义可知，它是不会返回的。下面依然分析捡重点代码分析。grub_main() 的主要过程如下面的代码所示
+
+	void __attribute__ ((noreturn)) grub_main (void)
+	{
+	  /* First of all, initialize the machine.  */
+	  grub_machine_init ();
+	  ...
+	  /* 如果 module info data 中有 OBJ_TYPE_CONFIG 类型的对性，此函数才有用。不过一般都没有 */
+	  grub_load_config ();
+	  ...
+	  /* 函数顾名思义，kernel.img 中有专门的数据结构 grub_symtab 来保存一些符号，目前看起来在 module 重定位
+	   * 时会用到。这个函数将 kernel.img 自身的一些符号信息先注册到 grub_symtab 数据结构中。待确认和详细分析 */
+	  grub_register_exported_symbols();
+	  ...
+	  /* 此函数将所有 buffer 中的 module 加载并链接起来，使其可用，内容复杂，在下面有单独分析 */
+	  grub_load_modules ();
+	  ...
+	  /* Reclaim space used for modules.
+	   * buffer 中的 module 使用完了，buffer 空间就没用了，回收 */
+	  reclaim_module_space ();
+	  ...
+	  /* 注册一些核心命令，这些命令是由 kernel.img 自己提供。更多的命令还是由各种 module 提供 */
+	  grub_register_core_commands ();
+	  ...
+	  /* 加载 grub 目录中的 normal 模块，其加载过程和函数 grub_load_modules 中一样。加载后则执行
+	   * "normal"命令。normal 模块会加载 linux kernel, initramfs */
+	  grub_load_normal_mode ();
+	}
+
+第一个函数 grub_machine_init 处理的事情比较多，拿出来单独分析：
+
+	void grub_machine_init (void)
+	{
+	  /* 这个函数不需要研究，它是针对 VIA 的芯片做单独的 workaround */
+	  grub_via_workaround_init ();
+
+	  /* 上文已说过，解压缩的临时 buffer 地址位于地址 1M(0x100000)处，压缩数据前端是 kernel.img，
+	   * 后面就是各种 module，因为 bss section 是不占据文件空间的，所以 _edata - _start 就是 kernel.img
+	   * 的有效 size，module 又是紧挨着 kernel.img，所以 grub module 的起始地址计算如下 */
+	  grub_modbase = GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR + (_edata - _start);
+	  ...
+
+	  /* 重点是下面关于内存的初始化。其实比较简单，函数 grub_machine_mmap_iterate 通过 e820 中断获得
+	   * 内存信息(addr, len, type)，然后将信息交给函数 mmap_iterate_hook 处理，过滤掉地址小于1M 且
+	   * 大于4G的，将类型是 GRUB_MEMORY_AVAILABLE 的内存区域信息保存到数组 mem_regions[] 中 */
+	  grub_machine_mmap_iterate (mmap_iterate_hook, NULL);
+	  /* 通过此函数整理数组 mem_regions[]：按地址从小到大排序，如果2快内存区域有重叠，则合二为一 */
+	  compact_mem_regions ();
+
+	  /* 获得解压缩 buffer 中的 module 的结束地址，要看明白此函数，需要了解打包的 core.img 的格式，
+	   * 在“安装 GRUB”一节中有图示。然后通过 grub_mm_init_region 做 grub 的内存管理功能的初始化。
+	   * 因为不是重点，所以对此函数不做详细。看起来由两级数据结构来管理：grub_mm_region_t &
+	   * grub_mm_header_t。初始化后，grub 中所有的 malloc 类操作都是在操作 grub_mm_base 这个
+	   * 数据结构了 */
+	  modend = grub_modules_get_end ();
+	  for (i = 0; i < num_regions; i++)
+	  {
+		grub_addr_t beg = mem_regions[i].addr;
+		grub_addr_t fin = mem_regions[i].addr + mem_regions[i].size;
+		if (modend && beg < modend)
+		beg = modend;
+	    if (beg >= fin)
+		continue;
+	    grub_mm_init_region ((void *) beg, fin - beg);
+	  }
+	}
+
+grub_load_modules 函数比较复杂，下面拿出来单独分析。核心内容是遍历 buffer 中所有类型为 OBJ_TYPE_ELF 的 module，将其代码和数据加载到一块分配的内存中并进行重定位，然后执行 module 的初始化函数。
+
+>grub_load_modules --遍历module--> grub_dl_load_core --> **grub_dl_load_core_noinit**
+                                                    \
+>                                                    --> grub_dl_init
+
+重点都在函数 grub_dl_load_core_noinit 中了
+
+	/* 入参 addr 是 module 在 buffer 中的地址 */
+	grub_dl_t grub_dl_load_core_noinit (void *addr, grub_size_t size)
+	{
+	  Elf_Ehdr *e;/* module 是 ELF 文件 */
+	  grub_dl_t mod;/* 用来描述一个 module 的总结构体 */
+	  ...
+	  /* ELF header 的常规检查，很常规，不做分析 */
+	  grub_dl_check_header(e, size);
+	  ...
+
+	  /* 重要的处理就在下面这些函数中。总的来说就是对 ELF 文件的 section 做操作，要看懂下面的函数，
+	   * 需要读一下 `man elf`。只对重点函数详细介绍。grub_dl_check_license 和
+	   * grub_dl_resolve_name 的内容很简单，略过；grub_dl_resolve_dependencies 也比较简单，
+	   * 找一下是否有 module 依赖关系的 section，如果有则先加载依赖的 module；其余三个函数工作量比较大，
+	   * 下面重点分析。*/
+	  if (grub_dl_check_license (e)
+		  || grub_dl_resolve_name (mod, e)
+		  || grub_dl_resolve_dependencies (mod, e)
+		  || grub_dl_load_segments (mod, e)
+		  || grub_dl_resolve_symbols (mod, e)
+		  || grub_dl_relocate_symbols (mod, e))
+	  {
+		mod->fini = 0;
+		grub_dl_unload (mod);
+		return 0;
+	  }
+	}
+
+	/* 将所有包含代码和数据的 section 从 buffer 加载到分配的内存 */
+	static grub_err_t grub_dl_load_segments (grub_dl_t mod, const Elf_Ehdr *e)
+	{
+	  ...
+	  /* 遍历所有的 section 获得 total size, 和 total align。total align 就是所有 alignment 中
+	   * 最大的那个，total size 是将所有 section size 对其到 alignment 后的和 */
+	  for (i = 0, s = (const Elf_Shdr *)((const char *) e + e->e_shoff);
+		   i < e->e_shnum;
+      	   i++, s = (const Elf_Shdr *)((const char *) s + e->e_shentsize))
+      {
+        tsize = ALIGN_UP (tsize, s->sh_addralign) + s->sh_size;
+        if (talign < s->sh_addralign)
+		talign = s->sh_addralign;
+	  }
+	  /* 按 total size 和 align 分配内存 */
+	  mod->base = grub_memalign (talign, tsize);
+	  mod->sz = tsize;
+	  ptr = mod->base;
+
+	  /* 再一次遍历 module 的所有 section */
+	  for (i = 0, s = (Elf_Shdr *)((char *) e + e->e_shoff);
+		   i < e->e_shnum;
+		   i++, s = (Elf_Shdr *)((char *) s + e->e_shentsize))
+	  {
+	    /* SHF_ALLOC 意思是这个 section occupies memory during process execution */
+		if (s->sh_flags & SHF_ALLOC)
+		{
+		  grub_dl_segment_t seg; /* 被加载的 sections 用这个结构体来描述 */
+
+		  seg = (grub_dl_segment_t) grub_malloc (sizeof (*seg));
+		  if (! seg)
+		    return grub_errno;
+
+		  if (s->sh_size)
+		  {
+	        void *addr;
+			/* 将目的地址按对齐需求对齐 */
+	        ptr = (char *) ALIGN_UP ((grub_addr_t) ptr, s->sh_addralign);
+	        addr = ptr;
+	        ptr += s->sh_size;
+
+			/* 然后copy到目的内存中 */
+	        switch (s->sh_type)
+			{
+			case SHT_PROGBITS:
+			  grub_memcpy (addr, (char *) e + s->sh_offset, s->sh_size);
+			  break;
+			case SHT_NOBITS:
+			  grub_memset (addr, 0, s->sh_size);
+			  break;
+			}
+
+	        seg->addr = addr;
+	      }
+		  else
+		    seg->addr = 0;
+
+		  seg->size = s->sh_size;
+		  seg->section = i;
+		  seg->next = mod->segment;
+		  mod->segment = seg;
+		}
+      }
+	}
+
+	/* 此函数对 buffer 中的 symbol table section 解析并原地修改 */
+	static grub_err_t grub_dl_resolve_symbols (grub_dl_t mod, Elf_Ehdr *e)
+	{
+	  /* 遍历 sections 找到符号表 section */
+	  for (i = 0, s = (Elf_Shdr *) ((char *) e + e->e_shoff);
+           i < e->e_shnum;
+       	   i++, s = (Elf_Shdr *) ((char *) s + e->e_shentsize))
+    	if (s->sh_type == SHT_SYMTAB)
+    	  break;
+
+	  mod->symtab = (Elf_Sym *) ((char *) e + s->sh_offset); /* 记下符号表在 buffer 中的地址 */
+	  mod->symsize = s->sh_entsize;/* 记下符号表 entry 的 size */
+	  ...
+	  /* sh_link 在 man elf 并没有详细解释，详细解释参考：
+	  * https://docs.oracle.com/cd/E19683-01/816-1386/6m7qcoblj/index.html#chapter6-47976
+	  * 对于符号表 section 来说，sh_link 是其对应 string table 的 section index */
+	  s = (Elf_Shdr *) ((char *) e + e->e_shoff + e->e_shentsize * s->sh_link);
+	  str = (char *) e + s->sh_offset;/* 拿到 string table 的地址*/
+
+	  /* 开始循环解析符号表中的每一个 entry */
+	  for (i = 0;
+	       i < size / entsize;
+	       i++, sym = (Elf_Sym *) ((char *) sym + entsize))
+	  {
+	    switch (type)
+	    {
+		  case STT_NOTYPE:
+		  case STT_OBJECT:
+
+		  /* Resolve a global symbol.  */
+		  /* https://docs.oracle.com/cd/E19683-01/816-1386/6m7qcoblh/index.html, table 7-11 */
+		  /* 如果符号有名字，且 st_shndx 是 SHN_UNDEF(0)，说明是定义在别处(module or kernel.img)的符号 	*/
+		  if (sym->st_name != 0 && sym->st_shndx == 0)
+		  {
+			/* 这个未定义的 symbol 必须已注册在内部的 grub_symtable 中，否则错误返回 */
+			grub_symbol_t nsym = grub_dl_resolve_symbol (name);
+	        if (! nsym)
+			  return grub_error (GRUB_ERR_BAD_MODULE,
+					   N_("symbol `%s' not found"), name);
+
+			  /* 找到的话，则把符号的地址赋值给 st_value；并更新 symbol entry 的 st_info field */
+		      sym->st_value = (Elf_Addr) nsym->addr;
+		      if (nsym->isfunc)
+				sym->st_info = ELF_ST_INFO (bind, STT_FUNC);
+		  }
+		  else
+		  {
+		    /* 如果这个 symbal 在本 module 中定义 */
+		    /* 关于 symbal table entry 中的 st_value 的定义，请参考：
+		     * https://docs.oracle.com/cd/E19683-01/816-1386/6m7qcoblj/	index.html#chapter6-35166
+		     * 本例中，st_value 是符号在所在 section 中的 offset，加上 section address，构成 st_value */
+		    sym->st_value += (Elf_Addr) grub_dl_get_section_addr (mod,
+								    sym->st_shndx);
+			/* 如果不是 local 的符号，则注册到 grub_symtable 中 */
+		    if (bind != STB_LOCAL)
+			  if (grub_dl_register_symbol (name, (void *) sym->st_value, 0, mod))
+				return grub_errno;
+		  }
+
+		case STT_FUNC:
+	    sym->st_value += (Elf_Addr) grub_dl_get_section_addr (mod, sym->st_shndx);
+
+	    case...
+		}// switch()
+	  }// for()
+	}
+
+	/* 遍历 buffer 中 module 的重定位 section，对cp到已分配内存中代码/数据进行重定位 */
+	static grub_err_t grub_dl_relocate_symbols (grub_dl_t mod, void *ehdr)
+	{
+	  for (i = 0, s = (Elf_Shdr *) ((char *) e + e->e_shoff);
+     	   i < e->e_shnum;
+       	   i++, s = (Elf_Shdr *) ((char *) s + e->e_shentsize))
+		if (s->sh_type == SHT_REL || s->sh_type == SHT_RELA)
+        {/* 遍历找到 SHT_REL & SHT_RELA 的 section */
+		  grub_dl_segment_t seg;
+		  grub_err_t err;
+
+		  /* Find the target segment.  */
+		  /* 对于 sh_info 的详细解释，还是参考这里：
+		   * https://docs.oracle.com/cd/E19683-01/816-1386/6m7qcoblj/index.html#chapter6-47976
+		   * 对于类型是 SHT_REL/SHT_RELA 的 section 来说，sh_info 指的是：
+		   * The section header index of the section to which the relocation applies.*/
+		  for (seg = mod->segment; seg; seg = seg->next)
+		    if (seg->section == s->sh_info)
+		      break;
+
+		  /* 找到了要进行重定位的 section，调用函数进行重定位。注意，这个 section 的地址是
+		   * 之前 grub_dl_load_segments 后分配的，而不是解压缩 buffer 中的。 */
+		  if (seg)
+		  {
+	        if (!mod->symtab)
+	          return grub_error (GRUB_ERR_BAD_MODULE, "relocation without symbol table");
+
+		      err = grub_arch_dl_relocate_symbols (mod, ehdr, s, seg);
+		      if (err)
+		        return err;
+	      }
+        }
+	}
+
+	/* 重定位函数，不同的ABI有不同的实现，x86下分 i386 和 x86_64 两种，我们以 i386 为例进行分析 */
+	grub_err_t grub_arch_dl_relocate_symbols (grub_dl_t mod, void *ehdr, Elf_Shdr *s, grub_dl_segment_t seg)
+	{
+	  Elf_Rel *rel, *max;
+
+	  /* 遍历每一个 relocation entry */
+	  for (rel = (Elf_Rel *) ((char *) ehdr + s->sh_offset),
+				 max = (Elf_Rel *) ((char *) rel + s->sh_size);
+    	   rel < max;
+    	   rel = (Elf_Rel *) ((char *) rel + s->sh_entsize))
+      {
+        Elf_Word *addr;
+        Elf_Sym *sym;
+
+        if (seg->size < rel->r_offset)
+		  return grub_error (GRUB_ERR_BAD_MODULE,
+			   "reloc offset is out of the segment");
+
+		/* 找到重定位点的起始地址: section 地址 + 重定位点在 section 中的 offset。
+		 * 拿到重定位点相关的符号信息 */
+        addr = (Elf_Word *) ((char *) seg->addr + rel->r_offset);
+        sym = (Elf_Sym *) ((char *) mod->symtab
+			  + mod->symsize * ELF_R_SYM (rel->r_info));
+
+		/* 根据重定位类型手动进行重定位。在之前的函数 grub_dl_resolve_symbols 中，已将 buffer 中
+		 * 符号表 entry 的 st_value 修改为符号的地址。下面的重定位也很容易理解，不赘述。 */
+        switch (ELF_R_TYPE (rel->r_info))
+		{
+		case R_386_32:
+		  *addr += sym->st_value;
+		  break;
+
+		case R_386_PC32:
+		  *addr += (sym->st_value - (grub_addr_t) addr);
+		  break;
+		default:
+		  return grub_error (GRUB_ERR_NOT_IMPLEMENTED_YET,
+			     N_("relocation 0x%x is not implemented yet"),
+			     ELF_R_TYPE (rel->r_info));
+		}
+      }
+	}
+
+加载完 module 则执行其初始化函数：
+
+	static inline void grub_dl_init (grub_dl_t mod)
+	{
+	  if (mod->init)
+		(mod->init) (mod);
+
+	  mod->next = grub_dl_head;
+	  grub_dl_head = mod;
+	}
+
+Ok，终于介绍完了 grub_load_modules 函数，回头继续看 grub_main，倒数第二个函数是 grub_load_normal_mode，也即加载 normal 模块并执行 normal 命令，关于 grub module 可以参考阅读"GRUB modules 简介"一节。normal module/command 的介绍参考[官方文档](https://www.gnu.org/software/grub/manual/grub/grub.html#normal)。
+
+作为 kernel.img/grub_main 过程重要的一部分，我们仍然捡重点代码分析 normal 命令的过程：
+
+	static grub_err_t grub_cmd_normal (struct grub_command *cmd __attribute__ ((unused)), int argc, char *argv[])
+	{
+	  /* 由 grub_load_normal_mode 函数可知，本函数的入参 argc 和 argv 都是 0。
+	   * 本函数的作用主要是读取 grub 目录中的 grub.cfg */
+	  char *config;
+
+	  config = grub_xasprintf ("%s/grub.cfg", prefix);
+	  grub_enter_normal_mode (config);
+	}
+
+	/* This starts the normal mode.  */
+	void grub_enter_normal_mode (const char *config)
+	{
+	  ...
+	  /* 读取 grub 目录中各种文件，读取 command.lst，fs.lst，crypto.lst，terminal.lst 保存到内部数据结构中；
+	   * 读取 grub.cfg 保存到 grub_menu_t 结构中，并执行其中的命令(应该是 grub.cfg 上方，menuentry 以外的那些命令)，
+	   * grub_menu_t 结构包括了显示 grub menu 所需的数据。展示 menu 菜单，获得用户选择的 menu entry
+	   * 或者 timeout 后的 default entry，执行这个 entry 中的各种命令用来启动 OS */
+	  grub_normal_execute (config, 0, 0);
+	  /* 正常情况下，下面这个函数不会走到？因为上面的函数已经成功启动 OS 了，只有在无法启动 OS
+	   * 的异常情况下，grub_normal_execute 才返回？ */
+	  grub_cmdline_run (0, 1);
+	  ...
+	}
+
+展示 grub menu，获得 menu entry 并执行这个 entry 的 callchain 长这样：
+
+>grub_normal_execute
+ 	--> grub_show_menu
+ 	    --> show_menu
+ 	        --> boot_entry = run_menu (menu, nested, &auto_boot);
+ 	        --> e = grub_menu_get_entry (menu, boot_entry);
+ 	        --> grub_menu_execute_with_fallback (menu, e, autobooted, &execution_callback,0);
+ 	        --> grub_menu_execute_entry /* Run a menu entry */
+ 	        	--> grub_script_execute_new_scope
+ 	        		--> grub_script_execute_sourcecode /* 看起来像在逐行解析 menu entry 的内容，并执行对应的命令，比如 linux16, initrd16 等等 */
+ 	        	--> grub_command_execute ("boot", 0, 0) /* 执行完 entry 中的各种命令，可以启动 OS 了 */
+
+上述过程有待详细分析。分析到这一步，我们所关心的 grub 的工作流程，就剩下 menu entry 中用于加载 linux kernel 和 initramfs 的两条命令比较重要，将单独作为一节进行分析，因为它涉及 Linux kernel 的内容，将在 “normal 模块加载 linux kernel & initramfs”一节中进行分析。
+
+#### GRUB modules 简介
+Module 的概念在 grub2 中引入，有两篇文章可以作为科普：
+
+1. [Writing GRUB Modules](https://wiki.osdev.org/Writing_GRUB_Modules)
+2. [grub2-modules](http://blog.fpmurphy.com/2010/06/grub2-modules.html?output=pdf)
+
+我们从代码的角度简单分析 module 的实现框架。每一个 module 都需要 initialization 和 finalization 函数，分别由宏 GRUB_MOD_INIT 和 GRUB_MOD_FINI 辅助完成，他们的定义在 include/grub/dl.h 中：
+
+	/* 为了简洁，直接列出在 i386-pc 平台上该宏的定义 */
+	#define GRUB_MOD_INIT(name)	\
+	static void grub_mod_init (grub_dl_t mod __attribute__ ((unused))) __attribute__ 	((used)); \
+	void \
+	grub_##name##_init (void) { grub_mod_init (0); } \
+	static void \
+	grub_mod_init (grub_dl_t mod __attribute__ ((unused)))
+
+	#define GRUB_MOD_FINI(name)	\
+	static void grub_mod_fini (void) __attribute__ ((used)); \
+	void \
+	grub_##name##_fini (void) { grub_mod_fini (); } \
+	static void \
+	grub_mod_fini (void)
+
+可以看出，对于 initialization 和 finalization，每个 module 都定义了 static 的函数: grub_mod_init() 和 grub_mod_fini。在上文加载模块的 grub_dl_resolve_symbols 函数中有如下这么一段：
+
+	if (grub_strcmp (name, "grub_mod_init") == 0)
+	  mod->init = (void (*) (grub_dl_t)) sym->st_value;
+	else if (grub_strcmp (name, "grub_mod_fini") == 0)
+	  mod->fini = (void (*) (void)) sym->st_value;
+
+所以现在应该可以理解 grub_dl_init 函数了。以 normal 模块为例(grub-core/normal/main.c)，它的 initialization 函数内容很简单，基本都在注册命令，比如我们最关心的一个命令：
+
+	/* Register a command "normal" for the rescue mode.  */
+	grub_register_command ("normal", grub_cmd_normal, 0, N_("Enter normal mode."));
+
+grub_main 函数的最后一步就是执行这个命令。
+
+### normal 模块加载 linux kernel & initramfs
+
+grub-mkconfig 生成 grub.cfg 时，会根据实际环境在 menuentry 中使用 linux16/initrd16 或者 linux/initrd 命令，究竟如何决定，代码细节尚未分析，在此也暂时略过。现在只需要知道，他们分别对应了 16-bit/32-bit 的 linux/x86 boot protocal 即可，boot protocal 在 linux kernel 的 Documentation/x86/boot.txt 中有详细介绍。本文将以 16-bit boot protocal 为例进行代码分析。
+
+
+
+## 安装 GRUB
 
 安装 grub，需要系统中已安装 grub utility，然后通过 grub-install 将 grub 安装到驱动器中(硬盘或者软盘)。通常只需要指定安装的目标驱动器，比如，通常我们的电脑上只有一块硬盘，叫做 /dev/sda，则只需：
 
 	grub-install /dev/sda [-v]
 
-选项 -v 用来输出安装过程中的详细信息。想要更详细的输出信息，可以使用两个 `-v`
+选项 -v 用来输出安装过程中的详细信息。想要更详细的输出信息，可以使用 `-vv`
 
 官方文档中[科普](https://www.gnu.org/software/grub/manual/grub/html_node/Installation.html#Installation)了一些基础概念：
 
@@ -800,7 +1218,7 @@ man 手册中说：
 
 没有指定 boot image 和 core image 的时候，默认是 `--directory` 下的 boot.img 和 core.img。
 
-它的主要作用是将 core.img 和 boot.img 写入磁盘，源代码在 util/grub-setup.c，我们拣代码分析。和其他 grub utility 一样，开始是入参解析，然后作一堆初始化动作，看起来是为了访问 /boot 所在文件系统所需，最重要的代码就只有这个函数：
+它的主要作用是将 core.img 和 boot.img 写入磁盘，源代码在 util/grub-setup.c，我们拣关键代码分析。和其他 grub utility 一样，开始是入参解析，然后作一堆初始化动作，看起来是为了访问 /boot 所在文件系统所需，最重要的代码就只有这个函数：
 
 	/* Do the real work.  */
 	GRUB_SETUP_FUNC (arguments.dir ? : DEFAULT_DIRECTORY,
@@ -871,11 +1289,19 @@ man 手册中说：
 	dest_dev = grub_device_open (dest);
 	...
 	/* 省略一段 root device 分析，因为目前不确定它的含义。目前的理解是：一台 PC 上可能由很多块
-	 * 磁盘，安装了 grub 或操作系统那一块才叫 root device? 那么一般 PC 只有一块硬盘，它就是 root device */
+	 * 磁盘，安装了 grub 或操作系统那一块才叫 root device? 那么一般 PC 只有一块硬盘，它就是 root device
+	 * 艰难的看了这段代码，理解过程如下，从 /proc/self/mountinfo 中读取信息，跟入参 dir: /boot/grub/i386-pc
+	 * 比对，找到 mountinfo 中 mount point 是 /boot 的 mount source(参考 man proce)，
+	 * 最后确定 root device, 并设置到环境变量。我的测试中显示 root = hostdisk//dev/sda,msdos1 */
+	grub_util_info ("setting the root device to `%s'", root);
+	if (grub_env_set ("root", root) != GRUB_ERR_NONE)
+		grub_util_error ("%s", grub_errmsg);
 
 	#ifdef GRUB_SETUP_BIOS
 	  {
 		/* Read the original sector from the disk.  */
+		/* 读取当前 boot sector 中的内容，作用是：1. copy 当前 boot sector 可能存在的 BPB 数据;
+		 * 2. 修改指令适配有问题的 BIOS; 3. copy 分区表 */
     	tmp_img = xmalloc (GRUB_DISK_SECTOR_SIZE);
     	if (grub_disk_read (dest_dev->disk, 0, 0, GRUB_DISK_SECTOR_SIZE, tmp_img))
     	  grub_util_error ("%s", grub_errmsg);
@@ -892,7 +1318,7 @@ man 手册中说：
 		   for buggy BIOSes which don't pass boot drive correctly. Instead,
 		   they pass 0x00 or 0x01 even when booted from 0x80.  */
 		/* 上面的注释把 bug 解释的很清楚，关于 boot drive number 的问题在 boot.img
-		 * 一节已有解释。看起来一般x情况下都会改写 boot.img 中 boot_drive_check 处的 jmp 指令 */
+		 * 一节已有解释。看起来一般情况下都会改写 boot.img 中 boot_drive_check 处的 jmp 指令 */
 		if (!allow_floppy && !grub_util_biosdisk_is_floppy (dest_dev->disk))
 		{
 			/* Replace the jmp (2 bytes) with double nop's.  */
@@ -900,6 +1326,17 @@ man 手册中说：
 			boot_drive_check[1] = 0x90;
 		}
 		...
+		/* 这段代码用来获得 core image 将要安装到磁盘的位置(sector号)，存放在数组 sectors */
+		if (is_ldm)
+		  err = grub_util_ldm_embed (dest_dev->disk, &nsec, maxsec,
+				 GRUB_EMBED_PCBIOS, &sectors);
+		else if (ctx.dest_partmap)
+		  err = ctx.dest_partmap->embed (dest_dev->disk, &nsec, maxsec,
+				     GRUB_EMBED_PCBIOS, &sectors);
+		else
+		  err = fs->embed (dest_dev, &nsec, maxsec,
+		         GRUB_EMBED_PCBIOS, &sectors);
+
 		/* 清零原 diskboot.img 中 blocklist 结构体 */
 	    /* Clean out the blocklists.  */
 	    bl.block = bl.first_block;
@@ -912,10 +1349,15 @@ man 手册中说：
 			if ((char *) bl.block <= core_img)
 			grub_util_error ("%s", _("no terminator in the core image"));
 		}
-		/* 在下面的函数中又重新写回，细节掠过 */
+		/* 在此函数中更新 diskboot.img 中的 blocklist 数据，细节掠过 */
 		save_blocklists (sectors[i] + grub_partition_get_start (ctx.container),
 		       0, GRUB_DISK_SECTOR_SIZE, &bl);
+
+		/* 已经确定了 core.img 将要安装的 sector 地址，也要更新 boot.img 中的相关字段，使得
+		 * boot.img 可以找到 core.img 的第一个 sector 的内容，也即 diskboot.img */
+		write_rootdev (root_dev, boot_img, bl.first_sector);
 		...
+
 		/* 将 core.img 写入 */
 		/* Write the core image onto the disk.  */
 	    for (i = 0; i < nsec; i++)
@@ -928,6 +1370,111 @@ man 手册中说：
 	    if (grub_disk_write (dest_dev->disk, BOOT_SECTOR,
 			       0, GRUB_DISK_SECTOR_SIZE, boot_img))
 		    grub_util_error ("%s", grub_errmsg);
+
+
+#### grub-install
+介绍完了 grub-mkimage, grub-bios-setup，回头看 grub-install 的工作流程。上面已经说过，通常我们安装 grub 时候，只需要
+
+	grub-install /dev/sda
+
+而无需指定额外参数，grub 会自动配置好其他参数。grub-install 的工作主要是将 grub 的文件从 image directory 拷贝到 boot directory，然后调用 grub-mkimage 生成 core.img，调用 grub-bios-setup 来安装 boot.img 和 core.img。我们仍选择关键代码分析，以理解其过程。
+
+	/* 首先是一堆准备工作，各种读取文件*/
+	/* grub_install_source_directory 是上文中说的 image directory，target 在我们的例子中是 "i386-pc" */
+	if (!grub_install_source_directory)
+	  {
+        if (!target)
+		  {
+		    const char * t;
+		    t = get_default_platform ();
+			if (!t)
+			  grub_util_error ("%s", 
+			     _("Unable to determine your platform."
+			       " Use --target."));
+			  target = xstrdup (t);
+		  }
+		grub_install_source_directory
+			= grub_util_path_concat (2, grub_util_get_pkglibdir (), target);
+	  }
+
+	/* 通过 string 来获得枚举变量 platform。括号里面的代码看起来仅仅是 debug 用 */
+	platform = grub_install_get_target (grub_install_source_directory);
+
+	{
+	  char *platname = grub_install_get_platform_name (platform);
+      fprintf (stderr, _("Installing for %s platform.\n"), platname);
+      free (platname);
+	}
+
+	switch (platform)
+      {
+      /* 对于 i386-pc 平台来说，默认访问磁盘的方式是通过 BIOS INT13，所以 diskmodule
+       * 是 biosdisk module */
+  	  case GRUB_INSTALL_PLATFORM_I386_PC:
+  	    if (!disk_module)
+		  disk_module = xstrdup ("biosdisk");
+	    break;
+	  ...
+	  }
+
+	/* 创建 grub directory，一般是 /boot/grub/，可以在 configure 阶段进行配置 */
+	if (!bootdir)
+      bootdir = grub_util_path_concat (3, "/", rootdir, GRUB_BOOT_DIR_NAME);
+
+	{
+      char * t = grub_util_path_concat (2, bootdir, GRUB_DIR_NAME);
+      grub_install_mkdir_p (t);
+      grubdir = grub_canonicalize_file_name (t);
+      if (!grubdir)
+        grub_util_error (_("failed to get canonical path of `%s'"), t);
+      free (t);
+	}
+
+	/* 对于非 efi 来说，直接来到下面的函数，将 image directory 下的内容 copy 到 boot directory。
+	 * copy 的内容包括：image directory 下所有的 .mod 文件；{"efiemu32.o", * "efiemu64.o",
+	 * "moddep.lst", "command.lst", "fs.lst", "partmap.lst", "parttool.lst", "video.lst",
+	 * "crypto.lst", "terminal.lst", "modinfo.sh"} 等 12 个文件； image directory 下的 po 目录，
+	 * 即 locale 文件，在我们的测试环境中没有 po 目录； /usr/lib/grub/theme(我们的测试下环境)
+	 * 下的 theme 文件; /usr/lib/grub/ 下的 fonts 文件(.pf2) */
+	grub_install_copy_files (grub_install_source_directory,
+							 grubdir, platform);
+
+	/* 跨过一堆磁盘/文件系统检测相关的代码，终于来待生成 core.img 的代码 */
+	/* 不得不说， grub 的代码写的有点乱，这里的 platdir 指 boot directory，即 /boot/grub/i386-pc，
+	 * 所以 imgfile 指 /boot/grub/i386-pc/core.img */
+	char *imgfile = grub_util_path_concat (2, platdir, core_name);
+	char *prefix = xasprintf ("%s%s", prefix_drive ? : "", relative_grubdir);
+	/* 将调用 grub-mkimage 来生成 core.img，其实最终调用它的主要函数 grub_install_generate_image */
+	grub_install_make_image_wrap (/* source dir  */ grub_install_source_directory,
+				/*prefix */ prefix,
+				/* output */ imgfile,
+				/* memdisk */ NULL,
+				have_load_cfg ? load_cfg : NULL,
+				/* image target */ mkimage_target, 0);
+
+	/* core.img 已经生成到 boot directory 中，完成了大约一半的工作。下面该把 boot.img 也放到里面，
+	 * 过程比较简单，仅是从 image directory 中 copy 到 boot directory:
+	 * /usr/lib/grub/i386-pc/boot.img --> /boot/grub/i386-pc/boot.img */
+
+	{
+	  char *boot_img_src = grub_util_path_concat (2,
+		  				  grub_install_source_directory,
+						  "boot.img");
+	  char *boot_img = grub_util_path_concat (2, platdir,
+					      "boot.img");
+	  grub_install_copy_file (boot_img_src, boot_img, 1);
+	  /*  Now perform the installation. */
+	  /* install_bootsector 默认是1，所以默认将调用 grub-bios-setup 的主函数来安装 boot.img 和 core.img */
+	  if (install_bootsector)
+	    grub_util_bios_setup (platdir, "boot.img", "core.img",
+				  install_drive, force,
+				  fs_probe, allow_floppy, add_rs_codes);
+	}
+
+这就是 grub-install 的过程，大部分的代码都是为了最后调用 grub-mkimage 和 grub-bios-setup 做准备。
+
+
+## How linux kernel is booted
 
 
 ## APPENDIX
