@@ -1968,7 +1968,7 @@ setup.bin 的二进制文件布局由其 linker script arch/x86/boot/setup.ld �
 	section_table:
 		# The offset & size fields are filled in by build.c.
 		# 第一个 field 是 name，8 bytes 长，又因为 .ascii 表示的字符串在汇编时不包含结尾的空字符
-		# 所以，用 2 个 .byte 0 补气
+		# 所以，用 2 个 .byte 0 补齐
 		.ascii	".setup"
 		.byte	0
 		.byte	0
@@ -2051,14 +2051,14 @@ setup.bin 的二进制文件布局由其 linker script arch/x86/boot/setup.ld �
 		sti			# Now we should have a working stack
 
 	# We will have entered with %cs = %ds+0x20, normalize %cs so
-	# it is on par with the other segments. 用这个技巧重新 load cd 和 ip 寄存器
+	# it is on par with the other segments. 用这个技巧重新 load cs 和 ip 寄存器
 		pushw	%ds
 		pushw	$6f
 		lretw
 	6:
 
 	# Check signature at end of setup.
-	# setup_sig 是定义在 linker script 中的变量。理论上 他们不会不相等，看看 Maintainer
+	# setup_sig 是定义在 linker script 中的变量。理论上他们不会不相等，看看 Maintainer
 	# 的解释：https://lkml.org/lkml/2018/3/21/226。下面的 bss 清零代码也有个小问题，也在
 	# 上面的邮件里得到确认和澄清。
 		cmpl	$0x5a5aaa55, setup_sig
@@ -2270,44 +2270,43 @@ The functionality of A20M# is used primarily by older operating systems and not 
 
 	int enable_a20(void)
 	{
-       int loops = A20_ENABLE_LOOPS;
-       int kbc_err;
+		int loops = A20_ENABLE_LOOPS;
+		int kbc_err;
 
-       while (loops--) {
-	       /* First, check to see if A20 is already enabled
-			  (legacy free, etc.) */
-		   /* 这是重点函数，下面几个只是 enable a20 的不同方法。读取中断向量 0x80 所在地址
-		    * 0：200h 的一个 4 byte 整数，然后 ++ A20_TEST_LONG 次并写入原地址；从两个
-		    * real mode 下表示相同线性地址的逻辑地址中(0:200h 和 ffff:210h，real mode
-		    * 下都表示线性地址 512)分别读取它，判断是否相等，来判断 a20 是否 enable */
-	       if (a20_test_short())
-		       return 0;
+		while (loops--) {
+			/* First, check to see if A20 is already enabled(legacy free, etc.) */
+			/* 这是重点函数，下面几个只是 enable a20 的不同方法。读取中断向量 0x80 所在地址
+			 * 0：200h 的一个 4 byte 整数，然后 ++ A20_TEST_LONG 次并写入原地址；从两个
+			 * real mode 下表示相同线性地址的逻辑地址中(0:200h 和 ffff:210h，real mode
+			 * 下都表示线性地址 512)分别读取它，判断是否相等，来判断 a20 是否 enable */
+			if (a20_test_short())
+				return 0;
 
 			/* 下面几种 enable a20 的方法，在上面第2篇文章里都有描述，不是本文重点 */
-	       /* Next, try the BIOS (INT 0x15, AX=0x2401) */
-	       enable_a20_bios();
-	       if (a20_test_short())
-		       return 0;
+			/* Next, try the BIOS (INT 0x15, AX=0x2401) */
+			enable_a20_bios();
+			if (a20_test_short())
+				return 0;
 
-	       /* Try enabling A20 through the keyboard controller */
-	       kbc_err = empty_8042();
+			/* Try enabling A20 through the keyboard controller */
+			kbc_err = empty_8042();
 
-	       if (a20_test_short())
-		       return 0; /* BIOS worked, but with delayed reaction */
+			if (a20_test_short())
+				return 0; /* BIOS worked, but with delayed reaction */
 
-	       if (!kbc_err) {
-		       enable_a20_kbc();
-		       if (a20_test_long())
-			       return 0;
-	       }
+			if (!kbc_err) {
+				enable_a20_kbc();
+				if (a20_test_long())
+					return 0;
+			}
 
-	       /* Finally, try enabling the "fast A20 gate" */
-	       enable_a20_fast();
-	       if (a20_test_long())
-		       return 0;
-       }
+			/* Finally, try enabling the "fast A20 gate" */
+			enable_a20_fast();
+			if (a20_test_long())
+				return 0;
+		}
 
-       return -1;
+		return -1;
 	}
 
 在 setup 的代码中，还经常使用了 in/out 指令来操作 I/O port，比如常见的 io_delay 函数，这里有一个[简单介绍](http://lkml.iu.edu/hypermail/linux/kernel/0802.2/0766.html)。
@@ -2402,7 +2401,7 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
 ## APPENDIX
 
-### 常见汇编指令说明
+### 常见汇编指令快速参考
 
 #### CMP
 
@@ -2415,4 +2414,4 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
 #### TEST
 
-将两个操作数做逻辑云
+将两个操作数做逻辑与
