@@ -922,7 +922,7 @@ grub_load_modules 函数比较复杂，下面拿出来单独分析。核心内�
 			  + mod->symsize * ELF_R_SYM (rel->r_info));
 
 		/* 根据重定位类型手动进行重定位。在之前的函数 grub_dl_resolve_symbols 中，已将 buffer 中
-		 * 符号表 entry 的 st_value 修改为符号的地址。下面的重定位也很容易理解，不赘述。 */
+		 * 符号表 entry 的 st_value 修改为符号的地址。下面的重定位也很容易理解，不赘述 */
         switch (ELF_R_TYPE (rel->r_info))
 		{
 		case R_386_32:
@@ -984,7 +984,7 @@ Ok，终于介绍完了 grub_load_modules 函数，至此，我们可以对上�
 	  ...
 	}
 
-展示 grub menu，获得 menu entry 并执行这个 entry 的 callchain 长这样：
+展示 grub menu，获得 menu entry 并执行这个 entry 的 callchain 长这样(待修改为图片)：
 
 >grub_normal_execute
  	--> grub_show_menu
@@ -1038,7 +1038,7 @@ grub_main 函数的最后一步就是执行这个命令。
 
 ### normal 模块加载 linux kernel & initramfs
 
-grub-mkconfig 生成 grub.cfg 时，会根据实际环境在 menuentry 中使用 linux16/initrd16 或者 linux/initrd 命令，究竟如何决定，代码细节尚未分析，在此也暂时略过。现在只需要知道，他们分别对应了 16-bit/32-bit 的 linux/x86 boot protocal 即可，boot protocal 在 linux kernel 的 Documentation/x86/boot.txt 中有详细介绍。本文将以 16-bit boot protocal 为例进行代码分析。
+grub-mkconfig 生成 grub.cfg 时，会根据实际环境在 menuentry 中使用 linux16/initrd16 或者 linux/initrd 命令，究竟如何决定，代码细节尚未分析，在此也暂时略过。现在只需要知道，他们分别对应了 16-bit/32-bit 的 linux/x86 boot protocal 即可，boot protocol 在 linux kernel 的 Documentation/x86/boot.txt 中有详细介绍。本文将以 16-bit boot protocol 为例进行代码分析。
 
 上文已经说过，normal 模块解析 grub.cfg 的 menu entry，然后执行选中的 entry，即执行 entry 中的命令。其中 linux 和 initrd 命令是用来加载 linux kernel 和 initramfs，本文以 linux16/initrd16 为例进行代码分析。在 grub.cfg 的 menu entry 中，这两条命令一般长这样：
 
@@ -1052,37 +1052,39 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 	{
 	  struct linux_i386_kernel_header lh;
 	  ...
-	  /* argv[0] 即跟在命令后的第一个参数，即要加载的文件。打开获得一个文件 Handle */
+	  /* argv[0] 是跟在 linux16 命令后的第一个参数，即要加载的 bzImage 文件。打开获得一个文件 Handle */
 	  file = grub_file_open (argv[0]);
 	  ...
-	  /* 然后读取 kernel image 开始的数据，存放在 linux_i386_kernel_header 结构中，这个结构
-	   * 就是 boot protocol 的内容，在 kernel 文档中有详细描述，这不是本节的分析重点。读取出来后
-	   * 必然要做相关的读写判断操作 */
+	  /* 然后读取 bzImage 头部的数据，存放在 linux_i386_kernel_header 结构中，这个结构包含 boot
+	   * protocol 的内容，在 linux kernel 文档中有详细描述，不是本节的分析重点。读取后对部分数据做判断 */
 	  if (grub_file_read (file, &lh, sizeof (lh)) != sizeof (lh))
 	  ...
 
-	  /* 初始化。Documentation/x86/boot.txt: protocol 2.05 and earlier, 最大值是 255。
-	  * 256是包括了结尾的 0 */
+	  /* 初始化部分变量 */
+	  ...
+	  /* Documentation/x86/boot.txt: protocol 2.05 and earlier, 最大值是 255。
+	   * 这里 256 是包括了结尾的 0 */
 	  maximal_cmdline_size = 256;
 
 	  /* protocol 2.00 是个分界线，之前不支持 bzImage & initrd */
 	  if (lh.header == grub_cpu_to_le32_compile_time (GRUB_LINUX_I386_MAGIC_SIGNATURE)
 		  && grub_le_to_cpu16 (lh.version) >= 0x0200)
 	  {
-	    /* 给 kernel image 中的 real mode(setup.bin) 部分分配内存空间，后面会详细分析。此时，只需知道
-		 * 将找一块结束地址 < 0xa0000 且 size >= GRUB_LINUX_CL_OFFSET + maximal_cmdline_size 的区域，
-		 * 用于加载 linux 的 setup.bin，为什么是 0xa0000? 参考 Documentation/x86/boot.txt
+	    /* 给 bzImage 中的 real mode 部分(setup.bin)分配内存空间，后面会详细分析。此时，只需知道将
+		 * 找一块结束地址 < 0xa0000 且 size >= GRUB_LINUX_CL_OFFSET + maximal_cmdline_size
+		 * 的区域，用于加载 real mode 部分。为什么是 0xa0000? 参考 Documentation/x86/boot.txt
 		 * 中 bzImage memory layout 的图示。
-		 * 这里有一点需要注意，同样是表示地址，变量 grub_linux_real_target 容易和下面的
-		 * grub_linux_real_chunk 混淆，仔细看会发现前者的类型是整数，典型的用作跳转指令的操作数；
-		 * 后者是指针 char*，用于内存读写操作。
-		 * 所以下面会做转换。
-		 */
+		 * 这里有一点需要注意，同样是表示 real mode 部分的地址，变量 grub_linux_real_target 容易
+		 * 和下面的 grub_linux_real_chunk 混淆，仔细看会发现前者的类型是整数，典型的用作跳转指令的操作数；
+		 * 后者是指针 char *，用于内存读写操作。所以下面会做转换。*/
 		grub_linux_real_target = grub_find_real_target ();
 		....
 	  }
 
-	  /* 使用了神秘的 relocator 机制，将 grub_linux_real_target 转换为 grub_linux_real_chunk */
+	  /* 使用了神秘的 relocator 机制，将整数类型的 grub_linux_real_target 转换为指针类型的
+	   * grub_linux_real_chunk。前者只是根据 E820 的信息找出一块符合要求(大小，类型是可用)的内存，
+	   * 但是这很粗糙，经过神秘的 relocator 机制，与 grub 的内存管理机制做了一次交互，也就是说分配内存
+	   * 的事情还是要通过 grub 的内存管理机制。待明确 */
 	  relocator = grub_relocator_new ();
 	  if (!relocator)
 		goto fail;
@@ -1091,17 +1093,23 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 	  err = grub_relocator_alloc_chunk_addr (relocator, &ch,
 		  			     grub_linux_real_target,
 					     GRUB_LINUX_CL_OFFSET + maximal_cmdline_size);
-	  if (err)
-	    return err;
+
+	  ...
 	  grub_linux_real_chunk = get_virtual_current_address (ch);
 
-	  /* Put the real mode code at the temporary address.
-	   * 如官方注释所说，将 linux kernel 的 real mode 代码加载到内存中 */
+	  /* Put the real mode code at the temporary address. */
+	   * 如官方注释所说，将 linux kernel 的 real mode 代码加载到内存中，先把
+	   * linux_i386_kernel_header 的数据放入，然后将剩余部分从文件读出放入内存 */
 	  grub_memmove (grub_linux_real_chunk, &lh, sizeof (lh));
+	  len = real_size + GRUB_DISK_SECTOR_SIZE - sizeof (lh);
+	  if (grub_file_read (file, grub_linux_real_chunk + sizeof (lh), len) != len)
+	  {
+	    ...
+	  }
 	  ...
 
 	  /* Create kernel command line. */
-	  /* 然后在紧挨 real mode 的 code，写入命令行字符串 */
+	  /* 在 real mode 部分(setup.bin)空间后面写入 linux kernel 的 command line */
 	  grub_memcpy ((char *)grub_linux_real_chunk + GRUB_LINUX_CL_OFFSET,
 			LINUX_IMAGE, sizeof (LINUX_IMAGE));
 	  /* 这里的 -1 是因为 LINUX_IMAGE 表示的字符串末尾是空字符(0)结尾 */
@@ -1111,27 +1119,27 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 			      maximal_cmdline_size
 			      - (sizeof (LINUX_IMAGE) - 1));
 
-	  /* 将 linux kernel image 的 protect mode 部分加载到地址： GRUB_LINUX_BZIMAGE_ADDR(0x100000)
+	  /* 将 bzImage 的 protect mode 部分加载到地址： GRUB_LINUX_BZIMAGE_ADDR(0x100000)
 	   * 或 GRUB_LINUX_ZIMAGE_ADDR(0x10000)。省略代码分析*/
 	  ...
 
 	  if (grub_errno == GRUB_ERR_NONE)
 	  {
-	    /* 这是最后一步，注册一个启动 OS 的 callback 函数:grub_linux16_boot，并 set 各种标记:
+	    /* 最后一步，注册启动 OS 的 callback 函数: grub_linux16_boot，并 set 各种标记:
 	     * loaded, grub_loader_flags, grub_loader_loaded 后续使用 */
 		grub_loader_set (grub_linux16_boot, grub_linux_unload, 0);
 		loaded = 1;
 	  }
 	}
 
-	/* 给 real mode 的 kernel 代码找一个合适的加载位置 */
+	/* 给 bzImage 的 real mode 部分找一个合适的加载地址 */
 	static grub_addr_t grub_find_real_target (void)
 	{
 	  grub_uint64_t result = (grub_uint64_t) -1;
 
 	  /* 因为考虑了很多不同的情况，此函数比较复杂。我们以最简单的情况分析，其过程可以这样理解：
-	   * 通过 E820 获取所有 memory map 的信息，交给函数 target_hook 处理选择：
-	   *   1. 类型必须是 GRUB_MEMORY_AVAILABLE
+	   * 通过 E820 获取所有 memory map 的信息，交给 target_hook 函数处理选择：
+	   *   1. 类型是 GRUB_MEMORY_AVAILABLE
 	   *   2. 结束地址小于 0xa0000
 	   *   3. size 必须大于 GRUB_LINUX_CL_OFFSET + maximal_cmdline_size，若某块 memory
 	   *      size 大于它，则从这块 memory 尾端开始留出这个 size 的区域，目的如原注释所说：
@@ -1142,8 +1150,9 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 	  return result;
 	}
 
+有一个细节需要知道： 对于 linux kernel 的 real mode 部分，即 setup.bin 的 size，其实包括了两部分，一是开头的 512 bytes，由于历史的原因，被称为 boot sector，因为最早的 linux kernel 自带 boot sector，可以直接由 bios 启动；二是剩余部分，被称为 setup 代码，这部分的 size 由 boot protocol 中的 setup_sects 指示，单位如它的名字所示，是 sector。
 
-从 grub 的角度来看，linux kernel image 的 real mode 部分最大是 GRUB_LINUX_MAX_SETUP_SECTS(64) x GRUB_DISK_SECTOR_BITS(512) = 32k。代码中实际是按照 GRUB_LINUX_CL_OFFSET(0x9000) + maximal_cmdline_size = 36k + maximal_cmdline_size 来分配内存的，多出来的 4k 是留作 stack & heap 使用，grub_cmd_linux 函数中有：
+从 grub 的代码来看，bzImage 的 real mode 部分最大是 GRUB_LINUX_MAX_SETUP_SECTS(64) x GRUB_DISK_SECTOR_BITS(512) = 32k，包括开头 512 bytes 的 boot sector，所以 setup code 实际最大只有 31k；从 linux 的文档 [Documentation/x86/boot.txt](https://github.com/torvalds/linux/blob/master/Documentation/x86/boot.txt) 中的 bzImage memory layout 也可以看出 linux kernel 的 setup + boot sector 的大小是 0x8000，即 32k。代码实际是按照 GRUB_LINUX_CL_OFFSET(0x9000) + maximal_cmdline_size = 36k + maximal_cmdline_size 来分配内存的，多出来的 (36k - 32k = 4k) 是留作 stack & heap 用，但他们的界限要等到进入 linux kernel 后才能确定(下方章节的 init_heap 函数)。grub_cmd_linux 函数中有：
 
 	lh.heap_end_ptr = grub_cpu_to_le16_compile_time (GRUB_LINUX_HEAP_END_OFFSET);
 
@@ -1151,7 +1160,7 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 
 >Set this field to the offset (from the beginning of the real-mode code) of the end of the setup stack/heap, minus 0x0200.
 
-不知道为什么要减去 0x200。也就是说，36k的空间，包含了 linux 的 setup 代码，除去 setup 的空间，剩下的用作 stack & heap，但他们的界限要等到进入 linux kernel 后，由 Linux kernel 确定(下方章节的 init_heap 函数)。在启动 OS 的函数 *grub_linux16_boot* 中有：
+不知道为什么要减去 0x200。在启动 OS 的函数 *grub_linux16_boot* 中有：
 
 	state.sp = GRUB_LINUX_SETUP_STACK;
 
@@ -1216,8 +1225,10 @@ grub_cmd_boot 函数的内容只有一行：调用 grub_loader_boot 函数，继
 	grub_err_t grub_relocator16_boot (..., struct grub_relocator16_state state)
 	{
 	  /* Put it higher than the byte it checks for A20 check.  */
-	  /* 从[0x8010 - 0xa0000]中分配一块 size 为 RELOCATOR_SIZEOF (16) + GRUB_RELOCATOR16_STACK_SIZE
-	   * 的内存，保存在变量 ch 中。在此上下文中，用 A1 表示这块内存的起始地址 */
+	  /* 从[0x8010 ~ 0xa0000- RELOCATOR_SIZEOF (16)- GRUB_RELOCATOR16_STACK_SIZE]中
+	   * 分配一块 size 为 RELOCATOR_SIZEOF (16) + GRUB_RELOCATOR16_STACK_SIZE 的内存，
+	   * 保存在变量 ch 中。在此上下文中，用 A1 表示这块内存的起始地址。RELOCATOR_SIZEOF (16)
+	   * 表示 relocator16.S 中 grub_relocator16_end - grub_relocator16_start 的大小。*/
 	  err = grub_relocator_alloc_chunk_align (rel, &ch, 0x8010,
 					  0xa0000 - RELOCATOR_SIZEOF (16)
 					  - GRUB_RELOCATOR16_STACK_SIZE,
@@ -1228,7 +1239,7 @@ grub_cmd_boot 函数的内容只有一行：调用 grub_loader_boot 函数，继
 
 	  /* 用入参 state 对 relocator16.S 中的各种变量赋值。代码省略 */
 	  ...
-	  /* 然后将 relocator16.S 中所有 code 和 data 拷贝到刚刚分配的内存 A1 中，等待被跳转执行。
+	  /* 然后将 relocator16.S 中的代码拷贝到刚刚分配的内存 A1 处，等待被跳转执行。
 	   * 跳转发生在下面 relst 的那行代码中 */
 	  grub_memmove (get_virtual_current_address (ch), &grub_relocator16_start,
 					RELOCATOR_SIZEOF (16));
@@ -1237,26 +1248,27 @@ grub_cmd_boot 函数的内容只有一行：调用 grub_loader_boot 函数，继
 	  err = grub_relocator_prepare_relocs (rel, get_physical_target_address (ch),
                                            &relst, NULL);
 
+	  /* 执行 relocator16.S 的代码拷贝 */
 	  ((void (*) (void)) relst) ();
 	}
 
 	/* 此函数比较复杂，目前只略看懂了主干 */
 	grub_err_t grub_relocator_prepare_relocs (..., grub_addr_t addr, void **relstart,...)
 	{
-	  /* 通过 malloc_in_range 又在[0 - 4G]范围中分配了 size 为 7(x86) 或者 12(x86_64) bytes
+	  /* 通过 malloc_in_range 在[0 - 4G]范围中分配 size 为 7(x86) 或者 12(x86_64) bytes
 	   * 的一块内存，然后记录在变量 rels 和 rels0 中。*/
 	  ...
 	  /* jumper 函数，顾名思义，在刚分配的内存中 hardcode 几条指令进行跳转。由函数里的注释可知，
 	   * 写了 2 条指令，对 i386 来说是：
 	   *   movl imm32, %eax // 这个立即数是入参 addr，即 A1
-	   *   jmp $eax  // 跳转到 入参 addr 表示的地址处，其内容是 relocator16.S 中 grub_relocator16_start 以后的部分
+	   *   jmp $eax  // 跳转到 入参 addr 表示的地址处，即 relocator16.S 中 grub_relocator16_start 处
 	   */
 	  grub_cpu_relocator_jumper ((void *) rels, (grub_addr_t) addr);
 	  /* 将 hardcode 指令的地址传出去，等待执行 */
 	  *relstart = rels0;
 	}
 
-relocator16.S 的主要工作是从 protect mode 切换回 real mode，步骤可以参考：[Switching from Protected Mode to Real Mode](https://wiki.osdev.org/Real_Mode#Switching_from_Protected_Mode_to_Real_Mode)。代码流程大致如上文所述。下面分析 relocator16.S 的重点代码：
+relocator16.S 的主要工作是从 protect mode 切换回 real mode，步骤可以参考：[Switching from Protected Mode to Real Mode](https://wiki.osdev.org/Real_Mode#Switching_from_Protected_Mode_to_Real_Mode)。代码流程大致如上文所述。它的代码作为 relocator module 的一部分已在内存中，但此时执行的是其在内存中的一份拷贝。下面分析 relocator16.S 的重点代码：
 
 	#include "relocator_common.S"
 
@@ -1272,10 +1284,10 @@ PREAMBLE 是定义在 grub-core/lib/i386/relocator_common.S 的宏：
 		 * 所以说 eax(x86) 寄存器包含的是新的 'base'。保存 A1 到 esi(x86) 寄存器 */
 		mov	RAX, RSI
 		...
-		/* 加上这个宏所表示代码的 size 到 A1 处 */
+		/* 加上这个宏定义代码的 size 到 A1 处 */
 		add	$(LOCAL(cont0) - LOCAL(base)), RAX
 		...
-		/* 又是一个 absolute jump，跳转到 relocator16.S 中 PREAMBLE 之后的代码处 */
+		/* 又一个 absolute jump，跳转到 relocator16.S 中 PREAMBLE 之后的代码处 */
 		jmp	*RAX
 	LOCAL(cont0):
 		.endm
@@ -1298,7 +1310,9 @@ RELOAD_GDT 也是定义在 grub-core/lib/i386/relocator_common.S 的宏：
 
 		.macro RELOAD_GDT
 		/* 将此宏结束位置(relocator16.S 中)的 effective address(段内offset) 保存到 eax 寄存器；
-		 * 然后继续保存到 local label: jump_vector 处 */
+		 * 然后继续保存到 local label: jump_vector 处。这里的 (RSI, 1) 是 AT&T 汇编语法，参考
+		 * "9.15.7 Memory References" of `info as`。有一个tips：这里的 1 是元素 SCALE，因为
+		 * 手册中有说：BASE 和 INDEX 是寄存器。*/
 		lea	(LOCAL(cont1) - LOCAL(base)) (RSI, 1), RAX
 		movl	%eax, (LOCAL(jump_vector) - LOCAL(base)) (RSI, 1)
 
@@ -1310,15 +1324,15 @@ RELOAD_GDT 也是定义在 grub-core/lib/i386/relocator_common.S 的宏：
 		lgdt	(LOCAL(gdtdesc) - LOCAL(base)) (RSI, 1)
 
 		/* Update %cs. 实际只是跳转到本宏结束的位置，这里多此一举的用 long jump 的原因如注释所说：
-		 * 更新 cs。 关于 ljmp 指令的解释，参考 intel 指令手册中的 JMP 指令：“Far Jumps in
-		 * Real-Address or Virtual-8086 Mode.” 和 “Far Jumps in Protected Mode” 两部分。
-		 * 然后此处又是一个 absolute jump，怪不得上面用 lea 指令在 jump_vector 处填入
+		 * 更新 cs，因为刚更新完GDT。 关于 ljmp 指令的解释，参考 intel 指令手册中的 JMP 指令：
+		 * “Far Jumps in Real-Address or Virtual-8086 Mode.” 和 “Far Jumps in Protected Mode”
+		 * 两部分。然后此处又是一个 absolute jump，怪不得上面用 lea 指令在 jump_vector 处填入
 		 * effective address */
 		ljmp	*(LOCAL(jump_vector) - LOCAL(base)) (RSI, 1)
 
 		.p2align	4 /* 以 16 byte 对齐 */
-	/* 下面2个 label 表示 GDTR 的内容，用于 lgdt 加载时使用。用2个 label 表示，
-	 * 可能是因为 gdt_addr 需要单独赋值 */
+	/* 下面 2 个 label 表示 GDTR 的内容，用于 lgdt 加载时使用。用 2 个 label 表示，
+	 * 是因为 gdt_addr 需要单独赋值 */
 	LOCAL(gdtdesc):
 		.word	LOCAL(gdt_end) - LOCAL(gdt)
 	LOCAL(gdt_addr):
@@ -1332,7 +1346,9 @@ RELOAD_GDT 也是定义在 grub-core/lib/i386/relocator_common.S 的宏：
 		.long	CODE_SEGMENT /* 待加载进 CS 的 segment selector value，定义为 8，表示
 		                      * GDT 中 index 为 1 的 descripter。参考 intel 手册 3a
 		                      * 中的 Figure 3-6. Segment Selector。一事不明：
-		                      * 为什么用 .long 定义 CS selector value？*/
+		                      * 为什么用 .long 定义 CS selector value？ 咨询社区后得到答复：
+		                      * https://www.mail-archive.com/grub-devel@gnu.org/msg27434.html
+		                      * 看起来应该只是个类似手误的问题，多出了 2 个 byte，并不妨事 */
 	LOCAL(cont1):
 		.endm
 
@@ -1352,10 +1368,12 @@ DISABLE_PAGING 顾名思义，不用过多解释。因为 grub kernel 运行在 
 
 然后更新所有 segment register，cs 处理特殊一点点：
 
-		/* 更新除 cs 外的其他 segment register */
+		/* 更新除 cs 外的其他 segment register。本段代码中，这些寄存器被更新了2次，但又没有
+		 * 实际内存操作，也得到答复： https://www.mail-archive.com/grub-devel@gnu.org/msg27434.html
+		 * 老代码就是这样，没人愿意冒风险去动它。 */
 		...
-		/* esi 寄存器一直保存着地址 A1，右移 4 bit，得到 real mode 下的段基址，保存到 local label:
-		 * segment 中。*/
+		/* esi 寄存器一直保存着地址 A1，右移 4 bit，得到 real mode 下的段基址，
+		 * 保存到 local label: segment 中。*/
 		movl 	%esi, %eax
 		shrl	$4, %eax
 		movw	%ax, (LOCAL (segment) - LOCAL (base)) (%esi, 1)
@@ -1376,7 +1394,7 @@ DISABLE_PAGING 顾名思义，不用过多解释。因为 grub kernel 运行在 
 
 		/* flush prefetch queue, reload %cs。因为之前已经填充 label: segment 为段基址，
 		 * 而当前 cs 的值是 selector value，所以需要更新为 real mode 下的段基址。 */
-		/* ljmp。hardcode ljmp 指令  */
+		/* ljmp。hardcode ljmp 指令 */
 		.byte	0xea
 		.word 	LOCAL(cont3)-LOCAL(base)
 	LOCAL(segment):
@@ -1385,16 +1403,17 @@ DISABLE_PAGING 顾名思义，不用过多解释。因为 grub kernel 运行在 
 	LOCAL(cont3):
 		/* 从此开始，工作在真正的 real mode 下*/
 		...
-		/* 初始化 stack，因为下面很快就要出现 call 指令。stack 和代码段在同一个 segment 中，
-		 * 因为 label: base 位于这个 segment 的地址 0 处，所以两个 label 之差，虽然是 offset，
-		 * 但值可以作为地址了，然后初始化其 size 为 4k */
+		/* 初始化 stack，因为下面 a20 检查的代码中多次出现 call 指令。stack 和代码段在同一个
+		 * segment 中，因为 label: base 位于这个 segment 的地址 0 处，所以两个 label 之差
+		 * 虽是 offset，但值可以作为地址。然后初始化其 size 为 4k，这也是在 grub_relocator16_boot
+		 * 函数中被 malloc 过的。 */
 		movw    %cs, %ax
 		movw    %ax, %ss
 		leaw    LOCAL(relocator16_end) - LOCAL(base), %sp
 		addw    $GRUB_RELOCATOR16_STACK_SIZE, %sp
 
-		/* 继做了一堆杂事后，又来到了重点代码，拿最最最开始 grub_linux16_boot 函数中初始化的
-		 * 各寄存器值，填入到各寄存器中。同样是 hardcode 指令 */
+		/* 此处略过一堆 a20 检查的代码，又回到重点代码，拿最开始 grub_linux16_boot 函数中
+		 * 初始化的各寄存器值，填入到各寄存器中。同样是 hardcode 指令 */
 	LOCAL(gate_a20_done):
 		/* we are in real mode now
 		 * set up the real mode segment registers : DS, SS, ES
@@ -1413,7 +1432,7 @@ DISABLE_PAGING 顾名思义，不用过多解释。因为 grub kernel 运行在 
 	VARIABLE(grub_relocator16_ip)
 		.word	0
 	VARIABLE(grub_relocator16_cs)
-	.word	0
+		.word	0
 
 	/* OK, Finally total finished! 终于跳转到内存中已加载的 linux kernel setup 部分的代码 */
 
@@ -1856,7 +1875,7 @@ man 手册中说：
 
 ## How linux kernel is booted
 
-linux kernel 编译出来的 bzImage 中包括如下部分： 运行在 real mode 下的 setup.bin；运行在 protect mode 下的 vmlinux.bin；可选的包含重定位信息的 vmlinux.relocs。上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。所以，首先来看 setup.bin 的流程
+linux kernel 编译出来的 bzImage 中包括如下部分： 运行在 real mode 下的 setup.bin；运行在 protect mode 下的 vmlinux.bin；包含重定位信息的 vmlinux.relocs(可选)。上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。由 grub 的 linux16 命令加载启动的内核将首先执行 setup.bin 的代码 所以，首先来看 setup.bin 的流程
 
 ### setup.bin
 
