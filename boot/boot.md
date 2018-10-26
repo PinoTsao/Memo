@@ -1152,7 +1152,11 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 
 有一个细节需要知道： 对于 linux kernel 的 real mode 部分，即 setup.bin 的 size，其实包括了两部分，一是开头的 512 bytes，由于历史的原因，被称为 boot sector，因为最早的 linux kernel 自带 boot sector，可以直接由 bios 启动；二是剩余部分，被称为 setup 代码，这部分的 size 由 boot protocol 中的 setup_sects 指示，单位如它的名字所示，是 sector。
 
-从 grub 的代码来看，bzImage 的 real mode 部分最大是 GRUB_LINUX_MAX_SETUP_SECTS(64) x GRUB_DISK_SECTOR_BITS(512) = 32k，包括开头 512 bytes 的 boot sector，所以 setup code 实际最大只有 31k；从 linux 的文档 [Documentation/x86/boot.txt](https://github.com/torvalds/linux/blob/master/Documentation/x86/boot.txt) 中的 bzImage memory layout 也可以看出 linux kernel 的 setup + boot sector 的大小是 0x8000，即 32k。代码实际是按照 GRUB_LINUX_CL_OFFSET(0x9000) + maximal_cmdline_size = 36k + maximal_cmdline_size 来分配内存的，多出来的 (36k - 32k = 4k) 是留作 stack & heap 用，但他们的界限要等到进入 linux kernel 后才能确定(下方章节的 init_heap 函数)。grub_cmd_linux 函数中有：
+从 grub 的代码来看，bzImage 的 real mode 部分最大是 GRUB_LINUX_MAX_SETUP_SECTS(64) x GRUB_DISK_SECTOR_BITS(512) = 32k，包括开头 512 bytes 的 boot sector，所以 setup code 实际最大只有 31k；从 linux 的文档 [Documentation/x86/boot.txt](https://github.com/torvalds/linux/blob/master/Documentation/x86/boot.txt) 中的 bzImage memory layout 也可以看出 linux kernel 的 setup + boot sector 的大小是 0x8000，即 32k；更确凿的证据在 arch/x86/boot/setup.ld 中：
+
+	. = ASSERT(_end <= 0x8000, "Setup too big!");
+
+代码实际是按照 GRUB_LINUX_CL_OFFSET(0x9000) + maximal_cmdline_size = 36k + maximal_cmdline_size 来分配内存的，多出来的 (36k - 32k = 4k) 是留作 stack & heap 用，但他们的界限要等到进入 linux kernel 后才能确定(下方章节的 init_heap 函数)。grub_cmd_linux 函数中有：
 
 	lh.heap_end_ptr = grub_cpu_to_le16_compile_time (GRUB_LINUX_HEAP_END_OFFSET);
 
@@ -1424,8 +1428,8 @@ DISABLE_PAGING 顾名思义，不用过多解释。因为 grub kernel 运行在 
 		.word	0
 		movw	%ax, %ds
 
-		/* 下面是其他寄存器的赋值，大部分代码逻辑跟上面一样，省略。只有 cs 寄存器的更新不同，
-		 * 是通过 ljmp 指令，相应的 label 已在 grub_linux16_boot 中初始化完成 */
+		/* 下面是其他寄存器的赋值，大部分代码逻辑跟上面一样，故省略。只有 cs 寄存器的更新不同，
+		 * 是通过 ljmp 指令，相应的 label 已在 grub_linux16_boot 中初始化 */
 		...
 		/* ljmp */
 		.byte	0xea
@@ -1434,7 +1438,13 @@ DISABLE_PAGING 顾名思义，不用过多解释。因为 grub kernel 运行在 
 	VARIABLE(grub_relocator16_cs)
 		.word	0
 
-	/* OK, Finally total finished! 终于跳转到内存中已加载的 linux kernel setup 部分的代码 */
+	/* OK, Finally total finished! 终于跳转到内存中已加载的 linux kernel 的 setup 代码。
+	 * 回顾上面 CS 寄存器的变化过程：CS 本来是使用的 grub 自己的 GDT 中的 code segment；
+	 * 走到 relocator16.S 后，更新为一个临时的由变量 gdt 表示的 GDT 中的 64k 大小的代码段，
+	 * 因为它是 protect mode 下的 64k 大小的 segment，所以被称为 PSEUDO_REAL_CSEG，这是为跳回
+	 * real mode 做准备；以 relocator16.S所在的起始地址为段基址，又做了一次跳转，更新 CS，
+	 * 现在的 CS 和刚刚 protect mode 下 PSEUDO_REAL_CSEG 是同样的段基址;最后以加载的
+	 * linux kernel 所在地址做段基址，通过 ljmp 更新 cs*/
 
 grub 启动的代码终于结束了，下面进入到 linux kernel，在分析 linux kernel 之前，有必要了解另一个主题： grub 的安装，才能对上面 grub 流程中的部分细节有更确切的理解。
 
@@ -1543,7 +1553,7 @@ SUFFIX 宏分别定义在 util/grub-mkimage32.c：
 	compress_kernel (image_target, kernel_img, layout.kernel_size + total_module_size,
 		   &core_img, &core_size, comp);
 
-打包后，压缩前的数据长这样：
+压缩前的数据长这样：
 
 ![kernel & mod](grub_kern_mod.png)
 
@@ -1788,7 +1798,7 @@ man 手册中说：
 		    const char * t;
 		    t = get_default_platform ();
 			if (!t)
-			  grub_util_error ("%s", 
+			  grub_util_error ("%s",
 			     _("Unable to determine your platform."
 			       " Use --target."));
 			  target = xstrdup (t);
@@ -1875,7 +1885,7 @@ man 手册中说：
 
 ## How linux kernel is booted
 
-linux kernel 编译出来的 bzImage 中包括如下部分： 运行在 real mode 下的 setup.bin；运行在 protect mode 下的 vmlinux.bin；包含重定位信息的 vmlinux.relocs(可选)。上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。由 grub 的 linux16 命令加载启动的内核将首先执行 setup.bin 的代码 所以，首先来看 setup.bin 的流程
+linux kernel 编译出来的 bzImage 中包括如下部分： 运行在 real mode 下的 setup.bin；运行在 protect mode 下的 vmlinux.bin；包含重定位信息的 vmlinux.relocs(可选)。上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。由 grub 的 linux16 命令加载启动的内核将首先执行 setup.bin 的代码 所以，首先来看 setup.bin 的流程.
 
 ### setup.bin
 
@@ -1914,7 +1924,11 @@ setup.bin 的二进制文件布局由其 linker script arch/x86/boot/setup.ld �
 2. [PE 32bit illustration](https://commons.wikimedia.org/wiki/File:Portable_Executable_32_bit_Structure.png)
 3. [The Linux EFI Boot Stub](https://firmware.intel.com/blog/linux-efi-boot-stub)
 
-用文字简单概括 PE 格式： MS-DOS stub(Image Only) + signature("PE\0\0", Image Only) + COFF file header(Object and Image) + Optional header(Image Only，包括3个主要部分：Standard fields, Windows-specific fields, Data directories) + section table。下面进行代码详细分析。
+用文字简单概括 PE 格式： MS-DOS stub(Image Only) + signature("PE\0\0", Image Only) + COFF file header(Object and Image) + Optional header(Image Only，包括3个主要部分：Standard fields, Windows-specific fields, Data directories) + section table。图示如下：
+
+![PE32](Portable_Executable_32_bit_Structure.png)
+
+下面进行代码详细分析。
 
 #### arch/x86/boot/header.S
 
@@ -2022,8 +2036,11 @@ setup.bin 的二进制文件布局由其 linker script arch/x86/boot/setup.ld �
 		# offset 512, entry point。正如上文对 grub 函数 grub_linux16_boot 的分析一样。
 		.globl	_start
 	_start:
-		# 下面的注释解释的很清楚。因为普通的jmp指令都是相对跳转，即跳转相对现在位置某个偏移的地方。
-		# start_of_setup 是 .entrytext section 第一个地址，也就是跳到那里去。
+		# 下面的注释说的清楚。但为什么 assembler 会生成 3bytes 的 jmp 指令？难道因为当前是
+		# 16-bit 的 real mode，所以 GCC 会默认生成 rel16 的 displacement？
+		# 普通的 jmp 指令都是相对跳转，即跳转相对当前位置的偏移，所以指令的第二个 byte 表示偏移。
+		# start_of_setup 是 .entrytext section 的第一个地址，也即跳转目的地址。
+
 		# Explicitly enter this as bytes, or the assembler
 		# tries to generate a 3-byte jump here, which causes
 		# everything else to push off to the wrong offset.
@@ -2059,7 +2076,7 @@ setup.bin 的二进制文件布局由其 linker script arch/x86/boot/setup.ld �
 
 	# ds = ss 的正常情况下，跳转至此
 	2:	# Now %dx should point to the end of our stack space
-		# dx 此时的值是 sp = 0x9000。 and 操作强制抹 0 尾部 2 个 bit，所以 dword 对齐了
+		# dx 此时的值是 sp = 0x9000。 and 操作强制抹 0 尾部 2 个 bit，为了 dword 对齐
 		andw	$~3, %dx	# dword align (might as well...)
 		jnz	3f
 		# 万一 dx 中是个无效值，我们也要给它赋个有效值，segment 最高的地址，64k 的最大处
@@ -2158,7 +2175,7 @@ header.S 中最后一条指令跳入了 setup.bin 的 main 函数，终于进入
 
 对重要的函数进行单独分析：
 
-	/* 把 header.S 中 hdr 起始的 boot protocol 的内容 copy 到别处待用 */
+	/* 把 header.S 中 hdr 起始的 boot protocol 的内容 copy 到另一处的全局变量 boot_params 中 */
 	static void copy_boot_params(void)
 	{
 		...
@@ -2177,18 +2194,19 @@ header.S 中最后一条指令跳入了 setup.bin 的 main 函数，终于进入
 
 		/* gcc inline assembly 的介绍可以参考：
 		 * https://www.ibiblio.org/gferg/ldp/GCC-Inline-Assembly-HOWTO.html
-		 * 这句内嵌汇编的意思: stack_end = %esp - STACK_SIZE = %esp - 1024。进入 main 函数前，
-		 * esp 的值是 0x9000，因为本函数没有入参，所以理论上此时 esp 的值不变，待验证。*/
+		 * 这句内嵌汇编的意思: stack_end = %esp - STACK_SIZE = %esp - 0x400。进入 main
+		 * 函数前 esp 的值是 0x9000，因为本函数没有入参，所以理论上此时 esp 的值不变，待验证。
+		 * 回忆一下：在 grub 为 linux kernel 分配内存时，为了 stack 和 heap 共分配了 4k 内存 */
 		if (boot_params.hdr.loadflags & CAN_USE_HEAP) {
 			asm("leal %P1(%%esp),%0"
 			    : "=r" (stack_end) : "i" (-STACK_SIZE));
 
-			/* 因为 Documentation/x86/boot.txt 对 heap_end_ptr 的定义有减去 0x200，
-			 * 所以这里恢复一下。*/
-			heap_end = (char *)
-				((size_t)boot_params.hdr.heap_end_ptr + 0x200);
+			/* Documentation/x86/boot.txt 对 heap_end_ptr 的定义有减去 0x200，grub 代码中也是
+			 * 这样做的：给 heap_end_ptr 赋值为 GRUB_LINUX_HEAP_END_OFFSET = 0x9000 - 0x200，
+			 * 所以这里使用前需要复原一下。*/
+			heap_end = (char *)((size_t)boot_params.hdr.heap_end_ptr + 0x200);
 			if (heap_end > stack_end)
-				heap_end = stack_end;/* stack 优先 */
+				heap_end = stack_end; /* stack 优先，4k 中，1k 作为 stack, 3k 作为 heap */
 		} else {
 			/* Boot protocol 2.00 only, no heap available */
 			puts("WARNING: Ancient bootloader, some functionality "
@@ -2198,6 +2216,8 @@ header.S 中最后一条指令跳入了 setup.bin 的 main 函数，终于进入
 
 函数 detect_memory 依次使用 BIOS Function: INT 0x15, AX = 0xE820/0xE801/0x88 来获取内存信息，后两者比较少见，着重分析。
 
+E820 很常见，就不介绍它的用法了。在本代码中使用 E820 中断服务，将获取的内存信息保存到 boot_params.e820_table 中。
+
 对 E801 比较标准的定义是：
 >It is built to handle the 15M memory hole, but stops at the next hole / memory mapped device / reserved area above that. That is, it is only designed to handle contiguous memory above 16M. 
 
@@ -2205,9 +2225,9 @@ header.S 中最后一条指令跳入了 setup.bin 的 main 函数，终于进入
 >AX = CX = extended memory between 1M and 16M, in K (max 3C00h = 15MB)
 BX = DX = extended memory above 16M, in 64K blocks
 
-读了几次也可能不太明白描述的意思，因为缺少一些背景知识：RAM 在映射到 cpu 地址空间时，本应该是连续的，但由于某些原因，某段空间不能用来映射 RAM，这段空间就叫做 memory hole。在地址 1M - 16M 之间可能有一个 memory hole，后面的地址空间还可能有 memory hole，E801 最多只能处理 2 个 memory hole，也即最多返回 2 段连续的地址空间，16M 之前和之后的。再回过头来看其英文描述，是不是感觉好理解了？或者简单一句话：E801 reports the amount of memory after 0xFFFFF
+读了几次也可能不太明白描述的意思，因为缺少一些背景知识：RAM 在映射到 cpu 地址空间时，本应该是连续的，但由于某些原因，某段空间不能用来映射 RAM，这段空间就叫做 memory hole。在地址 1M - 16M 之间可能有一个 memory hole，后面的地址空间还可能有 memory hole，E801 最多只能处理 2 个 memory hole，也即最多返回 2 段连续的映射到 RAM 的地址空间，16M 之前和之后的。再回过头来看其英文描述，是不是感觉好理解了？或者简单一句话：E801 reports the amount of memory after 0xFFFFF
 
-E801 的用法倒是很简单，无需准备入参，直接 INT 0x15 AX = 0xE801，看代码前最好参考[这里](https://wiki.osdev.org/Detecting_Memory_(x86)#BIOS_Function:_INT_0x15.2C_AX_.3D_0xE801)的描述。看代码如何处理：
+E801 的用法很简单，无需入参，直接 INT 0x15 AX = 0xE801，看代码前最好参考[这里](https://wiki.osdev.org/Detecting_Memory_(x86)#BIOS_Function:_INT_0x15.2C_AX_.3D_0xE801)的描述。看代码如何处理：
 
 	static int detect_memory_e801(void)
 	{
@@ -2240,18 +2260,18 @@ E801 的用法倒是很简单，无需准备入参，直接 INT 0x15 AX = 0xE801
 
 0x88 中断就更简单了，用于返回地址 0x100000之后的连续空间的 size，以 k 为单位。
 
-go_to_protected_mode 是 main 函数中的最后 & 最重要一步，直接来代码：
+go_to_protected_mode 是 main 函数中的最后 & 最重要一步：
 
 	void go_to_protected_mode(void)
 	{
 		/* Hook before leaving real mode, also disables interrupts */
 		/* 进入 protect mode 前，需要关闭普通中断 & NMI。调用 realmode_swtch hook 完成
 		 * 这项工作，如果有的话。同时引出一个小问题，为什么在切换到 protect mode 时需要关闭中断？
-		 * 一个最简单的因素，real mode 下使用的是 IVT，protect mode 下使用的叫 IDT，要做
+		 * 其中一个最简单的原因，real mode 下使用的是 IVT，protect mode 下使用的叫 IDT，要做
 		 * 切换的话，可想而知要先关闭了中断 */
 		realmode_switch_hook();
 
-		/* Enable the A20 gate */
+		/* Enable the A20 gate。有趣的内容，下面详细分析 */
 		if (enable_a20()) {
 			puts("A20 gate not responding, unable to boot...\n");
 			die();
@@ -2283,7 +2303,8 @@ go_to_protected_mode 是 main 函数中的最后 & 最重要一步，直接来�
 最后参考一下 Intel developer manual Volumn 3a, chaper 8.7.13.4 的描述：
 >On an IA-32 processor, the A20M# pin is typically provided for compatibility with the Intel 286
 processor. Asserting this pin causes bit 20 of the physical address to be masked (forced to zero) for all external bus memory accesses.
-The functionality of A20M# is used primarily by older operating systems and not used by modern operating systems. On newer Intel 64 processors, A20M# may be absent.
+
+>The functionality of A20M# is used primarily by older operating systems and not used by modern operating systems. On newer Intel 64 processors, A20M# may be absent.
 
 来看代码：
 
@@ -2294,10 +2315,14 @@ The functionality of A20M# is used primarily by older operating systems and not 
 
 		while (loops--) {
 			/* First, check to see if A20 is already enabled(legacy free, etc.) */
-			/* 这是重点函数，下面几个只是 enable a20 的不同方法。读取中断向量 0x80 所在地址
-			 * 0：200h 的一个 4 byte 整数，然后 ++ A20_TEST_LONG 次并写入原地址；从两个
-			 * real mode 下表示相同线性地址的逻辑地址中(0:200h 和 ffff:210h，real mode
-			 * 下都表示线性地址 512)分别读取它，判断是否相等，来判断 a20 是否 enable */
+			/* 这个函数是重点，下面几个只是 enable a20 的不同方法。
+			 * 原理是从 real mode 下两个表示相同线性地址的逻辑地址(其中一个故意 wrap around)中
+			 * 分别读取一个数，判断是否相等，相等则说明是从同一个地址读出来的，说明 a20 没有 enable。
+			 *
+			 * 本例中，读取中断向量 0x80 所在逻辑地址 0：200h(线性地址 200h)处的 4-byte 整数值，
+			 * ++ 后写入原地址；从另一个逻辑地址 ffff:210h(real mode 下线性地址也是 200h)处读取它，
+			 * 判断是否相等，进而判断 a20 是否 enable。最多重复 A20_TEST_LONG 次上述步骤，若不相等
+			 * 则说明 a20 已 enable，函数返回。*/
 			if (a20_test_short())
 				return 0;
 
@@ -2328,14 +2353,13 @@ The functionality of A20M# is used primarily by older operating systems and not 
 		return -1;
 	}
 
-在 setup 的代码中，还经常使用了 in/out 指令来操作 I/O port，比如常见的 io_delay 函数，这里有一个[简单介绍](http://lkml.iu.edu/hypermail/linux/kernel/0802.2/0766.html)。
+省略 I/O port 操作的两个函数的分析。setup 的代码中经常使用 in/out 指令来操作 I/O port，比如常见的 io_delay 函数，这里有一个[简单介绍](http://lkml.iu.edu/hypermail/linux/kernel/0802.2/0766.html)。
 
 setup 代码最最最后一步是调用 protected_mode_jump:
 
-	protected_mode_jump(boot_params.hdr.code32_start,
-			    (u32)&boot_params + (ds() << 4));
+	protected_mode_jump(boot_params.hdr.code32_start, (u32)&boot_params + (ds() << 4));
 
-第一个入参 code32_start 表示 protect mode 内核代码所在的内存地址，在 header.s 中定义为默认值0x100000，grub 没有修改它，并且也是使用这个地址加载 protect mode 的代码; 第二个入参是全局变量 boot_param 的地址，以整数形式表示，表达式是使用逻辑地址翻译成线性地址。这是汇编代码写的函数,定义在 arch/x86/boot/pmjump.S 中。这里有个小 tips, linux kernel real mode 的代码都使用了 GCC 的编译选项 `-mregparm=3`:
+第一个入参 code32_start 表示 protect mode 内核代码所在地址，在 header.s 中定义为默认值 0x100000，grub 没有修改它，并且也是使用这个地址加载 protect mode 的代码; 第二个入参是全局变量 boot_param 的地址，以整数形式表示，表达式的意思是使用逻辑地址翻译成线性地址。这是汇编代码写的函数，定义在 arch/x86/boot/pmjump.S 中。这里有个小 tips, linux kernel real mode 的代码都使用了 GCC 的编译选项 `-mregparm=3`:
 
 >mregparm=num
 	Control how many registers are used to pass integer arguments.  By default, no registers are used to pass arguments, and at most 3 registers can be used.  You can control this behavior for a specific function by using the function attribute "regparm".
@@ -2351,12 +2375,12 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 		xorl	%ebx, %ebx # 清零 ebx
 		movw	%cs, %bx
 		shll	$4, %ebx # 获得 cs 的段基址，保存在 ebx
-		addl	%ebx, 2f # 将 ebx 的值加到 lable 2 处
+		addl	%ebx, 2f # 将 ebx 的值加到下方的 label: 2 处
 		jmp	1f			# Short jump to serialize on 386/486
 	1:
 
-		# __BOOT_DS = 24，是 DS 的 segment selector value； __BOOT_TSS = 32，是 TSS 的
-		# segment selector value。参考 segment selector 格式。
+		# __BOOT_DS = 24，是 DS 的 segment selector value； __BOOT_TSS = 32，
+		# 是 TSS 的 segment selector value。参考 segment selector 格式。
 		movw	$__BOOT_DS, %cx
 		movw	$__BOOT_TSS, %di
 
@@ -2366,12 +2390,14 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 
 		# Transition to 32-bit mode
 		# 0x66 是 Operand-size override prefix，因为从 16 bit 代码跳到 32 bit 代码。
-		# 0xea 指令表示 Jump far, absolute, address given in operand
+		# 0xea 是 jmp 指令，表示 Jump far, absolute, address given in operand
 		.byte	0x66, 0xea # ljmpl opcode
-	2:	.long	in_pm32	   # offset。上面的代码加上了 real mode 下 cs 的段基址，此时这里的数本来表示
-						   # real mode 下 im_pm32 的线性地址；进入 protect mode 后所有 segment 的基址
-						   # 是 0，所以这个数既是 address(real mode下)，又是 offset(protect mode 下)
-		.word	__BOOT_CS  # segment。GDT中的段都以0为基地址，所以配上面的 offset 一起作为跳转目的地
+	2:	.long	in_pm32	   # in_pm32 的值是它在当前 segment 中的 offset, 即 effective address。
+						   # 上面的代码将 real mode 下 cs 的段基址加到这里，此时 label:2 这个数
+						   # 表示 real mode 下 in_pm32 的线性地址；进入 protect mode 后所有
+						   # segment 的基址是 0，所以这个数既是 real mode 下的线性地址，又是
+						   # protect mode 下的 offset(effective address)。
+		.word	__BOOT_CS  # segment。GDT中的段都以0为基地址，配上面的 offset 一起作为跳转地址
 	ENDPROC(protected_mode_jump)
 
 		.code32
@@ -2387,8 +2413,9 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 
 		# The 32-bit code sets up its own stack, but this way we do have
 		# a valid stack if some debugging hack wants to use it.
-		# ebx 在上面被赋值为 real mode 下 cs 的段基址，加到 esp 上，得到 esp 在 real mode 下的线性地址。
-		# 因为 protect mode 下所有段基址为0，原来的线性地址变成现在的 offset。所以，实际上还是使用原来的 stack
+		# ebx 在上面被赋值为 real mode 下 cs 的段基址，加到 esp 上，得到 esp 在 real mode 下的
+		# 线性地址。因为 protect mode 下所有段基址为 0，原来的线性地址变成现在的 offset(effective address)。
+		# 所以，实际上还是使用原来的 stack。
 		addl	%ebx, %esp
 
 		# Set up TR to make Intel VT happy。实际没用
@@ -2396,7 +2423,7 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 
 		# Clear registers to allow for future extensions to the
 		# 32-bit boot protocol
-		# 唯独 esi 没有清零，因为作为入参到现在一直还没使用。
+		# 唯独 esi 没有清零，因为作为入参到目前还没使用。
 		xorl	%ecx, %ecx
 		xorl	%edx, %edx
 		xorl	%ebx, %ebx
@@ -2406,7 +2433,7 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 		# Set up LDTR to make Intel VT happy。同样，实际没用
 		lldt	%cx
 
-		# protected_mode_jump 的第一个入参一直留到现在才使用，又是一个 absolute jump
+		# 本函数的第一个入参保留到现在才使用，又是一个 absolute jump
 		jmpl	*%eax			# Jump to the 32-bit entrypoint
 	ENDPROC(in_pm32)
 
@@ -2427,7 +2454,7 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 比较源操作数和目的操作数，并根据结果设置 EFLAGS 寄存器的 status flags。所谓比较是指： 目的操作数 - 源操作数(结果被丢弃)。Jcc 指令常常跟在 CMP 后，根据刚刚 CMP 的结果进行条件跳转。举例(AT&T汇编语法，第一个操作数是源操作数)：
 
 	cmp a, b
-	jg lable
+	jg label
 
 意味着：jump to label if and only if b > a
 
