@@ -2179,8 +2179,9 @@ header.S 中最后一条指令跳入了 setup.bin 的 main 函数，终于进入
 	static void copy_boot_params(void)
 	{
 		...
-		/* 这个宏很有意思，详细解释在:include/linux/build_bug.h 中
-		 * 简言之：括号中的条件为真时，编译将报错退出 */
+		/* 这个宏很有意思，详细解释在:include/linux/build_bug.h 中。简言之：括号中的条件为真时，
+		 * 编译将报错退出。同时引出一个新东西：__OPTIMIZE__，GCC 的 Common Predefined Macros，
+		 * 参阅：https://gcc.gnu.org/onlinedocs/cpp/Common-Predefined-Macros.html */
 		BUILD_BUG_ON(sizeof boot_params != 4096);
 		memcpy(&boot_params.hdr, &hdr, sizeof hdr);
 
@@ -2359,7 +2360,7 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 
 	protected_mode_jump(boot_params.hdr.code32_start, (u32)&boot_params + (ds() << 4));
 
-第一个入参 code32_start 表示 protect mode 内核代码所在地址，在 header.s 中定义为默认值 0x100000，grub 没有修改它，并且也是使用这个地址加载 protect mode 的代码; 第二个入参是全局变量 boot_param 的地址，以整数形式表示，表达式的意思是使用逻辑地址翻译成线性地址。这是汇编代码写的函数，定义在 arch/x86/boot/pmjump.S 中。这里有个小 tips, linux kernel real mode 的代码都使用了 GCC 的编译选项 `-mregparm=3`:
+第一个入参 code32_start 表示 protect mode 内核代码所在地址，在 header.s 中定义为默认值 0x100000，grub 没有修改它，并且也是使用这个地址(GRUB_LINUX_BZIMAGE_ADDR)加载 protect mode 的代码; 第二个入参是全局变量 boot_param 的地址，以整数形式表示，表达式的意思是使用逻辑地址翻译成线性地址。这是汇编代码写的函数，定义在 arch/x86/boot/pmjump.S 中。这里有个小 tips, linux kernel real mode 的代码都使用了 GCC 的编译选项 `-mregparm=3`:
 
 >mregparm=num
 	Control how many registers are used to pass integer arguments.  By default, no registers are used to pass arguments, and at most 3 registers can be used.  You can control this behavior for a specific function by using the function attribute "regparm".
@@ -2443,7 +2444,506 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
 ### protect mode linux
 
+bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 kernel 本尊(源码根目录下的 vmlinux)，在下面这将作为单独的一节介绍细节；而它又是从下一层目录(compressed)下的 vmlinux 剥离处理而来。以 x86-64 为例来分析这部分代码，首先看下 arch/x86/boot/compressed/vmlinux 的代码布局，定义在 arch/x86/boot/compressed/vmlinux.lds：
 
+	...
+	SECTIONS
+	{
+	 . = 0;
+	 .head.text : {
+	  _head = . ;
+	  *(.head.text)
+	  _ehead = . ;
+	 }
+
+	 .rodata..compressed : {
+	  *(.rodata..compressed)
+	 }
+
+	 .text : {
+	  _text = .;
+	  *(.text)
+	  *(.text.*)
+	  _etext = . ;
+	 }
+	 ....
+	}
+
+由此可知，地址 0 处的代码是 .head.text section 的内容，也即 real mode 的 setup 代码跳转到 protect mode 后开始执行的代码。.head.text section 在文件 arch/x86/boot/compressed/head_64.S 中：
+
+		__HEAD
+		.code32
+	ENTRY(startup_32)
+		/*
+		 * 32bit entry is 0 and it is ABI so immutable!
+		 * If we come here directly from a bootloader,
+		 * kernel(text+data+bss+brk) ramdisk, zero_page, command line
+		 * all need to be under the 4G limit.
+		 */
+		cld /* clear direction flag in EFLAGS 寄存器，字符串操作将递增 index 寄存器。
+			/* header.S 中已经看到这条字令，这里是 bootloader 直接到到 32-bit 入口的情况。*/
+		/*
+		 * Test KEEP_SEGMENTS flag to see if the bootloader is asking
+		 * us to not reload segments
+		 * real mode 代码最后一个函数 protected_mode_jump 的入参之一是 real mode 下的数据
+		 * 结构 boot_params 的线性地址，保存在 esi 寄存器中。grub 没有设置 KEEP_SEGMENTS
+		 * bit，所以不会跳转到 1f，执行下面几行代码重新加载各 segment register。
+		 * BP_loadflags 的实现待分析！不过顾名思义，BP 是 Boot Protocol
+		 */
+		testb $KEEP_SEGMENTS, BP_loadflags(%esi)
+		jnz 1f
+
+		/* realmode_switch_hook 中已 cli，这是 bootloader 直接跳到 32-bit entry 的情况 */
+		cli
+		/* 使用 real mode 下 setup_gdt 函数配置好的 GDT。同样，pmjump.S 中做过同样操作，这是
+		 * bootloader 使用 32-bit boot protocol 的情况。*/
+		movl	$(__BOOT_DS), %eax
+		movl	%eax, %ds
+		movl	%eax, %es
+		movl	%eax, %ss
+	1:
+
+	/*
+	 * Calculate the delta between where we were compiled to run
+	 * at and where we were actually loaded at.  This can only be done
+	 * with a short local call on x86.  Nothing else will tell us what
+	 * address we are running at.  The reserved chunk of the real-mode
+	 * data at 0x1e4 (defined as a scratch field) are used as the stack
+	 * for this calculation. Only 4 bytes are needed.
+	 * call 指令将它的下一条指令地址(label 1的运行时地址)压栈，然后弹出到 ebp，再和 label 1
+	 * 的链接时地址相减，差值放在 ebp 中。差值即编译时地址和运行时地址之 delta，其实也是符号
+	 * startup_32 的运行时地址。上面的英文注释解释的很清楚。
+	 * 由上文分析可知，protect mode kernel 被加载到内存的地址，由 boot protocol(header.S)
+	 * 中的 code32_start(0x100000 = 1M) 表示, grub 中没有修改它，且 grub 也是用这个值来
+	 * load protect mode kernel，startup_32 是 protect mode kernel 的入口，所以它的
+	 * 运行时地址是 0x100000(1M)。
+	 * 在 real mode 中是有设置 esp 的，这里单独设置应该也是 32-bit boot protocol 的情况。
+	 */
+		leal	(BP_scratch+4)(%esi), %esp
+		call	1f
+	1:	popl	%ebp
+		subl	$1b, %ebp
+
+	/* setup a stack and make sure cpu supports long mode. */
+	/* 在本文件底部定义了 label: boot_stack，boot_stack_end，和 boot_heap，并开辟了相应的空间 */
+		movl	$boot_stack_end, %eax
+		addl	%ebp, %eax /* 将 stack 顶的编译地址加上 delta，得到运行时地址 */
+		movl	%eax, %esp /* 得到栈的运行时地址，现在可以做函数调用(call指令)了 */
+
+	/* 函数定义在 verify_cpu.S，文件下方有include。此函数大部分内容是用 cpuid 指令来 discover cpu feature。
+	 * 待有机会在详细分析它。此刻只需要看 verify_cpu.S 的文件头描述，了解其返回值: verify_cpu,
+	 * returns the status of longmode and SSE in register %eax, 0: Success, 1: Failure */
+		call	verify_cpu
+		testl	%eax, %eax
+		jnz	no_longmode  /* 根据常识可知，一般情况下这条指令是不会被执行 */
+
+	/*
+	 * Compute the delta between where we were compiled to run at
+	 * and where the code will actually run at.
+	 *
+	 * %ebp contains the address we are loaded at by the boot loader and %ebx
+	 * contains the address where we should move the kernel image temporarily
+	 * for safe in-place decompression.
+	 * 英文注释解释的清楚。
+	 * kernel_alignment 在 boot protocal(header.S) 中定义为: CONFIG_PHYSICAL_ALIGN
+	 * (0x200000 - 0x1000000，必须是 0x200000 的倍数)，grub 没有修改它。ebp 寄存器保存着
+	 * protect mode kernel 被加载的地址(0x100000)，这段代码将其向上对齐到 kernel_alignment，
+	 * 对齐后的地址放在 ebx 中。比较 LOAD_PHYSICAL_ADDR(CONFIG_PHYSICAL_START 对齐到
+	 * CONFIG_PHYSICAL_ALIGN) 和 ebx，若 ebx 小于 LOAD_PHYSICAL_ADDR，则给它赋值为
+	 * LOAD_PHYSICAL_ADDR。      WHY???     所以，ebx 是解压缩 buffer 的起始地址？
+	 */
+	#ifdef CONFIG_RELOCATABLE
+		movl	%ebp, %ebx
+		movl	BP_kernel_alignment(%esi), %eax
+		decl	%eax
+		addl	%eax, %ebx
+		notl	%eax
+		andl	%eax, %ebx
+		cmpl	$LOAD_PHYSICAL_ADDR, %ebx // 如果 ebx >= LOAD_PHYSICAL_ADDR，则跳到 1f
+		jge	1f
+	#endif
+		movl	$LOAD_PHYSICAL_ADDR, %ebx
+
+	/* Target address to relocate to for decompression */
+	/* Tips: 这里涉及了几个陌生的概念，VO, ZO，在这个patch：
+	 * https://lore.kernel.org/patchwork/patch/674100/ 中有比较详细的解释，先了解这些
+	 * 概念才容易理解下面的代码。 */
+	/* _end 定义在 linker script 中，表示 arch/x86/boot/compressed/vmlinux 的(链接时)
+	 * 结束地址，也即它在内存中的 size；init_size 定义在 header.S 中，一般情况下它等于：
+	 * VO__end - VO__text；二者相减(即 VO - ZO)得到 offset，加到 ebx(解压缩 buffer 的
+	 * output pointer)。 所以，现在 ebx 的值是 ZO 被 copy 到解压缩 buffer 中的地址。
+	 * 压缩后size大于压缩前的情况是怎样??? */
+	1:
+		movl	BP_init_size(%esi), %eax
+		subl	$_end, %eax
+		addl	%eax, %ebx
+
+	/* Prepare for entering 64 bit mode */
+
+		/* Load new GDT with the 64bit segments using 32bit descriptor */
+		/* GDT 定义在文件下方的 .data section 中。ebp 中保存着 protect mode kernel 的
+		 * 运行时地址(delta)，所以，加上 delta 即得到 label: gdt 的运行时地址。虽然 lgdt，
+		 * 但看起来还没有生效。 */
+		addl	%ebp, gdt+2(%ebp)
+		lgdt	gdt(%ebp)
+
+		/* Enable PAE mode。开启 64 bit mode(long mode)，必须同时满足 CR0.PG = 1,
+		 * CR4.PAE = 1, and IA32_EFER.LME = 1 */
+		movl	%cr4, %eax
+		orl	$X86_CR4_PAE, %eax
+		movl	%eax, %cr4
+
+	/* Build early 4G boot pagetable */
+
+		/* If SEV is active then set the encryption mask in the page tables.
+		 * This will insure that when the kernel is copied and decompressed
+		 * it will be done so encrypted. */
+		/* 此函数定义在 mem_encrypt.S 中，AMD Secure Encrypted Virtualization (SEV)
+		 * 是 AMD 的特性，不是启动流程的重点，略过分析。这段代码也是最近才加入。直接跳到 1: 继续分析*/
+		call	get_sev_encryption_bit
+		xorl	%edx, %edx
+		testl	%eax, %eax
+		jz	1f
+		subl	$32, %eax	/* Encryption bit is always above bit 31 */
+		bts	%eax, %edx	/* Set encryption mask for page tables */
+
+	1:
+		/* Initialize Page tables to 0 */
+		/* label: pgtable 定义在 head_64.S 最底部的 .pgtable section 中，指向 size 为
+		 * BOOT_PGT_SIZE 的空间，它的起始地址在 arch/x86/boot/compressed/vmlinux.lds.S
+		 * 中被对齐到 4k(page size)！  注意!!!这里 leal 指令是基于 ebx 寄存器，上文说过，
+		 * ebx 是 ZO image 在解压缩 buffer 中的地址，所以初始化的页表结构在解压缩 buffer
+		 * 中的 ZO。阅读页表代码前必须掌握其基础知识，最权威的材料在 Intel 软件开发者手册 3A
+		 * 的 "chapter 4: paging"。由上面注释可知，early boot 只需映射 4G 大小的物理地址
+		 * 空间，所以只需 6 个 paging structure，下面会详细解释为什么只需 6 个。
+		 */
+		leal	pgtable(%ebx), %edi
+		xorl	%eax, %eax
+		movl	$(BOOT_INIT_PGT_SIZE/4), %ecx
+		rep	stosl
+
+		/* 5-level paging 出现以前(本文假设它还没有出现)，x86_64 默认是 4-level paging
+		 * mode, 即: 48-bit linear address -> 52-bit(最大) physical address。linear
+		 * address 的 48-bit 地址包含几个 field，除了最后一个 filed 表示页中的 offset，
+		 * 其他都是 paging structure 的 index。
+		 * 一个 PML4 entry 可以映射 2^39(48-9)，即 512G 的物理地址空间；
+		 * 一个 PDPT(page directory pointer table) entry 可以映射 2^30(48-9-9)，即 1G 的物理地址空间；
+		 * 一个 PD(page directory) entry 可以映射 2^21(48-9-9-9)，即 2M 的地址空间。
+		 * 所以映射 4G 物理地址空间需要 1 个 PML4(1个 entry)，1 个 PDPT(4个 entry)，4 个
+		 * PD(全部 entry) 即可。 另外，paging structures 的 size 都是 4k，CR3 中保存第一级
+		 * paging structure 的地址，由 Intel 开发者手册3A 的 chapter 2.5 CONTROL REGISTERS
+		 * 可知，CR3 只保存 lower 12 bits 以外的其他地址 bit，地址的 lower 12 bits 是 0,
+		 * 所以第一级 paging structure 的地址是 4k 对齐的；同样，所有 refer 下一级 paging
+		 * structure 的 entry 中的地址都是 4k 对齐的；若 entry 是 map a page，则 entry 中
+		 * 的地址是 page size 对齐的。  一般情况下，所有 paging structure 分配在同一块连续的
+		 * 内存，所以他们的地址都是 4k 对齐的。
+		 */
+
+		/* Build Level 4 */
+		/* 这里的 0x1007 让我困惑了一天，主要因为忽略了 lable: pgtable 已经 4k 对齐。
+		 * 将 (pgtable + 0x1007) 的 effective address 放到 eax 中，作为第一个 PML4 entry
+		 * 的内容。举例：假设 pgtable = 0x80600000，则 0x80600000 + 0x1007 = 0x80601007，
+		 * 作为 entry 的值，说明此 entry 指向的下一级 paging structure 的地址是 0x80601000；
+		 * 末尾的 7 = 01111b，表示 Present；相应的 memory region 是 read/write;user-mode
+		 * address(参考 4.6.1 Determination of Access Rights)。
+		 * 所以，还是有小小的 trick 在里面。如上面分析所说，PML4 table 仅需初始化 1 个 entry */
+		leal	pgtable + 0(%ebx), %edi
+		leal	0x1007 (%edi), %eax
+		movl	%eax, 0(%edi)
+		addl	%edx, 4(%edi) /* 这行由 AMD SEV 特性引入，可忽略。同样忽略下面所有相同操作 */
+
+		/* Build Level 3 */
+		/* 如上面分析，PDPT 需要初始化 4 个 entry */
+		leal	pgtable + 0x1000(%ebx), %edi
+		leal	0x1007(%edi), %eax
+		movl	$4, %ecx /* counter，用来 count 4 个 entry */
+	1:	movl	%eax, 0x00(%edi)
+		addl	%edx, 0x04(%edi) /* AMD SEV 特有，忽略 */
+		addl	$0x00001000, %eax
+		addl	$8, %edi /* entry size 是 8 byte */
+		decl	%ecx
+		jnz	1b
+
+		/* Build Level 2 */
+		/* 如上面分析，所有 PD table 的 entry 都需初始化，4 tables x 512 entries/per table.
+		 * 0x183 = 0001,1000,0011b，参考 Intel开发者手册3A: Figure 4-11. Formats of
+		 * CR3 and Paging-Structure Entries with 4-Level Paging. 即 Present, Read/Write,
+		 * Page size = 1(2M page), Global. 第一个 page 的地址是 0，所以是从地址0开始连续
+		 * map 4G 物理地址空间  */
+		leal	pgtable + 0x2000(%ebx), %edi
+		movl	$0x00000183, %eax
+		movl	$2048, %ecx /* 4 x 512 = 2048 */
+	1:	movl	%eax, 0(%edi)
+		addl	%edx, 4(%edi) /* AMD SEV 特有，忽略 */
+		addl	$0x00200000, %eax /* page size 是 2M */
+		addl	$8, %edi
+		decl	%ecx
+		jnz	1b
+
+		/* Enable the boot page tables */
+		/* 获得页表的物理地址，这里 leal 得到的 effective address 即物理地址，因为段基址是 0 */
+		leal	pgtable(%ebx), %eax
+		movl	%eax, %cr3
+
+		/* Enable Long mode in EFER (Extended Feature Enable Register) */
+		/* EFER 的详细描述在 Intel 开发者手册3A: "2.2.1 Extended Feature Enable Register".
+		 * MSR 的一般性介绍在 Intel 开发者手册3A: “9.4 MODEL-SPECIFIC REGISTERS (MSRS)”;
+		 * 详细介绍在 Intel开发者手册4: chapter 2. */
+		movl	$MSR_EFER, %ecx
+		rdmsr		/* Read 64-bit MSR specified by ECX into EDX:EAX */
+		btsl	$_EFER_LME, %eax /* enable long mode in value of eax，然后写回 msr */
+		wrmsr
+
+		/* After gdt is loaded */
+		xorl	%eax, %eax
+		lldt	%ax
+		movl    $__BOOT_TSS, %eax
+		ltr	%ax
+
+	ENDPROC(startup_32)
+
+		.data
+	gdt64:
+		.word	gdt_end - gdt
+		.long	0
+		.word	0
+		.quad   0
+	gdt:
+	/* 巧妙利用 GDT 中第一项是 null descriptor 的定义，用这个空间存储 GDTR 的内容。下面是 GDT 的内容*/
+		.word	gdt_end - gdt   /* limit */
+		.long	gdt				/* base address */
+		.word	0				/* padding，补足 null descriptor */
+		/* 参考 Intel developer manual 3a，“3.4.5 Segment Descriptors” 一节。前三项都是：
+		 * base: 0x0, limit: 0xfffff。type 'a'; 表示代码段，Execute/Read; type '2' 表示
+		 * 数据段，Read/Write。9 = 1001b，表示 Segment present，descriptor type 是
+		 * code or data。从左数的第三个数，a 表示 64-bit code segment，granularity 是 4k，
+		 * 如果 L bit set，则 D bit 必须 clear；c 表示 granularity 是 4k，对于 32-bit code
+		 * or data, D bit 总是 set 1 */
+		.quad	0x00cf9a000000ffff	/* __KERNEL32_CS */
+		.quad	0x00af9a000000ffff	/* __KERNEL_CS */
+		.quad	0x00cf92000000ffff	/* __KERNEL_DS */
+		.quad	0x0080890000000000	/* TS descriptor */
+		.quad   0x0000000000000000	/* TS continued */
+	gdt_end:
+
+head_64.S 代码分析到这里，不得不暂停一下，因为 header.S 中的 init_size 定义复杂，我们需要明白它的真实含义。init_size 在 header.S 中被定义为：
+
+	init_size:		.long INIT_SIZE		# kernel initialization size
+
+你会发现 INIT_SIZE 的定义非常复杂，牵扯了一堆 ZO_、VO_ 开头的变量，这些变量分别定义在 arch/x86/boot/ 下的 zoffset.h 和 voffset.h 中，若不理解 arch/x86/boot/vmlinux.bin 的处理流程，很难理解他们的定义，所以，是时候兑现上文的诺言了。
+
+相关文件的处理过程定义在 Makefile 中，技术细节属于 kbuild 领域，本文不展开解释，仅直接告诉结果：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin；vmlinux.bin 被压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S；piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 剥离为上一层目录的 vmlinux.bin，即 arch/x86/boot/vmlinux.bin。
+
+piggy.S 由 `mkpiggy` 生成，有必要看一下 `mkpiggy` 做了什么。[mkpiggy 的源代码](https://github.com/torvalds/linux/blob/master/arch/x86/boot/compressed/mkpiggy.c)很简单，但需要结合 [gzip spec](https://tools.ietf.org/html/rfc1952) 才能理解。
+
+>gzip spec tips: 一个 gzip 文件由一系列 members (compressed data sets) 组成，member 是一个被压缩的文件；多字节整数在 gzip 压缩文件中以 Little-endian 存放。
+
+目前，linux kernel 支持 6 种压缩算法：`.gz`, `.bz2`, `.lzma`, `.xz`, `.lzo`, `.lz4`，为了直观感受 objcopy 的剥离效果，以及各种压缩算法的效果，在我的测试环境下，各相关文件 size 如下：
+
+	# before stripped
+	[pino@IAAS0 linux]$ ll -h vmlinux
+	-rwxrwxr-x 1 pino pino 576M Nov 10 12:01 vmlinux
+
+	[pino@IAAS0 linux]$ ll -h arch/x86/boot/compressed/vmlinux.bin*
+	-rwxrwxr-x 1 pino pino  30M Nov 10 12:02 arch/x86/boot/compressed/vmlinux.bin
+	-rw-rw-r-- 1 pino pino 8.3M Nov 10 11:51 arch/x86/boot/compressed/vmlinux.bin.bz2
+	-rw-rw-r-- 1 pino pino 7.9M Nov  9 19:29 arch/x86/boot/compressed/vmlinux.bin.gz
+	-rw-rw-r-- 1 pino pino  11M Nov 10 13:37 arch/x86/boot/compressed/vmlinux.bin.lz4
+	-rw-rw-r-- 1 pino pino 6.2M Nov 10 12:28 arch/x86/boot/compressed/vmlinux.bin.lzma
+	-rw-rw-r-- 1 pino pino 9.4M Nov 10 12:40 arch/x86/boot/compressed/vmlinux.bin.lzo
+	-rw-rw-r-- 1 pino pino 5.8M Nov 10 12:35 arch/x86/boot/compressed/vmlinux.bin.xz
+
+岔开了一点话题，继续回来看 mkpiggy 如何处理 arch/x86/boot/compressed/vmlinux.bin。由 spec 上 member format 可知，每个 member 的最后 4 bytes 是该文件压缩前的 size：
+
+	ISIZE (Input SIZE)
+		This contains the size of the original (uncompressed) input
+		data modulo 2^32.
+
+如代码所示，这也是 mkpiggy 想要读出的信息：
+
+	# mkpiggy.c
+	...
+	if (fseek(f, -4L, SEEK_END)) {
+		perror(argv[1]);
+	}
+
+	# fread 读取数据后会相应移动 file stream 的 position indicator，所以读完后，position
+	# indicator 在文件尾，下面的的 ftell 读出的就是整个文件的 size。
+	if (fread(&olen, sizeof(olen), 1, f) != 1) {
+		perror(argv[1]);
+		goto bail;
+	}
+
+	ilen = ftell(f);
+	olen = get_unaligned_le32(&olen); /* 为什么? */
+	...
+
+6 种压缩算法，gzip 格式天然支持在压缩文件末尾附上文件压缩前的 size，其他压缩算法都是通过 Makefile 中的 `size_append` 操作在压缩文件末尾以 little-endian 附上压缩前的 size。mkpiggy 仅在 x86 上使用，x86 是 little-endian CPU，所以，为什么需要 endian 转换？ x86 maintainer 给了[解释](https://lkml.org/lkml/2018/11/9/1166)，因为考虑到了在 big-endian 机器上交叉编译 x86 的 kernel = =|，不知道谁有这种使用场景需求。
+
+生成的 piggy.S，在我的测试环境中长这样：
+
+	.section ".rodata..compressed","a",@progbits
+	.globl z_input_len
+	z_input_len = 8227726
+	.globl z_output_len
+	z_output_len = 31329060
+	.globl input_data, input_data_end
+	input_data:
+	.incbin "arch/x86/boot/compressed/vmlinux.bin.gz"
+	input_data_end:
+
+它记录了内核压缩前后的 size，把压缩后的 kernel 放在一个独立的 section 中。
+
+zoffset.h 和 voffset.h 两个文件在编译过程中生成，只有了解他们的生成细节，才能理解文件中那些变量的含义。arch/x86/boot/voffset.h 由 arch/x86/boot/compressed/Makefile 定义:
+
+	sed-voffset := -e 's/^\([0-9a-fA-F]*\) [ABCDGRSTVW] \(_text\|__bss_start\|_end\)$$/\#define VO_\2 _AC(0x\1,UL)/p'
+
+	quiet_cmd_voffset = VOFFSET $@
+	      cmd_voffset = $(NM) $< | sed -n $(sed-voffset) > $@
+
+	targets += ../voffset.h
+
+	$(obj)/../voffset.h: vmlinux FORCE
+	        $(call if_changed,voffset)
+
+voffset.h 由 nm 处理源码根目录下的 vmlinux 而来(代码细节属于 kbuild 领域，本文不展开)。nm 用于列出目标文件中的符号，对于每一个符号，列出其 symbol value(address), symbol type, symbol name，它的输出长这样：
+
+	000000000000005d t try_to_run_init_process
+
+sed 的用法参考 `info sed`。这条 sed script 过滤出 vmlinux 中的三个符号(_text,__bss_start,_end)的地址，输出到文件 voffset.h，这三个符号都定义在 vmlinux 的 linker script(arch/x86/kernel/vmlinux.lds)中。在我的例子中，voffset.h 长这样：
+
+	#define VO___bss_start _AC(0xffffffff82919000,UL)
+	#define VO__end _AC(0xffffffff82a7e000,UL)
+	#define VO__text _AC(0xffffffff81000000,UL)
+
+可以推断：前缀 VO 中的 V 表示 Vmlinux，O 猜测是 Object。_text 表示 vmlinux 的起始地址，_end 表示 vmlinux 的结束地址，__bss_start 的地址在二者之间。
+
+arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
+
+	sed-zoffset := -e 's/^\([0-9a-fA-F]*\) [ABCDGRSTVW] \(startup_32\|startup_64\|efi32_stub_entry\|efi64_stub_entry\|efi_pe_entry\|input_data\|_end\|_ehead\|_text\|z_.*\)$$/\#define ZO_\2 0x\1/p'
+
+	quiet_cmd_zoffset = ZOFFSET $@
+	      cmd_zoffset = $(NM) $< | sed -n $(sed-zoffset) > $@
+
+	targets += zoffset.h
+	$(obj)/zoffset.h: $(obj)/compressed/vmlinux FORCE
+	        $(call if_changed,zoffset)
+
+可以看出，处理流程与 voffset.h 完全一致，只不过过滤出更多的符号地址在 zoffset.h 中。我的环境中，zoffset.h 长这样：
+
+	#define ZO__ehead 0x00000000000003b4
+	#define ZO__end 0x00000000007ee000
+	#define ZO__text 0x00000000007b6ce0
+	#define ZO_efi32_stub_entry 0x0000000000000190
+	#define ZO_efi64_stub_entry 0x0000000000000390
+	#define ZO_efi_pe_entry 0x00000000000002c0
+	#define ZO_input_data 0x00000000000003b4
+	#define ZO_startup_32 0x0000000000000000
+	#define ZO_startup_64 0x0000000000000200
+	#define ZO_z_input_len 0x00000000007b6927
+	#define ZO_z_output_len 0x0000000001e04eec
+
+可以推断：前缀 ZO 中的 Z 表示压缩后。理解了这些，回头来分析 header.S 中的 INIT_SIZE 的含义：
+
+	# 为方便阅读，格式有做优化。源文件中本段代码上面有大段的注释详细解释为什么需要 extra bytes，
+	# 不在作者的知识领域，我们仅需知道：为了 safety decompression in place, 解压缩 buffer
+	# 的大小是原文件 size + extra bytes。
+	#define ZO_z_extra_bytes	((ZO_z_output_len >> 8) + 65536)
+
+	#if ZO_z_output_len > ZO_z_input_len
+	# 应该是绝大多数情况，没听说过压缩后比压缩前文件 size 还大。压缩文件放在解压缩 buffer 的
+	# 尾端，此变量表示它在 buffer 中的 offset。
+		# define ZO_z_extract_offset	(ZO_z_output_len + ZO_z_extra_bytes - \
+						 				ZO_z_input_len)
+	#else
+		# define ZO_z_extract_offset	ZO_z_extra_bytes
+	#endif
+
+	/*
+	 * The extract_offset has to be bigger than ZO head section. Otherwise when
+	 * the head code is running to move ZO to the end of the buffer, it will
+	 * overwrite the head code itself.
+	 */
+	#if (ZO__ehead - ZO_startup_32) > ZO_z_extract_offset
+		# 二者相减是 ZO 中的的 .head.text section 的 size。本段代码其他信息参考:
+		# https://lore.kernel.org/patchwork/patch/674095/
+		# define ZO_z_min_extract_offset ((ZO__ehead - ZO_startup_32 + 4095) & ~4095)
+	#else
+		# 正常情况下，只将 extract offset 向上对齐到 4k 边界 
+		# define ZO_z_min_extract_offset ((ZO_z_extract_offset + 4095) & ~4095)
+	#endif
+
+	# 前两个变量相减是 arch/x86/boot/compressed/vmlinux 被加载到内存中的 size
+	#define ZO_INIT_SIZE	(ZO__end - ZO_startup_32 + ZO_z_min_extract_offset)
+	# vmlinux 在内存中的 size;
+	#define VO_INIT_SIZE	(VO__end - VO__text)
+
+	# 二者谁大就选谁
+	#if ZO_INIT_SIZE > VO_INIT_SIZE
+		# define INIT_SIZE ZO_INIT_SIZE
+	#else
+		# define INIT_SIZE VO_INIT_SIZE
+	#endif
+
+-------------------
+
+
+#### linker script
+
+分析链接 kernel 用的 linker script 对于理解 linux kernel 的代码是很有帮助的。real mode 的 setup 和 protect mode 下的 vmlinux 各自有其 linker script，只不过前者比较简单，所以上文中没有进行分析。但 vmlinux 的 linker script 就复杂了很多，有必要拿出来看一看。
+
+学习 GUN linker script 的最佳方式应该还是阅读它的官方文档 via `info ld`，这应该是最权威的文档。但个人阅读下来感受到一个小问题： linker script 语言元素的 hierarchy 略多，而且许多细节描述夹杂其中，阅读中经常会忘记层次并迷失在其中。故这里用简单的语言总结下 linker script 的格式： 链接脚本的内容是一系列命令，这些命令可能是 linker script 的关键字(可能带参数)，也可能是赋值语句；命令之间可以用分号隔开(也可以不用，换行即可)。常见的命令关键字如：
+
+>ENTRY(SYMBOL)
+
+>OUTPUT_FORMAT(DEFAULT, BIG, LITTLE)
+
+>OUTPUT_ARCH(BFDARCH)
+
+>**SECTIONS**
+
+>PHDRS
+
+>ASSERT(EXP, MESSAGE)
+
+等等。其中 **SECTIONS** 命令是最重要的，它描述了如何把 input section 输出到 output section，以及这些 output section 摆在内存中的地址。**SECTIONS**命令的内容包含了一些列 SECTIONS-COMMAND，SECTIONS-COMMAND 又可以分为几类内容：
+
+>ENTRY command (很少见)
+
+>symbol assignment (常见)
+
+>output section description (几乎必见，继续介绍它)
+
+>overlay description (很少见)
+
+output section description 的完整描述长这样：
+
+     SECTION [ADDRESS] [(TYPE)] :
+       [AT(LMA)]
+       [ALIGN(SECTION_ALIGN) | ALIGN_WITH_INPUT]
+       [SUBALIGN(SUBSECTION_ALIGN)]
+       [CONSTRAINT]
+       {
+         OUTPUT-SECTION-COMMAND
+         OUTPUT-SECTION-COMMAND
+         ...
+       } [>REGION] [AT>LMA_REGION] [:PHDR :PHDR ...] [=FILLEXP] [,]
+
+其中 OUTPUT-SECTION-COMMAND 又可以分为几类：
+
+>symbol assignment (常见)
+
+>input section description (必见)
+
+>data values to include directly (偶尔见)
+
+>special output section keyword (少见)
+
+有时 linker script 的 command(比如 ASSERT)也会出现在 input section description 中。三层语言要素中，名字重复多，不同的层次的语言元素也有相似之处，所以初看时易迷失。
+
+有一个 tip: linker scripts 中提到的地址，对于 x86 来说，不论是 Virtual Memory Address(VMA) 还是 Load Memory Address(LMA)，都在 x86 的内存分段模型中，也就是说，这些地址是 code segment 中的地址。
+
+X86 下链接 vmlinux 用的 script 是 arch/x86/kernel/vmlinux.lds.S，但这只是原始模板，它会被 C Preprocessor(cpp) 处理为 arch/x86/kernel/vmlinux.lds，后者才是真正使用的 linker script，但是因为被 cpp 处理过，所以格式上很不 Human-friendly。
 
 ## APPENDIX
 
@@ -2451,7 +2951,7 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
 #### CMP
 
-比较源操作数和目的操作数，并根据结果设置 EFLAGS 寄存器的 status flags。所谓比较是指： 目的操作数 - 源操作数(结果被丢弃)。Jcc 指令常常跟在 CMP 后，根据刚刚 CMP 的结果进行条件跳转。举例(AT&T汇编语法，第一个操作数是源操作数)：
+比较源操作数和目的操作数，根据结果设置 EFLAGS 寄存器的 status flags。所谓比较是指： 目的操作数 - 源操作数(结果被丢弃)。Jcc 指令常常跟在 CMP 后，根据刚刚 CMP 的结果进行条件跳转。举例(AT&T汇编语法，第一个操作数是源操作数)：
 
 	cmp a, b
 	jg label
@@ -2460,4 +2960,4 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
 #### TEST
 
-将两个操作数做逻辑与
+对 源操作数 和 目的操作数 做逻辑与，根据结果设置 EFLAGS 寄存器的 SF，ZF，PF 状态位，不保存逻辑与后的结果。
