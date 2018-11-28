@@ -2583,12 +2583,12 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		/* Load new GDT with the 64bit segments using 32bit descriptor */
 		/* GDT 定义在文件下方的 .data section 中。ebp 中保存着 protect mode kernel 的
 		 * 运行时地址(delta)，所以，加上 delta 即得到 label: gdt 的运行时地址。虽然 lgdt，
-		 * 但看起来还没有生效。 */
+		 * 但看起来还没有生效。*/
 		addl	%ebp, gdt+2(%ebp)
 		lgdt	gdt(%ebp)
 
-		/* Enable PAE mode。开启 64 bit mode(long mode)，必须同时满足 CR0.PG = 1,
-		 * CR4.PAE = 1, and IA32_EFER.LME = 1 */
+		/* Enable PAE mode。开启 long mode 必要步骤(见下文)之一。也是开启 64-bit mode 的
+		 * 4-level paging 的必要条件之一: CR0.PG=1 & CR4.PAE=1 & IA32_EFER.LME=1 */
 		movl	%cr4, %eax
 		orl	$X86_CR4_PAE, %eax
 		movl	%eax, %cr4
@@ -2668,7 +2668,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		/* 如上面分析，所有 PD table 的 entry 都需初始化，4 tables x 512 entries/per table.
 		 * 0x183 = 0001,1000,0011b，参考 Intel开发者手册3A: Figure 4-11. Formats of
 		 * CR3 and Paging-Structure Entries with 4-Level Paging. 即 Present, Read/Write,
-		 * Page size = 1(2M page), Global. 第一个 page 的地址是 0，所以是从地址0开始连续
+		 * Page size = 1(2M page), Global. 第一个 page 的地址是 0，所以是从地址 0 开始连续
 		 * map 4G 物理地址空间  */
 		leal	pgtable + 0x2000(%ebx), %edi
 		movl	$0x00000183, %eax
@@ -2688,19 +2688,112 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		/* Enable Long mode in EFER (Extended Feature Enable Register) */
 		/* EFER 的详细描述在 Intel 开发者手册3A: "2.2.1 Extended Feature Enable Register".
 		 * MSR 的一般性介绍在 Intel 开发者手册3A: “9.4 MODEL-SPECIFIC REGISTERS (MSRS)”;
-		 * 详细介绍在 Intel开发者手册4: chapter 2. */
+		 * 详细介绍在 Intel开发者手册4: chapter 2.
+		 *
+		 * 开启 long mode 的条件：protect mode(CR0.PE=1) 下，LME=1 & CR0.PG=1。已经在
+		 * protect mode 下，这里 LME=1 只是 enable，需要 CR0.PG=1 才会 activate.
+		 * 详细描述在 Intel开发者手册: 9.8.5 Initializing IA-32e Mode.*/
 		movl	$MSR_EFER, %ecx
-		rdmsr		/* Read 64-bit MSR specified by ECX into EDX:EAX */
+		rdmsr		/* 64-bit MSR 地址由 ECX 指定，读入 EDX:EAX */
 		btsl	$_EFER_LME, %eax /* enable long mode in value of eax，然后写回 msr */
 		wrmsr
 
 		/* After gdt is loaded */
+		/* 为了 make Intel VT happy，在 real mode 的 setup 代码有做过，上文有详细描述。
+		 * 这是 boot loader 使用 32-bit boot protocol 的情况，不走 setup 代码，直接
+		 * 进入 protect mode。 segment selector 的格式参考 Intel 开发者手册3A */
 		xorl	%eax, %eax
 		lldt	%ax
 		movl    $__BOOT_TSS, %eax
 		ltr	%ax
 
+		/*
+		 * Setup for the jump to 64bit mode
+		 *
+		 * When the jump is performed we will be in long mode but
+		 * in 32bit compatibility mode with EFER.LME = 1, CS.L = 0, CS.D = 1
+		 * (and in turn EFER.LMA = 1).	To jump into 64bit mode we use
+		 * the new gdt/idt that has __KERNEL_CS with CS.L = 1.
+		 * We place all of the values on our mini stack so lret can
+		 * used to perform that far jump.
+		 */
+		/* Intel 对于 64-bit 模式的权威描述是：Intel 64-bit 架构引入了 IA-32e mode，它包括
+		 * 2 种子模式, Compatibility mode 和 64-bit mode。compatibility mode 下执行
+		 * 16-bit 或 32-bit 代码, 64-bit mode 下执行 64-bit 代码。通过 EFER.LME = 1 进入
+		 * long mode(即 IA-32e mode) 时，势必是子模式的一种，究竟是哪儿一种，由 CS.L 决定。
+		 * 代码的意图是直接跳入 64-bit mode，所以需要 load 64-bit code segment: __KERNEL_CS，
+		 * 如果直接 jmp 到 startup_64，CS 并不会被更新，还是使用老的 GDT 中的 32-bit code
+		 * segment。所以这里使用了小技巧，push segment selector 和 startup_64 的地址，待
+		 * 执行 lret 指令将它们加载回 CS:EIP。
+		 * 问题: 不能用 jmp cs:eip (长跳转)的形式跳转到另一个代码段中执行吗？ 可以自己试试写一下这个汇编代码！！
+		 */
+		pushl	$__KERNEL_CS
+		leal	startup_64(%ebp), %eax
+	#ifdef CONFIG_EFI_MIXED
+		movl	efi32_config(%ebp), %ebx /* 此时，efi32_config 处还没有被填充数据 */
+		cmp	$0, %ebx
+		jz	1f  /* 所以跳转到 1f*/
+		leal	handover_entry(%ebp), %eax
+	1:
+	#endif
+		pushl	%eax
+
+		/* Enter paged protected Mode, activating Long Mode */
+		/* 问题：在 startup_32 中的代码明显已经处在 protect mode，为什么再 enable 一次？*/
+		movl	$(X86_CR0_PG | X86_CR0_PE), %eax /* Enable Paging and Protected mode */
+		movl	%eax, %cr0
+
+		/* Jump from 32bit compatibility mode into 64bit mode. */
+		/* 指令将从 stack 上把准备好的值 load 回 CS 和 EIP，进入了 64-bit mode. */
+		lret
 	ENDPROC(startup_32)
+
+startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者手册: 9.8.5 Initializing IA-32e Mode 中描述了所需步骤:
+
+>1. 处在没有开启 paging 的 protect mode 下。
+>2. 设置 CR4.PAE = 1 使能 physical-address extensions (PAE)
+>3. 加载 paging structure 的物理地址到 CR3 寄存器。64-bit 下即 Level 4 page map table (PML4) 的基址
+>4. 设置 IA32_EFER.LME = 1 使能 long mode(IA-32e)
+>5. 设置 CR0.PG = 1 使能 paging。这将使 processor 自动设置 IA32_EFER.LMA = 1.
+
+32-bit protect mode 时 paging 不是必须开启，从上述步骤可以看出，IA-32e mode 默认必须开启 paging。对照手册中的步骤回望代码，会发现代码做的和手册讲的完全一致。手册对第 5 步还有更多描述：
+
+>The MOV CR0 instruction that enables paging and the following instructions must be located in an **identity-mapped** page
+
+代码中也常看到 **identity-mapped** 字眼，是什么意思呢？术语解释在 [Identity function](https://en.wikipedia.org/wiki/Identity_function)，原来是个数学术语，中文翻译为恒等函数。单词 identity 的主要意思是**身份**，但还有另一个意思：一致性，所以翻译过来应是“恒等映射的 page”，也就是 linear address = physical address 的映射。
+
+>Tips:
+
+>1. processor 操作模式切换条件在 Intel 开发者手册3A: Figure 2-3. Transitions Among the Processor’s Operating Modes
+>2. paging mode 切换条件在 Intel 开发者手册3A: Figure 4-1. Enabling and Changing Paging Modes
+
+继续分析 head_64.S:
+
+	/* 忽略 efi32_stub_entry 的分析。因为我们假设的流程下不会执行其代码 */
+
+		.code64
+		.org 0x200
+	ENTRY(startup_64)
+		/*
+		 * 64bit entry is 0x200 and it is ABI so immutable!
+		 * We come here either from startup_32 or directly from a
+		 * 64bit bootloader.
+		 * If we come here from a bootloader, kernel(text+data+bss+brk),
+		 * ramdisk, zero_page, command line could be above 4G.
+		 * We depend on an identity mapped page table being provided
+		 * that maps our entire kernel(text+data+bss+brk), zero page
+		 * and command line.
+		 */
+
+		/* Setup data segments. */
+		xorl	%eax, %eax
+		movl	%eax, %ds
+		movl	%eax, %es
+		movl	%eax, %ss
+		movl	%eax, %fs
+		movl	%eax, %gs
+
+...
 
 		.data
 	gdt64:
@@ -2709,22 +2802,31 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		.word	0
 		.quad   0
 	gdt:
-	/* 巧妙利用 GDT 中第一项是 null descriptor 的定义，用这个空间存储 GDTR 的内容。下面是 GDT 的内容*/
+		/* 巧妙利用 GDT 中第一项是 null descriptor 的定义，用这个空间存储 GDTR 的值。
+		 * 紧挨着下面是 GDT 的内容*/
 		.word	gdt_end - gdt   /* limit */
 		.long	gdt				/* base address */
 		.word	0				/* padding，补足 null descriptor */
-		/* 参考 Intel developer manual 3a，“3.4.5 Segment Descriptors” 一节。前三项都是：
-		 * base: 0x0, limit: 0xfffff。type 'a'; 表示代码段，Execute/Read; type '2' 表示
-		 * 数据段，Read/Write。9 = 1001b，表示 Segment present，descriptor type 是
-		 * code or data。从左数的第三个数，a 表示 64-bit code segment，granularity 是 4k，
-		 * 如果 L bit set，则 D bit 必须 clear；c 表示 granularity 是 4k，对于 32-bit code
-		 * or data, D bit 总是 set 1 */
+		/* 参考 Intel 开发者手册3A，“3.4.5 Segment Descriptors”。前三项都是：base: 0x0,
+		 * limit: 0xfffff; type 'a' 表示代码段，Execute/Read, type '2' 表示数据段，R/W;
+		 * 9 = 1001b，表示 Segment present，descriptor type 是 code or data; 从左数
+		 * 第三个数字，a = 1010b，表示 64-bit code segment，即此 segment 包含 native
+		 * 64-bit code，也即运行在 IA-32e 的 64-bit mode 下, granularity 是 4k(若 L
+		 * bit set，则 D bit 必须 clear)； c 表示 granularity 是 4k，对于 32-bit code
+		 * or data, D bit 总是 set 1. */
+		/* 64-bit 模式下，TSS Descriptor 被扩展到 16 bytes。除此，还有 LDT Descriptor 等
+		 * 也是被扩展到 16 bytes。参考手册3A的 3.5.2 Segment Descriptor Tables in IA-32e Mode。
+		 * 引出个问题：64-bit mode 下如何计算 descriptor 的地址。对于 32-bit mode，手册有说：
+		 * index x 8 + GDT base address，但 64-bit 下，descriptor 的 size varies.*/
 		.quad	0x00cf9a000000ffff	/* __KERNEL32_CS */
 		.quad	0x00af9a000000ffff	/* __KERNEL_CS */
 		.quad	0x00cf92000000ffff	/* __KERNEL_DS */
 		.quad	0x0080890000000000	/* TS descriptor */
 		.quad   0x0000000000000000	/* TS continued */
 	gdt_end:
+
+
+
 
 head_64.S 代码分析到这里，不得不暂停一下，因为 header.S 中的 init_size 定义复杂，我们需要明白它的真实含义。init_size 在 header.S 中被定义为：
 
@@ -2869,7 +2971,7 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 		# https://lore.kernel.org/patchwork/patch/674095/
 		# define ZO_z_min_extract_offset ((ZO__ehead - ZO_startup_32 + 4095) & ~4095)
 	#else
-		# 正常情况下，只将 extract offset 向上对齐到 4k 边界 
+		# 正常情况下，只将 extract offset 向上对齐到 4k 边界
 		# define ZO_z_min_extract_offset ((ZO_z_extract_offset + 4095) & ~4095)
 	#endif
 
