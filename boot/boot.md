@@ -2360,10 +2360,18 @@ setup 代码最最最后一步是调用 protected_mode_jump:
 
 	protected_mode_jump(boot_params.hdr.code32_start, (u32)&boot_params + (ds() << 4));
 
-第一个入参 code32_start 表示 protect mode 内核代码所在地址，在 header.s 中定义为默认值 0x100000，grub 没有修改它，并且也是使用这个地址(GRUB_LINUX_BZIMAGE_ADDR)加载 protect mode 的代码; 第二个入参是全局变量 boot_param 的地址，以整数形式表示，表达式的意思是使用逻辑地址翻译成线性地址。这是汇编代码写的函数，定义在 arch/x86/boot/pmjump.S 中。这里有个小 tips, linux kernel real mode 的代码都使用了 GCC 的编译选项 `-mregparm=3`:
+第一个入参 code32_start 表示 protect mode 内核代码所在地址，在 header.s 中定义为默认值 0x100000，grub 没有修改它，并且也是使用这个地址(GRUB_LINUX_BZIMAGE_ADDR)加载 protect mode 的代码; 第二个入参是全局变量 boot_param 的地址，以整数形式表示，表达式的意思是使用逻辑地址翻译成线性地址。这是汇编代码写的函数，定义在 arch/x86/boot/pmjump.S 中。这里有个小 tips, linux kernel real mode 的代码都使用了 GCC 的编译选项 `-mregparm=3`，定义在 arch/x86/Makefile 中：
+
+	REALMODE_CFLAGS := $(M16_CFLAGS) -g -Os -DDISABLE_BRANCH_PROFILING \
+                       -Wall -Wstrict-prototypes -march=i386 -etregparm=3 \
+                       -fno-strict-aliasing -fomit-frame-pointer -fno-pic \
+                       -mno-mmx -mno-sse
+
+`man gcc` 可知它的含义是：
 
 >mregparm=num
-	Control how many registers are used to pass integer arguments.  By default, no registers are used to pass arguments, and at most 3 registers can be used.  You can control this behavior for a specific function by using the function attribute "regparm".
+
+>	Control how many registers are used to pass integer arguments.  By default, no registers are used to pass arguments, and at most 3 registers can be used.  You can control this behavior for a specific function by using the function attribute "regparm".
 
 本来 x86 上函数调用时的参数传递是使用 stack 的，用这个选项则强制使用寄存器(最多3个)，可能是因为需要提高执行效率的原因。按入参从左到右的顺序，此选项分别使用 eax, edx, ecx 三个寄存器作参数传递用。
 
@@ -2481,7 +2489,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		 * all need to be under the 4G limit.
 		 */
 		cld /* clear direction flag in EFLAGS 寄存器，字符串操作将递增 index 寄存器。
-			/* header.S 中已经看到这条字令，这里是 bootloader 直接到到 32-bit 入口的情况。*/
+			/* header.S 中已看到这条指令，这里是 bootloader 直接到 32-bit 入口的情况。*/
 		/*
 		 * Test KEEP_SEGMENTS flag to see if the bootloader is asking
 		 * us to not reload segments
@@ -2725,7 +2733,8 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		 * 如果直接 jmp 到 startup_64，CS 并不会被更新，还是使用老的 GDT 中的 32-bit code
 		 * segment。所以这里使用了小技巧，push segment selector 和 startup_64 的地址，待
 		 * 执行 lret 指令将它们加载回 CS:EIP。
-		 * 问题: 不能用 jmp cs:eip (长跳转)的形式跳转到另一个代码段中执行吗？ 可以自己试试写一下这个汇编代码！！
+		 * 问题: 不能用 jmp cs:eip (长跳转)的形式跳转到另一个代码段中执行吗(ljmp $SECTION,$OFFSET)？
+		 * 可以自己试试写一下这个汇编代码！
 		 */
 		pushl	$__KERNEL_CS
 		leal	startup_64(%ebp), %eax
@@ -2760,19 +2769,21 @@ startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者�
 
 >The MOV CR0 instruction that enables paging and the following instructions must be located in an **identity-mapped** page
 
-代码中也常看到 **identity-mapped** 字眼，是什么意思呢？术语解释在 [Identity function](https://en.wikipedia.org/wiki/Identity_function)，原来是个数学术语，中文翻译为恒等函数。单词 identity 的主要意思是**身份**，但还有另一个意思：一致性，所以翻译过来应是“恒等映射的 page”，也就是 linear address = physical address 的映射。
+代码中也常看到 **identity-mapped** 字眼，是什么意思呢？术语解释在 [Identity function](https://en.wikipedia.org/wiki/Identity_function)，原来是个数学术语，中文翻译为恒等函数。单词 identity 的主要意思是**身份**，但还有另一个意思：**一致性**，所以翻译过来是“恒等映射的 page”，也就是 linear address = physical address 的映射。
 
 >Tips:
 
 >1. processor 操作模式切换条件在 Intel 开发者手册3A: Figure 2-3. Transitions Among the Processor’s Operating Modes
 >2. paging mode 切换条件在 Intel 开发者手册3A: Figure 4-1. Enabling and Changing Paging Modes
 
-继续分析 head_64.S:
+继续分析 head_64.S 前，插入一则科普，看到过很久却没有找到权威定义的术语: Canonical Address，权威解释在 Intel开发者手册1 的 3.3.7.1 Canonical Addressing。
+
+继续分析 64-bit mode 下的代码:
 
 	/* 忽略 efi32_stub_entry 的分析。因为我们假设的流程下不会执行其代码 */
 
 		.code64
-		.org 0x200
+		.org 0x200  /* 为什么需要这一句？ */
 	ENTRY(startup_64)
 		/*
 		 * 64bit entry is 0x200 and it is ABI so immutable!
@@ -2785,7 +2796,10 @@ startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者�
 		 * and command line.
 		 */
 
-		/* Setup data segments. */
+		/* Setup data segments. cs 通过上面的 lret 指令已经设置。但 64-bit mode 下，根据
+		 * Intel开发者手册1 的 3.4.2.1 Segment Registers in 64-Bit Mode 所说：不管 CS,
+		 * DS, ES, SS 中的值如何，他们的段基址都被当作 0；FS, GS 例外，他们的使用如往常一样。
+		 * 所以这里给各段寄存器赋值的意义是？ 而且他们都被赋值为0，也不是一个 segment selector 值？*/
 		xorl	%eax, %eax
 		movl	%eax, %ds
 		movl	%eax, %es
@@ -2793,9 +2807,224 @@ startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者�
 		movl	%eax, %fs
 		movl	%eax, %gs
 
+		/* 回忆一下上面代码： 经计算后ebp 的值是 ZO image 被 grub 加载到内存中的物理地址；
+		 * ebx 的值是解压缩 buffer 中，ZO image 被 copy 到的物理地址。
+		 * Compute the decompressed kernel start address.  It is where
+		 * we were loaded at aligned to a 2M boundary. %rbp contains the
+		 * decompressed kernel start address.
+		 *
+		 * If it is a relocatable kernel then decompress and run the kernel
+		 * from load address aligned to 2MB addr, otherwise decompress and
+		 * run the kernel from LOAD_PHYSICAL_ADDR
+		 *
+		 * We cannot rely on the calculation done in 32-bit mode, since we
+		 * may have been invoked via the 64-bit entry point.
+		 */
+
+		/* Start with the delta to where the kernel will run at. */
+	#ifdef CONFIG_RELOCATABLE
+		/* 由于不仔细阅读 gnu as 文档对 rip relative addressing 的描述，仍然按 IA 32 的
+		 * memory reference 方式来理解这条 lea 指令，导致无法理解，以致费了一天多时间翻阅
+		 * Intel开发者手册也没有找到对该语句的权威解释。绝望中重翻 `info as`，finally got it:
+		 *
+		 * AT&T: 'symbol(%rip)', Intel: '[rip + symbol]'
+		 *      Points to the 'symbol' in RIP relative way, this is shorter than
+		 *      the default absolute addressing.*/
+		 * (In 9.15.7 Memory References of `info as`)
+		 *
+		 * 原来就是 symbol 的地址！而且是运行时地址！ 这样的话, everything finally make sense。
+		 * 看下这条语句的反汇编：
+		 *
+		 * 		20c:   48 8d 2d ed fd ff ff    lea    -0x213(%rip),%rbp  # 0 <startup_32>
+		 * (诚不欺我)
+		 */
+		/* 这段&更下面的代码的逻辑在 startup_32 中出现过，这里又做一遍的原因英文注释有讲。找到
+		 * 自己被加载的地址，向上对齐到 kernel_alignment，然后比较等。
+		leaq	startup_32(%rip) /* - $startup_32 */, %rbp
+		movl	BP_kernel_alignment(%rsi), %eax
+		decl	%eax
+		addq	%rax, %rbp
+		notq	%rax
+		andq	%rax, %rbp
+		cmpq	$LOAD_PHYSICAL_ADDR, %rbp
+		jge	1f
+	#endif
+		movq	$LOAD_PHYSICAL_ADDR, %rbp
+
+		1:
+		/* Target address to relocate to for decompression */
+		/* 下面几行出现的两次 memory reference 很像 rip relative addressing，但并不是，
+		 * 所以按照 IA-32 的方式去理解～ */
+		movl	BP_init_size(%rsi), %ebx
+		subl	$_end, %ebx
+		addq	%rbp, %rbx
+
+		/* Set up the stack */
+		leaq	boot_stack_end(%rbx), %rsp
+
+		/*
+		 * paging_prepare() and cleanup_trampoline() below can have GOT
+		 * references. Adjust the table with address we are running at.
+		 *
+		 * Zero RAX for adjust_got: the GOT was not adjusted before;
+		 * there's no adjustment to undo.
+		 */
+		/* 上面注释和 adjust_got 的注释连在一起看更 make sense，但不理解位置无关代码的话，
+		 * 对注释的理解只能停留在表面。关于动态链接，共享对象，位置无关代码(PIC)，对我来说目前最
+		 * make sense 的讲解是：<一个程序员的自我修养>，第7章“动态链接”。
+		 *
+		 * 为何 compressed kernel 中有 Global Offset Table(GOT)? 就目前的理解程度，答案
+		 * 是：compressed kernel 使用 -fPIC 或 -fPIE 编译，会生成 .got section。但这个
+		 * 答案并不清晰，没有说明编译选项和 .got section 的关系。查看引入上面注释的 commit:
+		 * 5c9b0b1c498 可知，为了生成 X86_64 上的位置无关代码，新版本 binutils 使用 RIP
+		 * relative addressing 的方式(这也是我脑中最自然的方式)，而老版本 binutils 会为
+		 * 此生成 GOT。
+		 * GOT entry 的内容是相应符号的绝对地址，所以 entry size 在 IA-32下 为 4 bytes，
+		 * X86_64 下为 8 bytes。一个普通进程链接动态库时默认使用 -fPIC，对每一个动态库中符号
+		 * 的引用都生成一条 GOT entry, 程序被加载时，run time linker 会修改 GOT entry 中
+		 * 的地址，使其内容变为目标符号的运行时地址。而可执行程序主体中所有对 .so 中符号的引用
+		 * 都变成对自身 GOT 中相应 entry 的引用。
+		 *
+		 * 目前对老版本会生成 GOT 并不理解，因为 compressed kernel 作为一个独立运行的个体，不会
+		 * 引用外部模块的变量或函数(待确认)，所以为什么 paging_prepare，cleanup_trampoline
+		 * 的调用会在 GOT 中有 reference？
+		 * OK，暂时不纠结这个问题，假设老版本中 -fPIC 会生成 GOT 是个事实，那么只有 bootloader
+		 * 才有机会对它做动态链接，但从未听说此说法，而且 Zero RAX for adjust_got 的注释
+		 * 和代码也证实了这点：bootloader 不会做动态链接。之前没有人做 GOT adjust，所以现在
+		 * adjust_got 只需加上现在 adjustment。那么会引申出别的问题：adjustment 的值如何决定？
+		 * GOT 中的初始值是什么？这两个问题实际上是一个，推理一下： GOT 的内容是符号的编译地址，
+		 * 所以此处 adjust_got 调用仅仅加上自己的编译地址和运行地址之delta，即课更新为运行地址，
+		 * 因为编译地址是 0，所以加载地址就是这个 delta。
+		 * 我的环境中，binutils 的版本是 2.29(>2.24)，所以理论上不会通过 GOT 实现位置无关，
+		 * 通过 `objdump -h <compressed_vmlinux>` 可以看出，.got section 的 size 是
+		 * 0x18，即只有 3 条(8byte/per entry) entry，而 GOT 的前三条是特殊 entry，后面的
+		 * entry 才是对符号的 reference，说明 GOT 其实是空的，也就是说，现在只生成空的 GOT，
+		 * 而不在使用它。
+		 */
+		xorq	%rax, %rax
+
+		/*
+		 * Calculate the address the binary is loaded at and use it as
+		 * a GOT adjustment.
+		 */
+		call	1f
+	1:	popq	%rdi
+		subq	$1b, %rdi
+
+		/* 定义在文件下方 */
+		call	adjust_got
+
+		/*
+		 * At this point we are in long mode with 4-level paging enabled,
+		 * but we might want to enable 5-level paging or vice versa.
+		 *
+		 * The problem is that we cannot do it directly. Setting or clearing
+		 * CR4.LA57 in long mode would trigger #GP. So we need to switch off
+		 * long mode and paging first.
+		 *
+		 * We also need a trampoline in lower memory to switch over from
+		 * 4- to 5-level paging for cases when the bootloader puts the kernel
+		 * above 4G, but didn't enable 5-level paging for us.
+		 *
+		 * The same trampoline can be used to switch from 5- to 4-level paging
+		 * mode, like when starting 4-level paging kernel via kexec() when
+		 * original kernel worked in 5-level paging mode.
+		 *
+		 * For the trampoline, we need the top page table to reside in lower
+		 * memory as we don't have a way to load 64-bit values into CR3 in
+		 * 32-bit mode.
+		 *
+		 * We go though the trampoline even if we don't have to: if we're
+		 * already in a desired paging mode. This way the trampoline code gets
+		 * tested on every boot.
+		 */
+		/* RIP relative addressing AGAIN. 使用文件下方自己定义的 GDT。5-level paging
+		 * 的知识需要参考： <5-Level Paging and 5-Level EPT white paper>。总结上面注释
+		 * 的要点如下：
+		 *   1. 无法在 long mode 中随意切换 4-level 和 5-level paging，只能从 protect
+		 *      mode 直接跳入，所以我们需要一个在低地址中的 trampoline 函数*/
+		 *   2. trampoline 函数的功能不仅那么点，还有很多其他的功能，目前作者还没有感受，待补充。
+		 */
+		/* Make sure we have GDT with 32-bit code segment */
+		/* 64-bit boot protocol 的情况，如 commit 7beebaccd50 所说，bootloader 可能没有
+		 * 为我们准备一个合适的 GDT，即缺少 32-bit code segment，因为 trampoline 必须位于
+		 * 低地址(0-4G)，这是 32-bit protect mode 的虚拟地址空间范围。*/
+		leaq	gdt(%rip), %rax
+		movq	%rax, gdt64+2(%rip)
+		lgdt	gdt64(%rip)
+
+		/*
+		 * paging_prepare() sets up the trampoline and checks if we need to
+		 * enable 5-level paging.
+		 *
+		 * Address of the trampoline is returned in RAX.
+		 * Non zero RDX on return means we need to enable 5-level paging.
+		 *
+		 * RSI holds real mode data and needs to be preserved across
+		 * this function call.
+		 */
+		pushq	%rsi
+		movq	%rsi, %rdi		/* real mode address */
+		call	paging_prepare
+		popq	%rsi
+
+		/* Save the trampoline address in RCX */
+		movq	%rax, %rcx
+
+		/*
+		 * Load the address of trampoline_return() into RDI.
+		 * It will be used by the trampoline to return to the main code.
+		 */
+		leaq	trampoline_return(%rip), %rdi
+
+		/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
+		pushq	$__KERNEL32_CS
+		leaq	TRAMPOLINE_32BIT_CODE_OFFSET(%rax), %rax
+		pushq	%rax
+		lretq
+	trampoline_return:
+
+	...
+
+	/*
+	 * Adjust the global offset table
+	 *
+	 * RAX is the previous adjustment of the table to undo (use 0 if it's the
+	 * first time we touch GOT).
+	 * RDI is the new adjustment to apply.
+	 */
+	/* jae 的 ae = above or equal，很少看到 above 的跳转条件，和 great 的区别是啥？参考：
+	 * https://stackoverflow.com/questions/20906639/difference-between-ja-and-jg-in-assembly
+	 * https://en.wikibooks.org/wiki/X86_Assembly/Control_Flow#Jump_if_Above_(unsigned_comparison)
+	 *
+	 * 符号 _got 和 _egot 定义在 linker script 中，又是通过 RIP relative addressing，获得
+	 * 两个符号的运行时地址，放在 rdx, rcx 中。
+	 * 代码本身比较容易理解：通过比较 .got section 起始 & 结束地址，遍历 GOT 的 entry，undo
+	 * 之前的 adjustment，apply 现在的 adjustment。
+	 * GOT 前三项是特殊 entry，所以这里需要从第一项开始 adjust 吗，从第三项不行吗？
+	 * `readelf -x .got vmlinux` 显示确实如此，除了第一项是 .dynamic section 的地址，其他
+	 * 两项都是空(0)，而且猜测 .dynamic section 未来应该也不会被用到。而且被copy到上层目录的
+	 * vmlinux.bin 时被 `objcopy --strip-all` 删除了所有符号信息&重定位信息.
+	 */
+	adjust_got:
+		/* Walk through the GOT adding the address to the entries */
+		leaq	_got(%rip), %rdx
+		leaq	_egot(%rip), %rcx
+	1:
+		cmpq	%rcx, %rdx
+		jae	2f	/* 起始地址怎么会大于结束地址？所以这里不会跳到 2f，但下面的代码将对起始地址++ */
+		subq	%rax, (%rdx)	/* Undo previous adjustment */
+		addq	%rdi, (%rdx)	/* Apply the new adjustment */
+		addq	$8, %rdx		/* 起始地址不断++，直到等于结束地址，跳转到 2f，返回 */
+		jmp	1b
+	2:
+		ret
+
 ...
 
 		.data
+	/* gdt64 的四行也是由 commit 7beebaccd50 引入。表示 X86_64 下 GDTR 的内容。base 是 64
+	 * bits 长，但分别 .long，.word，.quad 是什么情况？待向社区提问。*/
 	gdt64:
 		.word	gdt_end - gdt
 		.long	0
@@ -2803,7 +3032,7 @@ startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者�
 		.quad   0
 	gdt:
 		/* 巧妙利用 GDT 中第一项是 null descriptor 的定义，用这个空间存储 GDTR 的值。
-		 * 紧挨着下面是 GDT 的内容*/
+		 * 紧挨着的是 GDT 的内容*/
 		.word	gdt_end - gdt   /* limit */
 		.long	gdt				/* base address */
 		.word	0				/* padding，补足 null descriptor */
