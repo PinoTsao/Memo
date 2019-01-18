@@ -1171,7 +1171,7 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 	  return result;
 	}
 
-有一个细节需要知道： 对于 linux kernel 的 real mode 部分，即 setup.bin 的 size，其实包括了两部分，一是开头的 512 bytes，由于历史的原因，被称为 boot sector，因为最早的 linux kernel 自带 boot sector，可以直接由 bios 启动；二是剩余部分，被称为 setup 代码，这部分的 size 由 boot protocol 中的 setup_sects 指示，单位如它的名字所示，是 sector。
+有一个细节需要知道：对于 linux kernel 的 real mode 部分，即 setup.bin 的 size，其实包括了两部分，一是开头的 512 bytes，由于历史的原因，被称为 boot sector，因为最早的 linux kernel 自带 boot sector，可以直接由 bios 启动；二是剩余部分，被称为 setup 代码，这部分的 size 由 boot protocol 中的 setup_sects 指示，单位如它的名字所示，是 sector。
 
 从 grub 的代码来看，bzImage 的 real mode 部分最大是 GRUB_LINUX_MAX_SETUP_SECTS(64) x GRUB_DISK_SECTOR_BITS(512) = 32k，包括开头 512 bytes 的 boot sector，所以 setup code 实际最大只有 31k；从 linux 的文档 [Documentation/x86/boot.txt](https://github.com/torvalds/linux/blob/master/Documentation/x86/boot.txt) 中的 bzImage memory layout 也可以看出 linux kernel 的 setup + boot sector 的大小是 0x8000，即 32k；更确凿的证据在 arch/x86/boot/setup.ld 中：
 
@@ -1922,9 +1922,9 @@ man 手册中说：
 
 ## How linux kernel is booted
 
-linux kernel 编译出来的 bzImage 中包括如下部分： 运行在 real mode 下的 setup.bin；运行在 protect mode 下的 vmlinux.bin；包含重定位信息的 vmlinux.relocs(可选)。上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。由 grub 的 linux16 命令加载启动的内核将首先执行 setup.bin 的代码 所以，首先来看 setup.bin 的流程.
+linux kernel 编译出来的 bzImage 中包括如下部分： 运行在 real mode 下的 setup.bin；运行在 protect mode 或 long mode 下的 vmlinux.bin；包含重定位信息的 vmlinux.relocs(可选)。上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。由 grub 的 linux16 命令加载启动的内核将首先执行 setup.bin 的代码 所以，首先来看 setup.bin 的流程.
 
-### setup.bin
+### arch/x86/boot/setup.bin
 
 setup.bin 的二进制文件布局由其 linker script arch/x86/boot/setup.ld 定义:
 
@@ -2506,9 +2506,9 @@ real mode 的 setup 代码最后一步是调用 protected_mode_jump:
 
 linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
-### protect mode linux
+### arch/x86/boot/vmlinux.bin
 
-bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 kernel 本尊(源码根目录下的 vmlinux)，在下面这将作为单独的一节介绍细节；而它又是从下一层目录(compressed)下的 vmlinux 剥离处理而来。以 x86-64 为例来分析这部分代码，首先看下 arch/x86/boot/compressed/vmlinux 的代码布局，定义在 arch/x86/boot/compressed/vmlinux.lds：
+bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 kernel 本尊(源码根目录下的 vmlinux)，在 "VO/ZO" 一节中有介绍细节；而它又是从下一层目录(compressed)的 vmlinux 剥离处理而来。以 x86-64 为例来分析这部分代码，首先看下 arch/x86/boot/compressed/vmlinux 的代码布局，定义在 arch/x86/boot/compressed/vmlinux.lds：
 
 	...
 	SECTIONS
@@ -2533,7 +2533,9 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 	 ....
 	}
 
-由此可知，地址 0 处的代码是 .head.text section 的内容，也即 real mode 的 setup 代码跳转到 protect mode 后开始执行的代码。.head.text section 在文件 arch/x86/boot/compressed/head_64.S 中：
+由此可知，地址 0 处的代码是 .head.text section 的内容，也即 real mode 的 setup 代码跳转到 protect mode 后开始执行的代码。.head.text section 在文件 arch/x86/boot/compressed/head_64.S 中。入口点是 startup_32。
+
+#### startup_32
 
 		__HEAD
 		.code32
@@ -2544,26 +2546,40 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		 * kernel(text+data+bss+brk) ramdisk, zero_page, command line
 		 * all need to be under the 4G limit.
 		 */
-		/* clear direction flag in EFLAGS 寄存器，字符串操作将递增 index 寄存器。
-		 * header.S 中已看到这条指令，这是 bootloader 直接跳到 32-bit entry 的情况。*/
+		/* clear direction flag in EFLAGS 寄存器，字符串操作指令(scas, stos等)将递增
+		 * index 寄存器。下面初始化 page table 会用到 stos 指令。header.S 中已看到这条
+		 * 指令，这里看到是 32-bit boot protocol 的情况 */
 		cld
+
+		/* startup_32 是 32-bit boot protocol 的入口，在阅读下面代码前，有必要事先 &
+		 * 事后各详细阅读一遍 “32-bit BOOT PROTOCOL” of Documentation/x86/boot.txt，
+		 * 因为事先读肯定无法透彻理解，待看完代码再回头复习一遍便可查漏补缺。
+		 *
+		 * tips: bzImage 打包了 setup(real mode) 和 compressed kernel(protect
+		 * mode)，及可能存在的重定位数据，即使使用 32-bit 或 64-bit boot protocol，
+		 * bzImage 也是作为一个整体被 load 到 RAM 中，所以 bootloalder 才能将 setup
+		 * 中 header.S 的 setup header 数据 cp 到准备好的 boot_params。
+		 */
 
 		/*
 		 * Test KEEP_SEGMENTS flag to see if the bootloader is asking
 		 * us to not reload segments
-		 * real mode 代码最后一个函数 protected_mode_jump 的入参之一是 real mode 下的
-		 * 数据结构 boot_params 的线性地址，保存在 esi 中。grub 没有设置 KEEP_SEGMENTS
-		 * bit，所以不会跳转到 1f，执行下面几行代码重新加载各 segment register。
-		 * BP_loadflags 的实现待分析！不过顾名思义，BP: Boot Protocol
+		 * setup 代码最后一个函数 protected_mode_jump 的入参之一是 setup 下的数据结构
+		 * boot_params 的线性地址，保存在 esi 中。grub 没有设置 KEEP_SEGMENTS bit，
+		 * 所以不会跳转到 1f，执行下面几行代码重新加载各 segment register。
+		 * BP_loadflags 的实现待分析，但顾名思义，BP = Boot Protocol
 		 */
 		testb $KEEP_SEGMENTS, BP_loadflags(%esi)
 		jnz 1f
 
-		/* realmode_switch_hook 中已 cli，这是 bootloader 直接跳到 32-bit entry 的情况 */
+		/* realmode_switch_hook 中已 cli，这是 32-bit boot protocol 的情况 */
 		cli
 
-		/* 使用 real mode 下 setup_gdt 函数配置好的 GDT。同样，pmjump.S 中做过同样操作，
-		 * 这是 bootloader 使用 32-bit boot protocol 的情况。*/
+		/* 如果是从 setup 来到 startup_32，则使用 setup 的 setup_gdt 函数配置的 GDT
+		 * 加载段寄存器(pmjump.S 中有同样操作)；如果通过 32-bit boot protocol 来到
+		 * startup_32，根据 “32-bit BOOT PROTOCOL” of Documentation/x86/boot.txt
+		 * 的最后一段描述可知，GDT 已经按需配好。 但这里显式 load 段寄存器可能是为了保险。
+		 */
 		movl	$(__BOOT_DS), %eax
 		movl	%eax, %ds
 		movl	%eax, %es
@@ -2577,14 +2593,14 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 	 * address we are running at.  The reserved chunk of the real-mode
 	 * data at 0x1e4 (defined as a scratch field) are used as the stack
 	 * for this calculation. Only 4 bytes are needed.
-	 * call 指令将 label 1 的运行时地址(下一条指令地址)压栈，然后弹出到 ebp，再和 label 1
-	 * 的链接时地址相减，差值放在 ebp 中。差值即编译时地址和运行时地址之 delta，其实也是符号
+	 * call 指令将下一条指令地址(label 1的运行时地址)压栈，然后弹出到 ebp，再和 label 1
+	 * 的链接时地址相减，差值放在 ebp 中。差值即编译地址和运行地址之 delta，其实也是符号
 	 * startup_32 的运行时地址，因为 startup_32 的编译地址是 0。
-	 * 由上文分析可知，protect mode kernel 被加载到内存的地址，由 boot protocol(header.S)
-	 * 中的 code32_start(0x100000 = 1M) 表示, grub 中没有修改它，且 grub 也是用这个值来
-	 * load protect mode kernel，startup_32 是 protect mode kernel 的入口，所以它的
-	 * 运行时地址是 0x100000(1M)。
-	 * 在 real mode 中是有设置 esp 的，这里单独设置应该也是 32-bit boot protocol 的情况。
+	 * 由上文分析可知，compressed kernel(protect mode) 被加载到内存的地址，由 boot
+	 * protocol(header.S) 中的 code32_start(0x100000 = 1M) 表示, grub 没有修改它，
+	 * 且 grub 也是用这个值来 load compressed kernel，startup_32 是 protect mode
+	 * kernel 的入口，所以它的运行时地址是 0x100000(1M)。
+	 * setup 中有设置 esp，这里再设置应该也是 32-bit boot protocol 的情况。
 	 */
 		leal	(BP_scratch+4)(%esi), %esp
 		call	1f
@@ -2592,19 +2608,20 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		subl	$1b, %ebp
 
 	/* setup a stack and make sure cpu supports long mode. */
-	/* 在本文件底部定义了 label: boot_stack，boot_stack_end，boot_heap，并开辟了空间 */
+	/* 本文件底部定义了 label: boot_stack，boot_stack_end，boot_heap，并开辟了空间 */
 		movl	$boot_stack_end, %eax
-		addl	%ebp, %eax /* 将 stack 顶的编译地址加上 delta，得到运行时地址 */
+		addl	%ebp, %eax /* stack 顶的编译地址加上 delta，得到运行时地址 */
 		movl	%eax, %esp /* 得到栈的运行时地址，现在可以做函数调用(call)了 */
 
-	/* 函数定义在 verify_cpu.S，文件在下面被 include。此函数大部分内容是用 cpuid 指令来
+	/* 函数定义在 verify_cpu.S，文件在下面被 include。函数大部分内容是用 cpuid 指令
 	 * discover CPU feature。此刻只需看 verify_cpu.S 的文件头描述，了解其返回值:
 	 *     verify_cpu, returns the status of longmode and SSE in register %eax,
 	 *     0: Success, 1: Failure
-	 * 有需求时再来详细分析它。  */
+	 * 有需求时再来详细分析
+	 */
 		call	verify_cpu
 		testl	%eax, %eax
-		jnz	no_longmode  /* 根据常识：一般情况下不会执行这条指令 */
+		jnz	no_longmode  /* 根据常识，一般不会执行这条指令 */
 
 	/*
 	 * Compute the delta between where we were compiled to run at
@@ -2614,13 +2631,17 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 	 * contains the address where we should move the kernel image temporarily
 	 * for safe in-place decompression.
 	 * 英文注释解释的清楚。
-	 * kernel_alignment 在 boot protocal(header.S) 中定义为: CONFIG_PHYSICAL_ALIGN
-	 * (0x200000 - 0x1000000，必须是 0x200000 的倍数)，grub 没有修改它。ebp 寄存器保存着
-	 * protect mode kernel 被加载的地址(0x100000)，这段代码将其向上对齐到 kernel_alignment，
-	 * 对齐后的地址放在 ebx 中。比较 LOAD_PHYSICAL_ADDR(CONFIG_PHYSICAL_START 对齐到
-	 * CONFIG_PHYSICAL_ALIGN) 和 ebx，若 ebx 小于 LOAD_PHYSICAL_ADDR，则给它赋值为
-	 * LOAD_PHYSICAL_ADDR。  WHY? 所以，ebx 是解压缩 buffer，即 decompressed kernel
-	 * 的起始地址？
+	 * kernel_alignment 在 header.S(boot protocol) 中定义为: CONFIG_PHYSICAL_ALIGN
+	 * (64-bit 下，其范围是 0x200000 - 0x1000000，且必须是 0x200000 的倍数)，grub 没有
+	 * 修改它。ebp 是 bzImage 中 protect mode kernel 被加载的地址(0x100000)，这段代码
+	 * 将其向上对齐到 kernel_alignment，对齐后的值放 ebx 中。比较 LOAD_PHYSICAL_ADDR
+	 * 和 ebx，若 ebx < LOAD_PHYSICAL_ADDR，则给 ebx 赋值 LOAD_PHYSICAL_ADDR。 WHY?
+	 * 所以 ebx 是解压缩 buffer，即 decompressed kernel 的起始地址？
+	 * 2019/12/29 update：上述推论正确！  LOAD_PHYSICAL_ADDR 在代码中被定义为:
+	 * CONFIG_PHYSICAL_START 对齐到 CONFIG_PHYSICAL_ALIGN。阅读 arch/x86/Kconfig
+	 * 中 PHYSICAL_START 和 PHYSICAL_ALIGN 的定义，会发现上面的推论正确！！！而且，在
+	 * CONFIG_RELOCATABLE 时，LOAD_PHYSICAL_ADDR 将作为加载 decompressed kernel
+	 * 的最小地址。
 	 */
 	#ifdef CONFIG_RELOCATABLE
 		movl	%ebp, %ebx
@@ -2636,15 +2657,12 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		movl	$LOAD_PHYSICAL_ADDR, %ebx
 
 	/* Target address to relocate to for decompression */
-	/* Tips: 这里涉及了几个陌生的概念，VO, ZO，在下面的 patch 中有详细的解释：
-	 *     https://lore.kernel.org/patchwork/patch/674100/
-	 * 先了解这些概念才容易理解下面的代码。
-	 */
-	/* _end 定义在 linker script 中，表示 arch/x86/boot/compressed/vmlinux 的(链接时)
-	 * 结束地址，也即它在内存中的 size；init_size 定义在 header.S 中，一般情况下它等于：
-	 * VO__end - VO__text，即 VO image 的 size；二者相减(VO - ZO)得到 offset，加到
-	 * ebx(解压缩 buffer 的地址)。所以，现在 ebx 的值是 ZO image 被 copy/relocate 到
-	 * 解压缩 buffer 中的地址。   压缩后 size 大于压缩前的情况是怎样??? */
+	/* Tips: 这里涉及了几个陌生的概念：VO, ZO。在 “VO/ZO” 一节中有详细描述。
+	 * _end 定义在 linker script 中，表示 arch/x86/boot/compressed/vmlinux 的(链接)
+	 * 结束地址，即 ZO image 在内存中的 size；init_size 定义在 header.S 中，一般情况下
+	 * 它等于：VO__end - VO__text，即 VO image 的 size；二者相减(VO - ZO)得到 offset，
+	 * 加到 ebx(解压缩 buffer 的地址)。所以，现在 ebx 的值是 ZO image 被 copy/relocate
+	 * 到解压缩 buffer 中的地址。   压缩后 size 大于压缩前的情况是怎样??? */
 	1:
 		movl	BP_init_size(%esi), %eax
 		subl	$_end, %eax
@@ -2653,14 +2671,14 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 	/* Prepare for entering 64 bit mode */
 
 		/* Load new GDT with the 64bit segments using 32bit descriptor */
-		/* GDT 定义在文件下方的 .data section。ebp 的值是 ZO image 的加载/运行时地址，即
-		 * delta，加上 delta 得到 label: gdt 的运行时地址。虽然 lgdt，但暂时没有重 load
-		 * 段寄存器，所以此刻还没有生效。*/
+		/* GDT 定义在文件下方的 .data section。ebp 的值是 ZO image 的加载/运行时地址，
+		 * 即 delta，加上 delta 得到 label: gdt 的运行时地址。虽然 lgdt，但暂未重新
+		 * load 段寄存器，所以此刻还没有生效。*/
 		addl	%ebp, gdt+2(%ebp)
 		lgdt	gdt(%ebp)
 
-		/* Enable PAE mode。开启 long mode 必要步骤(见下文)之一。也是开启 64-bit mode
-		 * 的 4-level paging 的必要条件之一: CR0.PG=1 & CR4.PAE=1 & IA32_EFER.LME=1 */
+		/* Enable PAE mode。开启 long mode 必要步骤(见下文)之一，也是开启 4-level
+		 * paging 的必要条件之一: CR0.PG=1 & CR4.PAE=1 & IA32_EFER.LME=1 */
 		movl	%cr4, %eax
 		orl	$X86_CR4_PAE, %eax
 		movl	%eax, %cr4
@@ -2670,7 +2688,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		/* If SEV is active then set the encryption mask in the page tables.
 		 * This will insure that when the kernel is copied and decompressed
 		 * it will be done so encrypted. */
-		/* 此函数定义在 mem_encrypt.S，AMD Secure Encrypted Virtualization (SEV)
+		/* 此函数定义在 mem_encrypt.S。AMD Secure Encrypted Virtualization (SEV)
 		 * 是 AMD 的特性，不是本文重点，略过。这段代码也是最近才加入。直接跳到 1: 继续分析 */
 		call	get_sev_encryption_bit
 		xorl	%edx, %edx
@@ -2682,12 +2700,12 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 	1:
 		/* Initialize Page tables to 0 */
 		/* label: pgtable 定义在本文件最底部的 .pgtable section 中，指向 size 为
-		 * BOOT_PGT_SIZE 的空间，它的起始地址在 arch/x86/boot/compressed/vmlinux.lds.S
-		 * 中被对齐到 4k(page size)！  注意!!!这里 leal 指令是基于 ebx 寄存器，上文说过，
-		 * ebx 是 ZO image 在解压缩 buffer 中的地址，所以初始化的页表结构在解压缩 buffer
-		 * 中的 ZO。阅读页表代码前必须掌握其基础知识，最权威的材料在 Intel 软件开发者手册 3A
-		 * 的 "chapter 4: paging"。由上面注释可知，early boot 只需映射 4G 大小的物理地址
-		 * 空间，所以只需 6 个 paging structure，下面会详细解释为什么只需 6 个。
+		 * BOOT_PGT_SIZE 的空间，它的地址在 arch/x86/boot/compressed/vmlinux.lds.S
+		 * 中被对齐到 4k(page size)！ 注意！这里 leal 指令是基于 ebx 寄存器，上文说过，
+		 * ebx 是 ZO image 在解压缩 buffer 中的地址，所以初始化的页表位于解压缩 buffer
+		 * 中的 ZO。阅读页表代码前必须掌握其基础知识，权威材料是 Intel 软件开发者手册 3A
+		 * 的 "chapter 4: paging"。由上面注释可知，early boot 只需映射 4G 的物理地址
+		 * 空间，所以只需 6 个 paging structure，下面会详细解释为什么4G空间只需 6 个。
 		 */
 		leal	pgtable(%ebx), %edi
 		xorl	%eax, %eax
@@ -2704,24 +2722,24 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		 *   一个 PDPT(page directory pointer table) entry 可以映射 2^30(48-9-9)，
 		 *     即 1G 物理地址空间；
 		 *   一个 PD(page directory) entry 可以映射 2^21(48-9-9-9)，即 2M 地址空间。
-		 * 所以，映射 4G 物理地址空间需要 1 个 PML4(1个 entry)，1 个 PDPT(4个 entry)，
-		 * 4 个 PD(全部 entry) 即可。另外，paging structures 的 size 都是 4k，CR3 中
-		 * 保存第一级 paging structure 的地址，由 Intel 开发者手册3A 的 chapter 2.5
-		 * CONTROL REGISTERS 可知，CR3 只保存 lower 12 bits 以外的其他地址 bit，地址
-		 * 的 lower 12 bits 是 0, 所以第一级 paging structure 的地址是 4k 对齐的；
-		 * 同样，所有 refer 下一级 paging structure 的 entry 中的地址都是 4k 对齐的；
-		 * 若 entry 是 map a page，则 entry 中的地址是 page size 对齐的。 本例中，所有
-		 * paging structure 分配在同一块连续的内存，所以他们的地址都是 4k 对齐的。
+		 * 所以，映射 4G 物理地址空间需要 PML4 的 1 个 entry，1 个 PDPT 中的 4 个 entry，
+		 * 4 个 PD 中的全部 entry 即可。另外，paging structures 的 size 都是 4k，CR3
+		 * 保存 top paging structure 的物理地址，由 Intel 开发者手册 3A 的 chapter
+		 * 2.5 CONTROL REGISTERS 可知，CR3 只保存 lower 12 bits 以外的其他地址 bit，
+		 * 地址的 lower 12 bits 是 0, 所以第一级 paging structure 的地址是 4k 对齐的；
+		 * 同样，其他所有 paging structure 的地址都是 4k 对齐的；若 entry 是 map a
+		 * page，则 entry 中的地址是 page size 对齐的。 本例中，所有 paging structure
+		 * 分配在同一块连续内存，所以他们的地址都是 4k 对齐的。
 		 */
 
 		/* Build Level 4 */
 		/* 这里的 0x1007 让我困惑了一天，主要因为忽略了 lable: pgtable 已经 4k 对齐。
-		 * 将 (pgtable + 0x1007) 的 effective address 放到 eax 中，作为第一个 PML4
+		 * 将 (pgtable + 0x1007) 的 effective address 放到 eax 中，作为 PML4 第一个
 		 * entry 的内容。举例：假设 pgtable = 0x80600000，则 0x80600000 + 0x1007 =
 		 * 0x80601007，作为 entry 的值，说明此 entry 指向的下一级 paging structure 的
 		 * 地址是 0x80601000；末尾的 7 = 01111b，表示 Present；相应的 memory region
 		 * 是 read/write;user-mode address(参考 4.6.1 Determination of Access
-		 * Rights)。所以，还是有小小的 trick 在里面。
+		 * Rights)。所以，这算是小小的 trick。
 		 * 如上面分析所说，PML4 table 仅需初始化 1 个 entry
 		 */
 		leal	pgtable + 0(%ebx), %edi
@@ -2742,11 +2760,11 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		jnz	1b
 
 		/* Build Level 2 */
-		/* 如上面分析，所有 PD table 的 entry 都需初始化，4 tables x 512 entries per
-		 * table。 0x183 = 0001,1000,0011b，参考 Intel 开发者手册 3A: Figure 4-11.
-		 * Formats of CR3 and Paging-Structure Entries with 4-Level Paging 可知：
-		 * Present, Read/Write, Page size = 1(2M page), Global。第一个 page 的地址
-		 * 是 0，所以是从地址 0 开始连续 map 4G 物理地址空间
+		/* 如上面分析，PD table 的所有 entry 都需初始化，共 4 tables x 512 entries
+		 * per table。0x183 = 0001,1000,0011b，参考 Intel 开发者手册 3A: Figure
+		 * 4-11. Formats of CR3 and Paging-Structure Entries with 4-Level Paging
+		 * 可知：Present, Read/Write, Page size = 1(2M page), Global。第一个 page
+		 * 的地址是 0，所以是从物理地址 0 开始连续 map 4G 物理地址空间
 		 */
 		leal	pgtable + 0x2000(%ebx), %edi
 		movl	$0x00000183, %eax
@@ -2759,20 +2777,21 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		jnz	1b
 
 		/* Enable the boot page tables */
-		/* 获得页表的物理地址。因为此刻还没有开启 paging，又因为段基址是 0，所以这里
-		 * lea 得到的 effective address 即物理地址
+		/* 获得 top paging structure 物理地址。此刻还没开启 paging，又因为段基址是 0，
+		 * 所以这里 lea 得到的 effective address 也是物理地址
 		 */
 		leal	pgtable(%ebx), %eax
 		movl	%eax, %cr3
 
 		/* Enable Long mode in EFER (Extended Feature Enable Register) */
-		/* 参考 Intel 开发者手册3A: "2.2.1 Extended Feature Enable Register".
+		/* 参考 Intel 开发者手册 3A: "2.2.1 Extended Feature Enable Register".
 		 * MSR 的一般性介绍在 Intel 开发者手册 3A: “9.4 MODEL-SPECIFIC REGISTERS
 		 * (MSRS)”; 详细介绍在 Intel 开发者手册 volume 4: chapter 2.
 		 *
 		 * 开启 long mode 的条件：protect mode(CR0.PE=1) 下，LME=1 & CR0.PG=1。
 		 * 已经在 protect mode 下，这里 LME=1 只是 enable，需要 CR0.PG=1 才会
-		 * activate。详细描述在 Intel 开发者手册: 9.8.5 Initializing IA-32e Mode
+		 * activate。这也表示，long mode 中必须有 paging 功能。
+		 * 详细描述在 Intel 开发者手册: 9.8.5 Initializing IA-32e Mode
 		 */
 		movl	$MSR_EFER, %ecx
 		rdmsr		/* 64-bit MSR 地址由 ECX 指定，读入 EDX:EAX */
@@ -2780,9 +2799,9 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		wrmsr
 
 		/* After gdt is loaded */
-		/* 为了 make Intel VT happy，在 real mode 的 setup 代码有做过，上文有详细描述。
-		 * 这是 boot loader 使用 32-bit boot protocol 的情况，不走 setup 代码，直接
-		 * 进入 protect mode。segment selector 的格式参考 Intel 开发者手册3A */
+		/* 为了 make Intel VT happy，在 real mode 的 setup 代码有做过，上文有描述。
+		 * 这是 32-bit boot protocol 的情况。segment selector 的格式参考
+		 * Intel 开发者手册 3A: Figure 3-6. Segment Selector */
 		xorl	%eax, %eax
 		lldt	%ax
 		movl    $__BOOT_TSS, %eax
@@ -2803,29 +2822,41 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		 * 下执行 16-bit 或 32-bit 代码, 64-bit mode 下执行 64-bit 代码。通过
 		 * EFER.LME = 1 进入 long mode(即 IA-32e mode) 时，势必是子模式的一种，究竟是
 		 * 哪儿一种，由 CS.L 决定。代码的意图是直接跳入 64-bit mode，所以需要 load
-		 * 64-bit code segment: __KERNEL_CS，这里使用了小技巧，push segment selector
-		 * 和 startup_64 的地址，待执行 lret 指令将它们加载回 CS:EIP。
+		 * 64-bit code segment: __KERNEL_CS.这里使用了小技巧：push segment
+		 * selector 和 startup_64 的地址，待执行 lret 指令将它们加载回 CS:EIP。
 		 * 问题: 不能用长跳转 jmp cs:eip 的形式跳转到另一个代码段中执行吗？ AT&T 语法：
-		 * ljmp $SECTION,$OFFSET。   试试写一下这个汇编代码!?
+		 * ljmp $SECTION,$OFFSET。(2019/12/29)经测试, ljmp $__KERNEL_CS, %eax 报错：
+		 *     Error: operand type mismatch for `ljmp'
+		 * ljmp $__KERNEL_CS, %rax 则报错：Error: bad register name `%rax'
+		 * 粗略分析：根据 volume 2 指令集手册中的 JMP 描述，jmp 要么跟 ptr16:32, 两部分
+		 * 都是立即数；要么 m16:64，两部分是存在 memory 中。所以写法不对。
 		 */
 		pushl	$__KERNEL_CS
 		leal	startup_64(%ebp), %eax
 	#ifdef CONFIG_EFI_MIXED
-		movl	efi32_config(%ebp), %ebx /* 此时，efi32_config 处还没有被填充数据 */
+		/* 若 firmware 是 EFI，推测 efi_32_config 处已被填入数据，那么 eax 将被更新为
+		 * 别的地址。本文暂不考虑 EFI 的情况，所以直接跳到 1f */
+		movl	efi32_config(%ebp), %ebx
 		cmp	$0, %ebx
-		jz	1f  /* 所以跳转到 1f */
+		jz	1f
 		leal	handover_entry(%ebp), %eax
 	1:
 	#endif
 		pushl	%eax
 
 		/* Enter paged protected Mode, activating Long Mode */
-		/* 问题：startup_32 中的代码明显已经处在 protect mode，为什么再 enable 一次？*/
+		/* 问：startup_32 中的代码明显已经处在 protect mode，为什么再 enable 一次？
+		 * 答：(2019/12/29)经测试，删掉 X86_CR0_PE 导致无法启动，又回到 grub menu。
+		 * WHY? 仔细看宏定义发现，这两个 macro 只有 set 自己的 bit。这里操作不是读取了
+		 * CR0 后仅 enable PG bit，然后写回。所以如果删除 X86_CR0_PE，它的 bit 最终
+		 * 不会被 set。从另一个角度看，CR0 中有那么多 bit，这里不管之前有没有设置其他 bit，
+		 * 单纯的只 set PG 和 PE，似乎也透露出什么信息
+		 */
 		movl	$(X86_CR0_PG | X86_CR0_PE), %eax /* Enable Paging and Protected mode */
 		movl	%eax, %cr0
 
 		/* 看起来 compatibility mode 的存在也是为了润滑的过渡到 64-bit mode。protect
-		 * mode 下，所有 long mode 相关开关开启后，直接进入 compatibility mode。差别
+		 * mode 下，所有 long mode 必需开关开启后，直接进入 compatibility mode。差别
 		 * 仅在 CS.L，切换个 CS，即可从 compatibility mode 进入 64-bit mode。
 		 *
 		 * 从 stack 上 load 回准备好的 CS 和 EIP，进入 64-bit mode. */
@@ -2833,7 +2864,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，封装了压缩后的 ke
 		lret
 	ENDPROC(startup_32)
 
-startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者手册: 9.8.5 Initializing IA-32e Mode 中描述了所需步骤:
+startup_32 的主要作用是为跳入到 long mode 做准备，Intel 开发者手册: 9.8.5 Initializing IA-32e Mode 中描述了所需步骤:
 
 >1. 处在没有开启 paging 的 protect mode 下。
 >2. 设置 CR4.PAE = 1 使能 physical-address extensions (PAE)
@@ -2845,21 +2876,29 @@ startup_32 的主要作用是为跳入到 long mode 做准备，Intel开发者�
 
 >The MOV CR0 instruction that enables paging and the following instructions must be located in an **identity-mapped** page
 
-代码中也常看到 **identity-mapped** 字眼，是什么意思呢？术语解释在 [Identity function](https://en.wikipedia.org/wiki/Identity_function)，原来是个数学术语，中文翻译为恒等函数。单词 identity 的主要意思是**身份**，但还有另一个意思：**一致性**，所以翻译过来是“恒等映射的 page”，也就是 linear address = physical address 的映射。
-
->Tips:
+Tips:
 
 >1. processor 操作模式切换条件在 Intel 开发者手册3A: Figure 2-3. Transitions Among the Processor’s Operating Modes
 >2. paging mode 切换条件在 Intel 开发者手册3A: Figure 4-1. Enabling and Changing Paging Modes
 
-继续分析 head_64.S 前，插入一则科普，看到过很久却没有找到权威定义的术语: Canonical Address，权威解释在 Intel开发者手册1 的 3.3.7.1 Canonical Addressing。
+#### 科普两例：
 
-head_64.S 继续:
+代码中常看到 **identity-mapped** 字眼，是什么意思呢？术语解释在 [Identity function](https://en.wikipedia.org/wiki/Identity_function)，原来是个数学术语，中文翻译为恒等函数。单词 identity 的主要意思是**身份**，但还有另一个意思：**一致性**，所以翻译过来是“恒等映射的 page”，也就是 linear address = physical address 的映射。
 
-	/* 忽略 efi32_stub_entry 的分析。因为我们假设的流程下不会执行其代码 */
+另一科普：看到过很久却没有找到权威定义的术语: Canonical Address，权威解释在 Intel 开发者手册1 的 3.3.7.1 Canonical Addressing。
+
+#### startup_64
+
+继续分析 head_64.S:
+
+	/* 忽略 efi32_stub_entry 的分析。因为我们不考虑 firmware 是 EFI 的情况 */
+
+	/* startup_64 是 64-bit boot protocol 的入口。同样，在阅读下面代码前，有必要事先 &
+	 * 事后各仔细阅读一遍 “64-bit BOOT PROTOCOL” of Documentation/x86/boot.txt。
+	 * grub 不支持 64-bit boot protocol, EFI 等新的 firmware 才支持。*/
 
 		.code64
-		.org 0x200  /* 为什么需要这一句？ */
+		.org 0x200  /* WHY？(2019/1/2) 这是 64-bit boot protocol 的约定 */
 	ENTRY(startup_64)
 		/*
 		 * 64bit entry is 0x200 and it is ABI so immutable!
@@ -2872,15 +2911,21 @@ head_64.S 继续:
 		 * and command line.
 		 */
 
-		/* Setup data segments. cs 通过上面的 lret 指令已经设置。但 64-bit mode 下，
-		 * 根据 Intel 开发者手册1 的 3.4.2.1 Segment Registers in 64-Bit Mode 所说：
-		 * 不管 CS, DS, ES, SS 中的值如何，他们的段基址都被当作 0；FS, GS 例外，他们的
-		 * 使用如往常一样。所以这里给各段寄存器赋值的意义是？ 而且他们都被赋值为0，引用
-		 * null descriptor？
+		/* Setup data segments. */
+		/* 64-bit mode 下，根据 Intel 开发者手册 volume 1：3.4.2.1 Segment
+		 * Registers in 64-Bit Mode 所说：不管 CS, DS, ES, SS 中的值如何，他们的
+		 * 段基址都被当作 0；FS, GS 例外，这俩的使用如往常一样。所以这里给各段寄存器赋值
+		 * 的意义是？而且他们都被赋值为0，引用 null descriptor？
 		 * By initializing the segment registers with segment selector of null
 		 * descriptor, accidental reference to unused segment registers can be
 		 * guaranteed to generate an exception.
-		 * 这是目前 manual 中看到的最像答案的说法。Still in Question! */
+		 * 这是目前 manual 中看到的最像答案的说法。BUT！Still in Question!
+		 * 无论是从 startup_32 还是 64-bit boot protocol 来到这里，所有段寄存器应该是
+		 * 设置过了，所以暂不理解为什么还要显式的设置一遍？(2019/1/2)在 grub 下测试过，可以
+		 * 启动，不知道在 EFI 等支持 64-bit boot protocol 的 firmware 下情况如何？
+		 * 2019/1/15 update: 由 commit 08da5a2ca 可知，set fs/gs 是为了 make VT
+		 * happy, 但 BIOS 中开启了 Intel VT, 没有发现异常，待继续研究！
+		 */
 		xorl	%eax, %eax
 		movl	%eax, %ds
 		movl	%eax, %es
@@ -2888,10 +2933,12 @@ head_64.S 继续:
 		movl	%eax, %fs
 		movl	%eax, %gs
 
-		/* 这段&更下面的代码的逻辑在 startup_32 中出现过，又做一遍的原因下面的英文注释有讲。
-		 * 经计算后 ebp 的值是 ZO image 被 grub 加载到内存中的物理地址；向上对齐到
-		 * kernel_alignment，然后比较。 ebx 的值是解压缩 buffer 中，ZO image 被 copy
-		 * 到的物理地址
+		/* 这段 & 更下面的代码的逻辑在 startup_32 中出现过，同样是因为 64-bit boot
+		 * protocol 的原因又做一遍，下面的英文注释也有讲。
+		 * ZO image(protect mode kernel) 被 bootloader 加载到 RAM 中的物理地址，
+		 * 向上对齐到 kernel_alignment 后放入 ebp，这个值是 decompressed kernel 的
+		 * 运行地址，也是解压缩 buffer 的起始地址。ebx 是 ZO image 被 copy/relocate
+		 * 到解压缩 buffer 中的物理地址。
 		 */
 		/*
 		 * Compute the decompressed kernel start address.  It is where
@@ -2914,8 +2961,8 @@ head_64.S 继续:
 		 * got it:
 		 *
 		 * AT&T: 'symbol(%rip)', Intel: '[rip + symbol]'
-		 *      Points to the 'symbol' in RIP relative way, this is shorter than
-		 *      the default absolute addressing.*/
+		 *     Points to the 'symbol' in RIP relative way, this is shorter than
+		 *     the default absolute addressing.*/
 		 * (In 9.15.7 Memory References of `info as`)
 		 *
 		 * 原来就是 symbol 的地址！而且是运行时地址！ So, everything finally make sense。
@@ -2937,8 +2984,8 @@ head_64.S 继续:
 
 		1:
 		/* Target address to relocate to for decompression */
-		/* NOT rip relative addressing! 经计算后，rbx 的值是解压缩 buffer 中，
-		 * ZO image 被 copy 的目的物理地址。*/
+		/* NOT rip relative addressing! 计算后，rbx 的值是解压缩 buffer 中，
+		 * ZO image 将被 copy/relocate 的目的物理地址 */
 		movl	BP_init_size(%rsi), %ebx
 		subl	$_end, %ebx
 		addq	%rbp, %rbx
@@ -2962,34 +3009,37 @@ head_64.S 继续:
 		 * 查看引入上面注释的 commit 5c9b0b1c498 可知：为生成 X86_64 的位置无关代码，新
 		 * 版本 binutils 使用 RIP relative addressing 的方式(这也是我脑中最自然的方式)，
 		 * 而老版本 binutils 则使用 GOT。
-		 * GOT entry 的内容是相应符号的地址，所以 entry size 在 i386 下为 4 bytes，X86_64
-		 * 下为 8 bytes。普通可执行程序与动态库链接时默认使用 -fPIC，对每一个动态库中符号的
+		 *
+		 * 下面的描述仅是粗浅个人理解，很可能不准确，仅作理解当前代码用。盼指正。
+		 * 本例中，GOT entry 的内容应是相应符号的地址，因不涉及动态链接，所以不会 involve
+		 * Procedure Link Table(PLT)。entry size 在 i386 下为 4 bytes，X86_64 下
+		 * 为 8 bytes。普通可执行程序与动态库链接时默认使用 -fPIC，对每一个动态库中符号的
 		 * 引用都生成一条 GOT entry；程序执行时，run time linker 会修改 GOT entry 中的
 		 * 值，使其等于目标符号的运行时地址。可执行程序主体中所有对 .so 中符号的引用都变成对
 		 * 自身 GOT 中相应 entry 的引用。
 		 *
-		 * 目前对老版本 binutils 生成 GOT 并不理解，因为 compressed kernel 作为一个独立
-		 * 运行的个体，不引用外部模块的变量或函数，不存在动态链接，所以为什么 paging_prepare，
+		 * 对老版本 binutils 生成 GOT 不太理解，因为 compressed kernel 作为一个独立运行
+		 * 的个体，不引用外部模块的变量或函数，不存在动态链接，所以为什么 paging_prepare，
 		 * cleanup_trampoline 的调用会在 GOT 中有 reference？推测：对于从汇编直接调用的
-		 * C函数，会生成 GOT entry，所以 head_32.S 中也有调整 got 的相同操作。
+		 * C 函数，会生成 GOT entry，所以 head_32.S 中也有调整 got 的相同操作。
 		 *
-		 * OK，暂时不纠结这个问题，因为老版本中 -fPIC 会生成 GOT 是事实，那么只有 bootloader
-		 * 才有机会对它做 PIC 的调整(对于普通应用程序来说，叫动态链接)，但从未听说有此说法，且
-		 * Zero RAX for adjust_got 的注释和代码，arch/x86/boot/compressed/Makefile 中
-		 * "quiet_cmd_check_data_rel" 的注释，也证实了 bootloader 不会对 compressed
+		 * 暂时不纠结这个问题，因为老版本中 -fPIC 会生成 GOT 是事实，那么只有 bootloader
+		 * 有机会对它做 PIC 的调整(对于普通应用程序来说，叫动态链接)，但从未听说有此说法，且
+		 * Zero RAX for adjust_got 的注释和代码，arch/x86/boot/compressed/Makefile
+		 * 中 "quiet_cmd_check_data_rel" 的注释，也证实 bootloader 不会对 compressed
 		 * kernel 做 PIC 的调整，这个调整就是对 GOT entry 的内容重新计算。既然之前没有人做
 		 * GOT adjust，所以此刻 adjust_got 无需 undo previous adjustment，只需 apply
 		 * current adjustment。   那么又引出别的问题：adjustment 的值如何决定？GOT 中的
-		 * 初始值是什么？这两个问题本质上是一个，假设并推理一下： GOT 的内容是符号的编译时地址，
-		 * 所以此处 adjust_got 只需加上自己的编译地址和加载地址之 delta，即可更新为运行地址，
-		 * 又因为编译地址是 0，所以加载地址就是这个 delta。
+		 * 初始值是什么？这两个问题本质上是一个，假设并推理一下：GOT 的内容是符号的编译时地址，
+		 * 所以此处 adjust_got 只需加上编译地址和加载地址之 delta，即可更新为运行地址，又
+		 * 因为编译起始地址是 0，所以加载地址就是这个 delta。
 		 *
 		 * 我的环境中，binutils 的版本是 2.29(>2.24)，所以不会通过 GOT 实现位置无关，通过
 		 * `objdump -h <compressed_vmlinux>` 发现，.got section 的 size 是 0x18，即
 		 * 只有 3 条(8 bytes per entry) entry，而 GOT 的前三条是特殊 entry，用于动态链接，
 		 * 后面的 entry 才是对符号的 reference，也就是说，这是只有 header 的 GOT，其实是
 		 * 空的，所以不会使用它。
-		 * ToDo: 虚拟机装个老版本 binutils 看一下 compressed 目录下的 vmlinux。
+		 * ToDo: 虚拟机装个老版本 binutils 看一下 compressed 目录下的 vmlinux？
 		 */
 		xorq	%rax, %rax
 
@@ -3028,9 +3078,8 @@ head_64.S 继续:
 		 * already in a desired paging mode. This way the trampoline code gets
 		 * tested on every boot.
 		 */
-		/* RIP relative addressing AGAIN. 使用文件下方自己定义的 GDT。5-level paging
-		 * 的知识需要参考： <5-Level Paging and 5-Level EPT white paper>。总结上面注释
-		 * 的要点如下：
+		/* 使用文件下方自己定义的 GDT。5-level paging 的背景知识参考：
+		 *  <5-Level Paging and 5-Level EPT white paper>。总结上面注释的要点如下：
 		 *   1. 无法在 long mode 中随意切换 4-level 和 5-level paging，只能从 protect
 		 *      mode 直接跳入，所以我们需要一个在低地址中的 trampoline 函数
 		 *   2. trampoline 函数的功能不仅那么点，还有很多其他的功能。
@@ -3058,8 +3107,8 @@ head_64.S 继续:
 		/* 对 paging_prepare 的使用解释的很清楚，函数细节分析在下方。这里涉及 X86_64 ABI
 		 * 中的 calling conventions，详细描述在 “3.2.3 Parameter Passing” of
 		 * https://software.intel.com/sites/default/files/article/402129/mpx-linux64-abi.pdf
-		 * 简单总结一下：函数入参传递要么使用 register 要么使用 stack。规则是：先对所有入参
-		 * 分类，分为 POINTER, INTEGER, MEMORY 等类别，查看 paging_prepare 函数发现其
+		 * 简单总结：函数入参传递要么使用 register 要么使用 stack。规则是：先对所有入参
+		 * 分类，分为 POINTER, INTEGER, MEMORY 等等，查看 paging_prepare 函数发现其
 		 * 入参是指针(POINTER)，根据规则：
 		 *   If the class is INTEGER or POINTER, the next available register of
 		 *   the sequence %rdi, %rsi, %rdx, %rcx, %r8 and %r9 is used
@@ -3090,11 +3139,15 @@ head_64.S 继续:
 		 * Load the address of trampoline_return() into RDI.
 		 * It will be used by the trampoline to return to the main code.
 		 */
-		/* lea 指令拿到 effective address，是为了后面的 absolute jump */
+		/* lea 指令拿到(运行时) effective address，为了后面的 absolute jump */
 		leaq	trampoline_return(%rip), %rdi
 
 		/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
-		/* 跳入 trampoline 函数: trampoline_32bit_src。lret again, why not ljmp? 试试 */
+		/* 跳入 trampoline 函数: trampoline_32bit_src. rax 是 trampoline 空间的
+		 * 起始地址，lea 拿到 trampoline 函数 trampoline_32bit_src 在其中的地址。
+		 * lret again, why not ljmp? 答：与 startup_32 中的 lret 是同样的问题，
+		 * 在上面已解释。
+		 */
 		pushq	$__KERNEL32_CS
 		leaq	TRAMPOLINE_32BIT_CODE_OFFSET(%rax), %rax
 		pushq	%rax
@@ -3102,8 +3155,9 @@ head_64.S 继续:
 
 	trampoline_return:
 		/* Restore the stack, the 32-bit trampoline uses its own stack */
-		/* 回忆上文：rbx 的值是解压缩 buffer 中，ZO image 被 copy 的目的物理地址，
-		 * boot_stack_end 是相对于 0 的地址，所以也是 offset */
+		/* 回忆：rbx 是 ZO image 被 copy 到解压缩 buffer 中的物理地址，或者说是被
+		 * relocated 的地址。boot_stack_end 的值是相对于 0 的地址，这里用作 offset。
+		 * 上文一直使用它作 stack */
 		leaq	boot_stack_end(%rbx), %rsp
 
 		/*
@@ -3115,15 +3169,19 @@ head_64.S 继续:
 		 * RSI holds real mode data and needs to be preserved across
 		 * this function call.
 		 */
-		/* cleanup_trampoline 的入参是一个指针，根据 calling conventions，用 rdi 传递。
-		 * top_pgtable 定义在本文件最末尾处，用于存储 trampoline 空间中的 page table. */
+		/* cleanup_trampoline 的入参是指针，根据 calling conventions，用 rdi 传递。
+		 * top_pgtable 定义在本文件最末尾。很久不看此段代码的话，容易和 startup_32 中
+		 * 初始化页表用的 pgtable 混淆。top_pgtable 是专用于存储 trampoline 空间中的
+		 * page table。函数内容本身很简单：把 trampoline 空间的 top page table 放到
+		 * 它的专用空间，恢复 trampoline 空间原来的内容。下面有更详细分析。
+		 */
 		pushq	%rsi
 		leaq	top_pgtable(%rbx), %rdi
 		call	cleanup_trampoline
 		popq	%rsi
 
 		/* 截至目前，ZO image 被 relocated 的目标空间在代码中只有两处使用，一是使用它作
-		 * stack；二是上面的代码，copy top_pgtable 用，以及 startup_32 中初始化页表空间
+		 * stack；二是存放页表：刚刚 copy 的 top_pgtable，及 startup_32 中初始化页表
 		 * pgtable
 		 */
 
@@ -3136,15 +3194,17 @@ head_64.S 继续:
 		 * loaded at. Now we need to re-adjust for relocation address.
 		 *
 		 * Calculate the address the binary is loaded at, so that we can
-		 * undo the previous GOT adjustment. 第一次调用 adjust_got 用的 adjustment
+		 * undo the previous GOT adjustment. 解释很清楚，无需赘述。
 		 */
 		call	1f
 	1:	popq	%rax
 		subq	$1b, %rax
 
 		/* The new adjustment is the relocation address */
-		/* AGAIN：rbx 是 ZO image 在解压缩 buffer 中的地址。在原加载(当前)的地址中做完
-		 * 最后一次 PIC 的调整，就可以 copy 到 relocated address & 跳过去执行了。*/
+		/* AGAIN：rbx 是 ZO image 被 copy 到解压缩 buffer 中的物理地址，或者说是被
+		 * relocated 的地址。在当前(加载)的地址中使用 relocated 的地址做完 PIC 的调整，
+		 * 就可以 copy 到 relocated 地址 & 跳过去执行了
+		 */
 		movq	%rbx, %rdi
 		call	adjust_got
 
@@ -3152,27 +3212,31 @@ head_64.S 继续:
 	 * Copy the compressed kernel to the end of our buffer
 	 * where decompression in place becomes safe.
 	 */
-	/* _bss 定义在 linker script，bss 之前的 section 是需要被 copy 的内容，后面详细说明。
-	 * ZO image 的编译起始地址是 0，所以 _bss 的值其实是待 copy 的 size(bytes)。std
-	 * 指令表示将使用逆序 copy，即从内容的后端->前端进行 copy；当前在 64 位下，所以可以
-	 * 每次 copy 一个 quadruple word，所以才有 _bss-8，copy 的次数自然是 size/8.
-	 * copy 结束则 cld 恢复 direction flag.
+	/* _bss 定义在 linker script，bss 之前的 section 是需要被 copy 的内容，后面详细
+	 * 说明。ZO image 的编译起始地址是 0，所以 _bss 的值其实是待 copy 的 size(bytes)。
+	 * std(Set Direction Flag) 指令表示使用逆序 copy，即从内容的后端->前端进行 copy；
+	 * 当前在 64 位下，所以每次可 copy 一个 quadruple word。要注意！虽整体是逆序 copy,
+	 * 但 copy 一个单位(8 bytes)时是正常的顺序！否则 copy 后内容就乱了，这就是 _bss-8
+	 * 的含义！那么，copy 的次数自然是 size/8，因 .bss 地址(待 copy size)在 linker
+	 * script 中已对齐到 64(2^6)，所以 size/8 的结果肯定是整数。
+	 * copy 结束则 cld 恢复 direction flag. rsi 保存着 boot_params 的地址，字符串
+	 * 操作要用到它，所以 push 保存一下。
 	 */
 		pushq	%rsi
-		leaq	(_bss-8)(%rip), %rsi
-		leaq	(_bss-8)(%rbx), %rdi
-		movq	$_bss /* - $startup_32 */, %rcx
-		shrq	$3, %rcx
+		leaq	(_bss-8)(%rip), %rsi  /* 源地址 */
+		leaq	(_bss-8)(%rbx), %rdi  /* 目的地址 */
+		movq	$_bss /* - $startup_32 */, %rcx  /* copy 的 size */
+		shrq	$3, %rcx  /* copy 的次数 = size/8*/
 		std
 		rep	movsq
 		cld
 		popq	%rsi
 
-	/*
-	 * Jump to the relocated address. 因为编译起始地址是 0，所以每个 label 既是地址，
-	 * 又是 offset，lea 出 effective 地址，then, absolute jump 到解压缩 buffer
-	 * (relocated address) 中的 label: relocated。自此，将执行的代码是解压缩 buffer
-	 * 中的 copy。
+	/* Jump to the relocated address. */
+	/* 因为编译起始地址是 0，所以每个 label 既是地址，又是 offset。lea 出 label
+	 * relocated: 在解压缩 buffer(relocated 地址) 的 effective 地址，then,
+	 * absolute jump to it. 自此，将从解压缩 buffer(relocated 地址) 的 label
+	 * relocated: 处执行，也就说后面运行的代码是 ZO image 在 relocated 处的拷贝。
 	 */
 		leaq	relocated(%rbx), %rax
 		jmp	*%rax
@@ -3186,19 +3250,22 @@ head_64.S 继续:
 
 	/*
 	 * Clear BSS (stack is currently empty)
-	 * 与上面 copy 的逻辑相似，但不是逆序，且 _ebss 已 aligned to 8 bytes
+	 * 与上面 copy 的逻辑相似，但不是逆序，且 _ebss 的值已 aligned to 8 bytes(_bss
+	 * aligned to 64 bytes). 原来 stack 和 heap 被放在了 .bss section，所以原注释
+	 * 强调现在 stack is empty.
 	 */
 		xorl	%eax, %eax
 		leaq    _bss(%rip), %rdi
 		leaq    _ebss(%rip), %rcx
-		subq	%rdi, %rcx
-		shrq	$3, %rcx
+		subq	%rdi, %rcx  /* _ebss - _bss, 获得 size */
+		shrq	$3, %rcx    /* 一次 copy quadruple word(8 bytes) */
 		rep	stosq
 
 	/*
 	 * Do the extraction, and jump to the new kernel..
 	 * extract_kernel 有 6 个入参，都是指针或整数，返回值是指针。根据 calling conventions，
 	 * 从左到右，入参依次使用 %rdi, %rsi, %rdx, %rcx, %r8 and %r9；返回值通过 %rax。
+	 * 因为 extract_kernel 内容复杂，涉及到 kaslr，elf 解析，重定位，在下一节单独分析。
 	 */
 		pushq	%rsi			/* Save the real mode argument */
 		movq	%rsi, %rdi		/* real mode address */
@@ -3231,10 +3298,12 @@ head_64.S 继续:
 	 * 获得两个符号的运行时地址，放在 rdx, rcx 中。
 	 * 代码本身比较容易理解：通过比较 .got section 起始 & 结束地址，遍历 GOT 的 entry，
 	 * undo 之前的 adjustment，apply 现在的 adjustment。
-	 * GOT 前三项是特殊 entry，所以这里需要从第一项开始 adjust 吗，从第三项不行吗？
+	 * GOT 前三项是特殊 entry，所以这里需要从第一项开始 adjust 吗，从第4项不行吗？
 	 * `readelf -x .got vmlinux` 显示确实如此，除了第一项是 .dynamic section 的地址，
-	 * 其他两项都是空(0)，而且猜测 .dynamic section 未来应该也不会被用到。而且被 copy 到
-	 * 上层目录的 vmlinux.bin 时被 `objcopy --strip-all` 删除了所有符号信息&重定位信息.
+	 * 其他两项都是空(0)，猜测 .dynamic section 未来应该也不会被用到，而且被 objcopy 为
+	 * 上层目录的 vmlinux.bin 时(objcopy --strip-all)删除了所有符号信息 & 重定位信息.
+	 * 2019/1/2：还不了解打包到 bzImage 的 relocation info 是什么情况，那些被 strip
+	 * 的 relocation info 说不定在 bzImage 中。
 	 */
 	adjust_got:
 		/* Walk through the GOT adding the address to the entries */
@@ -3261,64 +3330,85 @@ head_64.S 继续:
 	/* 上面的注释 so sweet~ */
 	ENTRY(trampoline_32bit_src)
 		/* Set up data and stack segments */
+		/* 因为 startup_64 入口处用 0 初始化了 cs 外所有 data segments */
 		movl	$__KERNEL_DS, %eax
 		movl	%eax, %ds
 		movl	%eax, %ss
 
-		/* Set up new stack。因为下面要 push 操作，所以需要准备 stack */
+		/* Set up new stack。因为下面要 push 操作，所以需要准备 stack。用 trampoline
+		 * 空间的结束地址作栈顶，因为 trampline 函数很小，4kb 中还剩余很多。 */
 		leal	TRAMPOLINE_32BIT_STACK_END(%ecx), %esp
 
-		/* Disable paging */
-		/* btr: stores the value of the bit in the CF flag, and clears the
-		 *      selected bit in the bit string to 0 */
+		/* Disable paging。终究要重新回到 long mode，所以先关闭 paging */
+		/* btr: Bit Test and Reset. stores the value of the bit in the CF flag,
+		 *      and clears the selected bit in the bit string to 0 */
 		movl	%cr0, %eax
 		btrl	$X86_CR0_PG_BIT, %eax
 		movl	%eax, %cr0
 
 		/* Check what paging mode we want to be in after the trampoline */
+		/* rdx(edx) 是 l5_required，表示最终是否需要 5-level, 不需要则说明需要
+		 * 4-level. 原注释描述很精准。*/
 		cmpl	$0, %edx
-		jz	1f
+		jz	1f /* edx 为 0，不需开启 5-level paging，意味着：4->4 或者 5->4 */
 
 		/* We want 5-level paging: don't touch CR3 if it already points to 5-level page tables */
+		/* 最终需要进入 5-level paging, 所以有两种情况： 4->5 或 5->5. 通过 CR4.LA57
+		 * 判断之前是否在 5-level paging mode 下。*/
 		movl	%cr4, %eax
 		testl	$X86_CR4_LA57, %eax
-		jnz	3f  /* 之前已 enable 5-level paging，不需要动 CR3，跳回 long mode 即可 */
-		jmp	2f  /* 之前没 enable 5-level paging，跳到 2f 准备 enable 5-level paging */
+		jnz	3f  /* 5->5 的情况，不需要动 CR3，仅回到 long mode 即可 */
+		jmp	2f  /* 4->5 的情况，跳到 2: 处理 5- 所需页表 */
 	1:
 		/* We want 4-level paging: don't touch CR3 if it already points to 4-level page tables */
+		/* 虽然希望 trampoline 函数执行后进入 4-level paging, 但要看一下之前是否在
+		 * 5-level paging mode 下，因为涉及到是否需要使用 trampoline 空间的页表。
+		 * 通过检查 CR4 的 LA57 bit 来确认 */
 		movl	%cr4, %eax
 		testl	$X86_CR4_LA57, %eax
-		jz	3f
+		jz	3f /* 之前不在 5-level paging mode 下，就是 4->4, 跳到 3: */
 	2:
 		/* Point CR3 to the trampoline's new top level page table */
+		/* 5->4 或 4->5 的情况，所以使用 trampoline 中准备好的 page table. */
 		leal	TRAMPOLINE_32BIT_PGTABLE_OFFSET(%ecx), %eax
 		movl	%eax, %cr3
 	3:
 		/* Enable PAE and LA57 (if required) paging modes */
-		/* 各 sub-开关先打开，等待最后打开 CR0.PG */
-		movl	$X86_CR4_PAE, %eax  /* 不 care CR4 中其他 bit? why not mov %cr4 %eax? */
+		/* lable 3 的功能是打开 paging mode 所需开关，与页表操作的代码解耦。各 sub-开关
+		 * 先打开，等待最后 activate via CR0.PG */
+		movl	$X86_CR4_PAE, %eax  /* 不 care CR4 中其他 bit? */
 		cmpl	$0, %edx
-		jz	1f
-		orl	$X86_CR4_LA57, %eax
+		jz	1f /* 确认不需进入 5-level paging */
+		orl	$X86_CR4_LA57, %eax /* 按需 eanble 5-level paging, 但还没 activate */
 	1:
-		movl	%eax, %cr4 /* eax 中仅 enable PAE & LA57 */
+		movl	%eax, %cr4 /* enable PAE & LA57(需要的话) */
+
+		/* trampoline 核心代码看完了，感叹其几个 lable 使用之精妙，主要就是 2: 和 3:，
+		 * 前者只负责把 top paging structure 的地址搬到 cr3，后者只负责 enable 所需
+		 * 开关；第一个 1: 之前是进入 5-level 的处理，之后是进入 4-level 的处理。下面的
+		 * 代码是共用的功能：activate & 返回 long mode
+		 */
 
 		/* Calculate address of paging_enabled() once we are executing in the trampoline */
+		/* 获得 trampoline 函数的 exit 地址，准备离开 trampoline. */
 		leal	paging_enabled - trampoline_32bit_src + TRAMPOLINE_32BIT_CODE_OFFSET(%ecx), %eax
 
 		/* Prepare the stack for far return to Long Mode */
 		pushl	$__KERNEL_CS
 		pushl	%eax
 
-		/* Enable paging again。为啥需要 PE 一起呢，它不是应该已 enable? */
+		/* Enable paging again。为啥需要 PE 一起呢，它不是已 enable？答：这个问题在
+		 * 上文已解释：这两个宏只 set 各自的 bit，只使用 X86_CR0_PG 的话，意味着 clear
+		 * 了 PE bit
+		 */
 		movl	$(X86_CR0_PG | X86_CR0_PE), %eax
 		movl	%eax, %cr0
 
-		lret /* 跳回 long mode，但下面那条指令还是在 trampoline 空间 */
+		lret /* 回到 long mode，跳到 trampoline 空间的 paging_enabled: */
 
 		.code64
 	paging_enabled:
-		/* Return from the trampoline。曾出现多次的 absolute jump */
+		/* Return from the trampoline。出现多次的 absolute jump */
 		jmp	*%rdi
 
 		/*
@@ -3382,7 +3472,11 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		struct paging_config paging_config = {};
 
 		/* Initialize boot_params. Required for cmdline_find_option_bool(). */
-		/* 和 setup 代码中的 boot_params 同名，定义在 misc.c。*/
+		/* 和 setup 中的 boot_params 同名，定义在 misc.c，需要通过它找 cmd_line_ptr，
+		 * 下方的 cmdline_find_option_bool 函数会用到。但这个解析函数中的：
+		 *     	cptr = cmdline_ptr & 0xf;
+		 * 不明白，待向社区询问。
+		 */
 		boot_params = rmode;
 
 		/*
@@ -3398,8 +3492,8 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		 * That's substitute for boot_cpu_has() in early boot code.
 		 */
 		/* 判断以下 kernel 是否需要运行在 5-level paging，如何判断，注释解释的很清楚。
-		 * IS_ENABLED 宏定义在 kconfig.h 中，使用了一些技巧判断某配置项
-		 * 是否被定义，其中使用了 variadic macro:
+		 * IS_ENABLED 宏定义在 kconfig.h 中，使用了一些技巧判断某配置项是否被定义，核心
+		 * 技术是使用 variadic macro:
 		 *     https://gcc.gnu.org/onlinedocs/cpp/Variadic-Macros.html
 		 * tip: 调用有参数的宏时，即使不传入参，也可使用，参数为空而已。例子：
 		 *     #include <stdio.h>
@@ -3417,15 +3511,17 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 			paging_config.l5_required = 1;
 		}
 
-		/* 不管是否需要切换 paging mode，head_64.S 中注释说 trampoline 函数始终是需要的，
-		 * 所以先做相关处理。*/
-		/* 给 trampoline 函数在第 1M 地址空间的 low memory 区域(0 - 640kb)找块空间
-		 * (2 pages)，这个地址是 4k 页对齐的。下有详细分析 */
+		/* 不管是否需要切换 paging mode，head_64.S 中的注释说 trampoline 函数始终需要，
+		 * 所以先做相关处理：找到合适地址摆放该函数。给 trampoline 函数在 conventional
+		 * memory 区域(0 - 640kb)找块空间(2 pages)，这个地址是 4k 页对齐的。
+		 * 下有 find_trampoline_placement 的详细分析。
+		 */
 		paging_config.trampoline_start = find_trampoline_placement();
 		/* 将刚找到的地址由整形数据变成 pointer。*/
 		trampoline_32bit = (unsigned long *)paging_config.trampoline_start;
 
-		/* Preserve trampoline memory */
+		/* Preserve trampoline memory。trampoline 空间不知道有什么重要数据，所以需要
+		 * 备份，待用完恢复。 */
 		memcpy(trampoline_save, trampoline_32bit, TRAMPOLINE_32BIT_SIZE);
 
 		/* Clear trampoline memory first */
@@ -3435,7 +3531,9 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		/* 找到的 trampoline 空间有两个作用，一是放 trampoline 函数的 copy；二是放页表，
 		 * 用于 4->5 或者 5->4 的 paging mode switch。TRAMPOLINE_32BIT_CODE_SIZE
 		 * 在上面的代码分析中一直没有看到定义，原来它定义在 head_64.S 中。但不理解为什么
-		 * 起始地址要除 sizeof(unsigned long)？
+		 * 起始地址要除 sizeof(unsigned long)？2019/01/11 update: 终于想明白了 = =|
+		 * trampoline_32bit 的类型是 unsigned long *，它加 1 的时候，实际是加了
+		 * sizeof(unsigned long)
 		 */
 		memcpy(trampoline_32bit + TRAMPOLINE_32BIT_CODE_OFFSET / sizeof(unsigned long),
 				&trampoline_32bit_src, TRAMPOLINE_32BIT_CODE_SIZE);
@@ -3449,18 +3547,26 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		 * If switching is not required, the page table is unused: trampoline
 		 * code wouldn't touch CR3.
 		 */
-		/* 如需 paging mode 切换，必然需要内存中准备好目标 mode 的页表，待 load 入 CR3。*/
-		/* 一共只有 2 x 2 = 4 种情况: 事先 4- 或 5- x 事后 4- 或 5- */
+
+		/* 如需 paging mode 切换，则需内存中准备好目标 mode 的页表，待执行 trampoline
+		 * 函数时 load 入 CR3：
+		 *   1. 4 -> 5，少了最高层 paging structure，则在 trampoline 空间准备它；
+		 *   2. 5 -> 4，多了最高层 paging structure，则将 PML4 copy 到 trampoline
+		 *      空间。
+		 * mode 切换一共有 2 x 2 = 4 种情况: (事先 4- 或 5-) x (事后 4- 或 5-)。目前
+		 * 看来，由 bootloader 启动 kernel 的情况下，只可能处于 4-level paging mode，
+		 * 因为 firmware 没有需求进入 5-level
+		 */
+
 		/*
 		 * We are not going to use the page table in trampoline memory if we
 		 * are already in the desired paging mode.
 		 */
-		/* Cover 了事前事后相同的两种情况。出现在 64-bit boot protocol 时，bootloader
-		 * 已进入 long mode，并处在两种 paging mode 之一. */
+		/* Cover 事前事后相同的两种情况，这样则不需要准备页表 */
 		if (paging_config.l5_required == !!(native_read_cr4() & X86_CR4_LA57))
 			goto out;
 
-		/* 下面就剩下的两种情况： 4 -> 5 或者 5 -> 4 */
+		/* 就剩下两种情况： 4 -> 5 或 5 -> 4 */
 		if (paging_config.l5_required) {
 			/*
 			 * For 4- to 5-level paging transition, set up current CR3 as
@@ -3480,11 +3586,16 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 			 * We cannot just point to the page table from trampoline as it
 			 * may be above 4G.
 			 */
-			/* 直接把 5-level paging 的 2nd top paging structure 拷贝到 trampoline
-			 * 空间作为 4-level paging 的 top paging structure 即可，所以只需 1 个
-			 * PAGE_SIZE，虽然其实这个 paging structure 只需第一条 entry。根据 x86_64 ABI,
-			 * long mode 下，long 型整数是 8 bytes，即 LP64(long, pointer are 64-bit)
-			 * programming model.
+			/* 将 5-level paging 的 2nd top paging table 拷贝到 trampoline 空间
+			 * 作为 4-level paging 的 top paging table，所以只需 1 PAGE_SIZE 空间。
+			 * 这隐含了前提：之前 5-level paging 是 identity mapping；且，内核
+			 * 加载地址 + setup_header.init_size，zero page，command line buffer
+			 * 都在第一个 PML5 entry 映射的范围内，即 512 x 512G = 256TB 空间内。
+			 * 如何确认？
+			 * __native_read_cr3() 本就是返回 unsigned long，这里转换的逻辑是：
+			 * 以整数形式读出 top page table 的地址，转为指针后再使用 dereference
+			 * operator (*) 可以取该地址处相应指针类型的整数，即 PML5 中第一个 entry
+			 * 的内容，逻辑与 PAGE_MASK 就得到了第一个 PML4 table 的地址。
 			 */
 			src = *(unsigned long *)__native_read_cr3() & PAGE_MASK;
 			memcpy(trampoline_32bit + TRAMPOLINE_32BIT_PGTABLE_OFFSET / sizeof(unsigned long),
@@ -3495,25 +3606,31 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		return paging_config;
 	}
 
-	/* 给 trampoline 函数找合适的空间摆放。看起来是在第 1M 空间内找，为啥呢？推测：1M 内
-	 * 是 BIOS、GRUB 的运行空间，走到 long mode linux 后，已不在需要他们(BIOS 的中断服务？)，
-	 * 而后面的空间是未来使用的，所以在第 1M 空间内找个空比较合理。
+	/* 给 trampoline 函数找合适的空间摆放。看起来是在第 1M 空间內，为啥呢？推测：第 1M 内
+	 * 是 BIOS、部分 bootloader(grub boot.img) 的运行空间，走入 long mode linux 后，
+	 * 已不在需要他们(BIOS 的中断服务？)，而后面的空间是未来使用的，所以在第 1M 空间内找个空比较合理。
 	 */
 	/* 此函数参照 reserve_bios_regions() 实现，需阅读理解原函数注释，但仅阅读注释恐怕也
 	 * 无法完全理解，还需要一些古老的背景知识：现代 PC 架构源自1981年的 IBM PC，BIOS 的
-	 * 概念也源自该产品。IBM PC 只有 1M 地址空间，除了分配给 RAM，还要分配给显卡，ROM 中
-	 * 的 BIOS 等。参考：
-	 *     https://en.wikipedia.org/wiki/IBM_Personal_Computer#Original_PC
+	 * 概念也源自该产品。IBM PC 只有 1M 地址空间，除了映射 RAM，还有显卡，ROM 中的 BIOS
+	 * 等。参考：
+	 *     https://en.wikipedia.org/wiki/IBM_Personal_Computer (随意阅读，干货不多)
 	 * 这又引出 Conventional memory 的概念，参考：
 	 *     https://en.wikipedia.org/wiki/Conventional_memory
-	 *     https://ancientelectronics.wordpress.com/tag/conventional-memory/
-	 * Simply speaking: real mode 只能看到第 1M 地址空间，它并不全部映射为 RAM，只有前
-	 * 640kb 是 RAM，这部分叫做 conventional memory；后面 384kb(也叫 upper memory area)
-	 * 可作它用，或许其中还有一些空洞(hole)可以映射到 RAM。从 Q35 chipset datasheet 中
-	 * PAM 寄存器的描述可知，768KB 到 1MB 这段空间可以映射为 RAM，也可以从 DMI 映射到外设。
-	 * BIOS 的 EBDA 被放在 conventional memory(640kb) 的顶部，这会减少 conventional
-	 * memory(INT 0x12 http://www.ctyme.com/intr/rb-0598.htm) 的 reported amount。
-	 * https://wiki.osdev.org/EBDA#Overview 中的图示说明了 EBDA 的位置。
+	 *     https://ancientelectronics.wordpress.com/tag/conventional-memory
+	 * Simply speaking: real mode 只能寻址 1M 地址空间，其中只有前 640kb 映射 RAM，
+	 * 这 640kb 叫 conventional memory；后面 384kb(也叫 upper memory area)作它用，
+	 * 比如映射显卡，ROM BIOS 等。BIOS 的数据会放在 Conventional memory 中，比如第 1k
+	 * 中的 Interrupt Vector Table(IVT), 1k 到 1k + 256byte 的 BIOS Data Area(BDA),
+	 * 紧贴 conventional memory 顶端放置的 Extended BIOS Data Area(EBDA)。
+	 * 因 EBDA 被放在 conventional memory 的顶部，且 EBDA 在未来仍可能被用到，这会减少
+	 * conventional memory 的 reported amount(INT 0x12)。参考：
+	 *     1. http://www.ctyme.com/intr/rb-0598.htm (INT 0x12)
+	 *     2. https://wiki.osdev.org/Memory_Map (很好！必看！)
+	 *     3. http://stanislavs.org/helppc/bios_data_area.html (最后一节展示了
+	 *        640k - 1M 空间映射的例子)
+	 * 链接 2. 中说：SMM also seems to use the EBDA. So the EBDA memory area
+	 * should never be overwritten. 所以函数的计算中，考虑到了这一点。
 	 */
 	static unsigned long find_trampoline_placement(void)
 	{
@@ -3527,42 +3644,56 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		 * This code is based on reserve_bios_regions().
 		 */
 
-		 * 总的意思是：在第 1M 地址空间里找一段合适的空间放 trampoline 函数，对这块空间
-		 * 有什么要求呢？类型必须是 E820_TYPE_RAM，因为地址空间映射的设备不一定都是 RAM，
-		 * 第 1M 中，除了开头的 conventional memory 映射为 RAM，后面的地址空间会映射到
-		 * BIOS firmare(由变量bios_start表示)，显卡用的 framebuffer，这些就不在 RAM
-		 * 中(存疑)。本函数保守的推测可用的 RAM 空间，这就是为什么对齐时使用 round_down，
-		 * 而不是 round_up
+		 * 总的意思：在第 1M 地址空间里找一段合适的空间放 trampoline 函数，对这块空间有
+		 * 什么要求？首先类型(当然)必须是 E820_TYPE_RAM，那就是 conventional memory；
+		 * 其次不能碰 conventional memory 中 BIOS 相关的区域(代码，数据)，因为不知道
+		 * 未来谁还会用到他们。
+		 * 第 1M 中，除 conventional memory 映射为 RAM，后面的地址空间会映射为 BIOS
+		 * firmare(由变量bios_start表示) 及显卡等，这部分空间不在 RAM 中。本函数尽可能
+		 * 保守的推测可用的 RAM 空间，这就是为什么对齐时使用 round_down，而不是 round_up。
 		 */
-		/* 两个 magic number： 0x40e，0x413 需要解释。由
-		 * http://stanislavs.org/helppc/bios_data_area.html 及上面 EBDA overview
-		 * 的链接可知，地址 0x00000400 处有 BIOS data area(BDA)：逻辑地址 40:0E 处
-		 * 的 word 保存着 EBDA 所在区域的 segment base address；逻辑地址 40:13 处的
-		 * word 保存着 Memory size in Kbytes(kilobytes of contiguous memory
-		 * starting at absolute address 00000h)。所以这两个变量名终于 make sense 了：
-		 * conventional memory 以上，1M 以下的部分都是 BIOS related area，所以叫
-		 * bios_start。 下面两行代码获得这两处 word 的值(两个地址)
+		/* 两个 magic number： 0x40e，0x413 需要解释。这两个值表示线性地址，由链接：
+		 *     http://stanislavs.org/helppc/bios_data_area.html
+		 *     https://wiki.osdev.org/EBDA#Overview
+		 * 可知，BIOS data area(BDA) 中的逻辑地址 40:0E 处的 word 保存着 EBDA 的
+		 * segment base address；逻辑地址 40:13 处的 word 保存着 Memory size in
+		 * Kbytes(kilobytes of contiguous memory starting at absolute address
+		 * 00000h，或叫 conventional memory size，但减去 EBDA 的空间)。变量名终于
+		 * make sense：conventional memory 以上，1M 以下的部分是 BIOS related area，
+		 * 所以叫 bios_start。但某种角度看，这两个值其实也是一个东西？
 		 */
 		ebda_start = *(unsigned short *)0x40e << 4;
 		bios_start = *(unsigned short *)0x413 << 10;
 
-		/* MIN 不知道如何确定的，MAX 是 640kb，但实际是 636，注释中写 640，这是一个
-		 * quirk，比如 Dell 可能在 RAM size 中没有预留 EBDA 的空间。*/
+		/* MIN(128K) 不知道如何确定的，MAX 是 636K，但注释中写 640K，这 4k 是 quirk?
+		 * 考虑 Dell 可能在 RAM size 中没有预留 EBDA 的空间？ 通过 git blame ebda.c
+		 * 发现引入 ebda.c 的 commit: 0c51a965ed3c4, 证明推测正确。但现在似乎不再需要
+		 * 这 4k quirk？因为下面有 if(xxx && ebda_start < bios_start)，待确认
+		 */
 		if (bios_start < BIOS_START_MIN || bios_start > BIOS_START_MAX)
 			bios_start = BIOS_START_MAX;
-		/* EBDA 虽然在 conventional memory 范围内，但它也是 BIOS related memory */
+
+		/* conventional memory 中的 EBDA 是 BIOS related memory，不可以 overwritten，
+		 * 理论上，正常情况下，我认为 ebda_start 应该等于 bios_start，但正因为一些奇葩
+		 * 情况，如 Dell 老系统中 "RAM size" value 没有考虑 EBDA，会导致 bios_start
+		 * 大于 ebda_start，这种情况当然要按实际情况来，即 EBDA memory 也要被 reserve.
+		 * 因为原函数 reserve_bios_regions 的终极目标是，bios_start 至 1M 之间都要被
+		 * reserve.
+		 */
 		if (ebda_start > BIOS_START_MIN && ebda_start < bios_start)
 			bios_start = ebda_start;
 
 		/* 可能是因为怕下面 for 循环中找不到合适的，而 bios_start 又需要始终保持页对齐，
-		 * 所以先做一下页对齐。round up 可能就跑到 BIOS related area 中了，所以宁愿浪费
-		 * 一点也要 round down
+		 * 所以先做页对齐。round up 可能就跑到 BIOS related area 中了，所以宁愿浪费
+		 * 一点也要 round down。
 		 */
 		bios_start = round_down(bios_start, PAGE_SIZE);
 
 		/* Find the first usable memory region under bios_start. */
-		/* 原注释说： reserved memory area 是不可以被 kernel 当作 available RAM 用，
-		 * 所以在前面的 conventional memory 中找一块空间。*/
+		/* 0 - bios_start 是 conventional memory，bios_start 以上至 1M 的空间是被
+		 * reserve 的，不能被 kernel 用作 available RAM。注意!这里是从低地址往上找
+		 * 1st usable memory region under bios_start
+		 */
 		for (i = boot_params->e820_entries - 1; i >= 0; i--) {
 			entry = &boot_params->e820_table[i];
 
@@ -3596,12 +3727,14 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 	{
 		void *trampoline_pgtable;
 
+		/* 除 sizeof(unsigned long) 上文中已有解释 */
 		trampoline_pgtable = trampoline_32bit + TRAMPOLINE_32BIT_PGTABLE_OFFSET / sizeof(unsigned long);
 
 		/*
 		 * Move the top level page table out of trampoline memory,
-		 * if it's there. 如果之前 trampoline 函数做过 4->5 或 5->4 的 paging mode
-		 * 切换，那当前 CR3 的值就是 trampoline 中 top page table 的地址, just copy.
+		 * if it's there. 如果 trampoline 函数做过 4->5 或 5->4 的 paging mode
+		 * 切换，则 CR3 的值就是 trampoline 中 page table 的地址, 而且它收 top page
+		 * table, so, just copy it 到预备好的 top page table 空间.
 		 */
 		if ((void *)__native_read_cr3() == trampoline_pgtable) {
 			memcpy(pgtable, trampoline_pgtable, PAGE_SIZE);
@@ -3612,7 +3745,9 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		memcpy(trampoline_32bit, trampoline_save, TRAMPOLINE_32BIT_SIZE);
 	}
 
-misc.c : extract_kernel:
+#### extract_kernel:
+
+arch/x86/boot/compressed/misc.c:
 
 	/* asmlinkage，字面意思是汇编链接，在 X86_64 下定义为空；在 X86_32 下被定义为：
 	 *     #define asmlinkage CPP_ASMLINKAGE __attribute__((regparm(0)))
@@ -3727,14 +3862,113 @@ misc.c : extract_kernel:
 		return output;
 	}
 
+#### string operation under x86/boot
 
-head_64.S 代码分析到这里，不得不暂停一下，因为 header.S 中的 init_size 定义复杂，我们需要明白它的真实含义。init_size 在 header.S 中被定义为：
+此 topic 的引入，源自研究 x86/boot/string.{c,h} 时的发现。x86/boot/ 下的 string.{c.h} 不仅在所在目录中使用，而且在 x86/boot/compressed，x86/purgatory 目录下使用。本来意图很简单，一些通用的字符操作，无需多次定义。但在实际使用中，发现了一些有趣的小现象。
+
+对于 memcpy/memset/memcmp，x86/boot/string.h 做了声明，同时定义了 macro：
+
+	void *memcpy(void *dst, const void *src, size_t len);
+	void *memset(void *dst, int c, size_t len);
+	int memcmp(const void *s1, const void *s2, size_t len);
+
+	#define memcpy(d,s,l) __builtin_memcpy(d,s,l)
+	#define memset(d,c,l) __builtin_memset(d,c,l)
+	#define memcmp	__builtin_memcmp
+
+x86/boot/string.c 中 #undef 了上述宏，同时定义了 memcmp(没定义 memset, memcpy)；而 x86/boot/copy.S 以汇编代码定义了 memset 和 memcpy。同时要注意，编译 x86/boot/ 下 setup 文件时，使用了选项 `-ffreestanding`，它在 [GCC 文档](https://gcc.gnu.org/onlinedocs/gcc/C-Dialect-Options.html#C-Dialect-Options)中的定义如下：
+
+>Assert that compilation targets a freestanding environment. This implies
+‘-fno-builtin’. bluhbluh...
+
+`-fno-builtin` 的定义也在上述 GCC 文档：
+
+>Don’t recognize built-in functions that do not begin with ‘__builtin_’ as prefix. bluhbluh...
+
+Simply speaking，标准 C 库中的很多函数都有其 GCC builtin 版本，这些 GCC builtin 函数有两种形式，带前缀 "__builtin_" 和不带的，使用选项 `-fno-builtin` 意味着不带前缀则不会被识别为 builtin 函数。继续阅读之前需要补充一些背景知识：
+
+ 1.[C Language Standards supported by GCC](https://gcc.gnu.org/onlinedocs/gcc/Standards.html#C-Language)
+
+ 2.[Other Built-in Functions Provided by GCC](https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#Other-Builtins)
+
+实际使用中，x86/boot/ 下的 .c 文件会 #include "string.h"，也就是说会使用 memxxx() 的 GCC builtin 版本。这么说来，x86/boot 下定义的 memxxx() 不会被用到？这要 case by case 的看：
+
+  * memcmp() 定义在 string.c，被同文件中的 strstr()使用；
+  * memcmp() 定义在 copy.S，被同文件中的 copy_from_fs/copy_to_fs 使用；
+  * memset() 定义在 copy.S，但看起来没有被特别的使用，因为凡使用 memset 的文件头部都有 #include "string.h"，所以看起来 copy.S 中定义的 memset() 没有被使用，从 setup 的 `objdump -d` 输出中也可以确认这一点。
+
+memset() 的情况引出了 [patch](https://lkml.org/lkml/2019/1/7/60)。x86 maintainer 的回复太简洁，无法明白背后的原理。发了 patch 后，又发现 x86/boot/compressed 目录下的[有趣现象](https://lkml.org/lkml/2019/1/8/128)，实际上和 patch 是一个问题。最后，从 GCC 社区得到了[帮助](https://gcc.gnu.org/ml/gcc-help/2019-01/msg00039.html)。
+
+简而言之，当 GCC 看到 builtin 函数后，会使用启发式的策略决定如何 expand 它：emit a call to library equivalent(我们的情况下就是 call 自己定义的函数), 还是 optimize to inline code。有编译选项来精确的控制 expand 行为：`-mstringop-strategy=`, `-mmemcpy-strategy=`, `-mmemset-strategy=strategy`. 从这些选项的释义可以看出，可以配置是否 inline builtin 函数，inline 时根据操作数 size 选择不同的 inline 算法。
+
+经过测试，`-mstringop-strategy=` 的确可以达成期望。在 arch/x86/boot/compressed/Makefile 添加：
+
+	$(obj)/kaslr.o: KBUILD_CFLAGS += -mstringop-strategy=byte_loop
+	$(obj)/pgtable_64.o: KBUILD_CFLAGS += -mstringop-strategy=libcall
+
+后编译，观察 kaslr.o 和 pgtable_64.o 的 nm 输出，并 `grep mem*`，就可确认编译选项生效，与 hack 之前的结果相反，符合预期。
+
+#### command line parsing under x86/boot
+
+此节的存在，来自分析 paging_prepare->cmdline_find_option_bool 时遇到的小困惑。command line 解析在 boot/ 和 compressed/ 目录下都会用到，在 boot/ 目录遇到时并没细看，但来到 compressed/ 后，就有了一些小困惑：fs/gs 寄存器的使用问题，本节旨在解释 fs/gs 使用在 boot/ 和 compressed/ 下的差异，并非 parsing 本身。So, let's go~
+
+command line parsing 在 compressed/ 中第一次出现如上所述：paging_prepare->cmdline_find_option_bool("no5lvl")。compressed/cmdline.c 中 #include 了 boot/ 下的 cmdline.c，所以实际使用的核心函数来自 boot/cmdline.c，而 compressed/cmdline.c 中只是定义了 wrapper 函数和 helper 函数(set_fs, rdfs8)。来看 boot/cmdline.c 中的核心函数 __cmdline_find_option_bool：
+
+	/* 仅关注 fs/gs 相关代码 */
+	int __cmdline_find_option_bool(unsigned long cmdline_ptr, const char *option)
+	{
+		addr_t cptr;
+		...
+
+		/* 此函数既运行在 real mode, 也运行在 protect mode/long mode，两种情况分别分析。
+		 * 入参 cmdline_ptr 是 command line 在 RAM 中的线性(物理)地址。
+		 *
+		 * 1. 作为 setup 的代码运行在 real mode
+		 * 线性(即物理)地址的计算方式：linear address = segment base << 4 + offset,
+		 * 第一行开始没想明白，后来逆向思考明白了，这两行代码后，按照 real mode 计算地址
+		 * 的方式，fs << 4 + cptr = cmdline_ptr
+		 *
+		 * 2. 作为 decompressor 运行在 protect mode/long mode
+		 * 这个情况略复杂，因为地址计算方式不一样，此时的所有 segment base 都是 0。所以
+		 * compressed/cmdline.c 定义了自己的 set_fs 和 rdfs8，代替 boot/ 中的。看
+		 * 定义，便明白了。
+		 */
+		cptr = cmdline_ptr & 0xf;
+		set_fs(cmdline_ptr >> 4);
+
+		/* real mode 下，segment 的 size 是固定的 64k = 0x10000 */
+		while (cptr < 0x10000) {
+			c = rdfs8(cptr++);
+			...
+		}
+
+		return 0;
+	}
+
+	/* compressed/cmdline.c */
+	static unsigned long fs;
+	static inline void set_fs(unsigned long seg)
+	{
+		fs = seg << 4;  /* shift it back */
+	}
+
+	typedef unsigned long addr_t;
+	static inline char rdfs8(addr_t addr)
+	{
+		return *((char *)(fs + addr));
+	}
+
+
+
+#### VO/ZO
+
+head_64.S 和 head_32.S 中有用到 macro: BP_init_size，它表示 header.S 中的 boot protocol field: init_size。为了理解用到它的代码，必须搞清楚它的真实含义。init_size 在 header.S 中被定义为：
 
 	init_size:		.long INIT_SIZE		# kernel initialization size
 
-你会发现 INIT_SIZE 的定义非常复杂，牵扯了一堆 ZO_、VO_ 开头的变量，这些变量分别定义在 arch/x86/boot/ 下的 zoffset.h 和 voffset.h 中，若不理解 arch/x86/boot/vmlinux.bin 的处理流程，很难理解他们的定义，所以，是时候兑现上文的诺言了。
+你会发现 INIT_SIZE 的定义非常复杂，牵扯了一堆 ZO_、VO_ 开头的变量，这些变量分别定义在 arch/x86/boot/ 下的 zoffset.h 和 voffset.h 中，若不理解 arch/x86/boot/vmlinux.bin 的处理流程，很难理解这些变量的含义。所以，是时候兑现上文的诺言了。kernel 文档中没有发现对 VO/ZO 的官方权威解释，唯一的解释在 [patch](https://lore.kernel.org/patchwork/patch/674100/) 中。
 
-相关文件的处理过程定义在 Makefile 中，技术细节属于 kbuild 领域，本文不展开解释，仅直接告诉结果：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin；vmlinux.bin 被压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S；piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 剥离为上一层目录的 vmlinux.bin，即 arch/x86/boot/vmlinux.bin。
+相关文件的处理过程定义在 Makefile 中，技术细节属于 kbuild 领域，本文不展开解释，仅直接告诉结果：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin；vmlinux.bin 被压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S；piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 剥离为上一层目录的 vmlinux.bin，即 arch/x86/boot/vmlinux.bin，此 vmlinux.bin 与同目录的 setup.bin 一起被 host program `build` 打包在一起成 bzImage。
 
 piggy.S 由 `mkpiggy` 生成，有必要看一下 `mkpiggy` 做了什么。[mkpiggy 的源代码](https://github.com/torvalds/linux/blob/master/arch/x86/boot/compressed/mkpiggy.c)很简单，但需要结合 [gzip spec](https://tools.ietf.org/html/rfc1952) 才能理解。
 
@@ -3755,7 +3989,7 @@ piggy.S 由 `mkpiggy` 生成，有必要看一下 `mkpiggy` 做了什么。[mkpi
 	-rw-rw-r-- 1 pino pino 9.4M Nov 10 12:40 arch/x86/boot/compressed/vmlinux.bin.lzo
 	-rw-rw-r-- 1 pino pino 5.8M Nov 10 12:35 arch/x86/boot/compressed/vmlinux.bin.xz
 
-岔开了一点话题，继续回来看 mkpiggy 如何处理 arch/x86/boot/compressed/vmlinux.bin。由 spec 上 member format 可知，每个 member 的最后 4 bytes 是该文件压缩前的 size：
+岔开了一点话题，继续看 mkpiggy 如何处理 arch/x86/boot/compressed/vmlinux.bin。由 spec 上 member format 可知，每个 member 的最后 4 bytes 是该文件压缩前的 size：
 
 	ISIZE (Input SIZE)
 		This contains the size of the original (uncompressed) input
@@ -3780,7 +4014,7 @@ piggy.S 由 `mkpiggy` 生成，有必要看一下 `mkpiggy` 做了什么。[mkpi
 	olen = get_unaligned_le32(&olen); /* 为什么? */
 	...
 
-6 种压缩算法，gzip 格式天然支持在压缩文件末尾附上文件压缩前的 size，其他压缩算法都是通过 Makefile 中的 `size_append` 操作在压缩文件末尾以 little-endian 附上压缩前的 size。mkpiggy 仅在 x86 上使用，x86 是 little-endian CPU，所以，为什么需要 endian 转换？ x86 maintainer 给了[解释](https://lkml.org/lkml/2018/11/9/1166)，因为考虑到了在 big-endian 机器上交叉编译 x86 的 kernel = =|，不知道谁有这种使用场景需求。
+6 种压缩算法中，gzip 格式天然支持在压缩文件末尾附上文件压缩前的 size，其他压缩算法都是通过 Makefile 中的 `size_append` 操作在压缩文件末尾以 little-endian 附上压缩前的 size。mkpiggy 仅在 x86 上使用，x86 是 little-endian CPU，所以，为什么需要 endian 转换？ x86 maintainer 给了[解释](https://lkml.org/lkml/2018/11/9/1166)，因为考虑到了在 big-endian 机器上交叉编译 x86 的 kernel = =|，不知道谁有这种使用场景需求。
 
 生成的 piggy.S，在我的测试环境中长这样：
 
@@ -3818,7 +4052,7 @@ sed 的用法参考 `info sed`。这条 sed script 过滤出 vmlinux 中的三�
 	#define VO__end _AC(0xffffffff82a7e000,UL)
 	#define VO__text _AC(0xffffffff81000000,UL)
 
-可以推断：前缀 VO 中的 V 表示 Vmlinux，O 猜测是 Object。_text 表示 vmlinux 的起始地址，_end 表示 vmlinux 的结束地址，__bss_start 的地址在二者之间。
+可以推断：前缀 VO 的 V 表示 Vmlinux，O 猜测是 Object 或 Offset。_text 表示 vmlinux 的起始地址，_end 表示 vmlinux 的结束地址，__bss_start 的地址在二者之间。
 
 arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 
@@ -3845,7 +4079,7 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 	#define ZO_z_input_len 0x00000000007b6927
 	#define ZO_z_output_len 0x0000000001e04eec
 
-可以推断：前缀 ZO 中的 Z 表示压缩后。理解了这些，回头来分析 header.S 中的 INIT_SIZE 的含义：
+可以推断：前缀 ZO 中的 Z 表示压缩后。理解了这些，再来分析 header.S 中的 INIT_SIZE 的含义：
 
 	# 为方便阅读，格式有做优化。源文件中本段代码上面有大段的注释详细解释为什么需要 extra bytes，
 	# 不在作者的知识领域，我们仅需知道：为了 safety decompression in place, 解压缩 buffer
@@ -3868,7 +4102,7 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 	 */
 	#if (ZO__ehead - ZO_startup_32) > ZO_z_extract_offset
 	    /* 二者相减是 ZO 中的的 .head.text section 的 size。本段代码其他信息参考:
-	     * https://lore.kernel.org/patchwork/patch/674095/ */
+	     * https://lore.kernel.org/patchwork/patch/674095 */
 	    # define ZO_z_min_extract_offset ((ZO__ehead - ZO_startup_32 + 4095) & ~4095)
 	#else
 	    /* 正常情况下，只将 extract offset 向上对齐到 4k 边界 */
@@ -3880,7 +4114,7 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 	/* vmlinux 在内存中的 size */
 	#define VO_INIT_SIZE	(VO__end - VO__text)
 
-	/* 谁大选谁 */
+	/* 谁大选谁。正常情况下，以我的环境为例，INIT_SIZE 是 VO_INIT_SIZE */
 	#if ZO_INIT_SIZE > VO_INIT_SIZE
 		# define INIT_SIZE ZO_INIT_SIZE
 	#else
