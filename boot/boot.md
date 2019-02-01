@@ -3265,7 +3265,8 @@ Tips:
 	 * Do the extraction, and jump to the new kernel..
 	 * extract_kernel 有 6 个入参，都是指针或整数，返回值是指针。根据 calling conventions，
 	 * 从左到右，入参依次使用 %rdi, %rsi, %rdx, %rcx, %r8 and %r9；返回值通过 %rax。
-	 * 因为 extract_kernel 内容复杂，涉及到 kaslr，elf 解析，重定位，在下一节单独分析。
+	 * 因 extract_kernel 内容复杂，涉及到 kaslr 处理，elf 解析，重定位处理，将在下文
+	 * 作为独立一节进行分析。
 	 */
 		pushq	%rsi			/* Save the real mode argument */
 		movq	%rsi, %rdi		/* real mode address */
@@ -3475,7 +3476,8 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		/* 和 setup 中的 boot_params 同名，定义在 misc.c，需要通过它找 cmd_line_ptr，
 		 * 下方的 cmdline_find_option_bool 函数会用到。但这个解析函数中的：
 		 *     	cptr = cmdline_ptr & 0xf;
-		 * 不明白，待向社区询问。
+		 * 不明白，待向社区询问。2019/1/16 update: 不需问社区了，已明白，在下方命令行解析
+		 * 一节有详细解释。
 		 */
 		boot_params = rmode;
 
@@ -3727,7 +3729,7 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 	{
 		void *trampoline_pgtable;
 
-		/* 除 sizeof(unsigned long) 上文中已有解释 */
+		/* 除以 sizeof(unsigned long) 上文中已有解释 */
 		trampoline_pgtable = trampoline_32bit + TRAMPOLINE_32BIT_PGTABLE_OFFSET / sizeof(unsigned long);
 
 		/*
@@ -3747,7 +3749,9 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 
 #### extract_kernel:
 
-arch/x86/boot/compressed/misc.c:
+如上文所述，extract_kernel 函数的内容复杂，涉及 kaslr 处理，elf 解析，重定位处理，本节将逐个进行分析。
+
+函数定义在 arch/x86/boot/compressed/misc.c:
 
 	/* asmlinkage，字面意思是汇编链接，在 X86_64 下定义为空；在 X86_32 下被定义为：
 	 *     #define asmlinkage CPP_ASMLINKAGE __attribute__((regparm(0)))
@@ -3780,24 +3784,13 @@ arch/x86/boot/compressed/misc.c:
 		boot_params = rmode;
 
 		/* Clear flags intended for solely in-kernel use. */
-		/* 没看到之前的 kernel 代码有设置此 flag, so, WHY? */
+		/* 没看到之前的代码有 set 此 flag, so, WHY? 推测可能其他的 bootloader 会 set
+		 * 此 flag，总之以防万一。*/
 		boot_params->hdr.loadflags &= ~KASLR_FLAG;
 
-		/* 下面大片代码都对本文重点不重要，暂时略过 */
-		sanitize_boot_params(boot_params);
-
-		if (boot_params->screen_info.orig_video_mode == 7) {
-			vidmem = (char *) 0xb0000;
-			vidport = 0x3b4;
-		} else {
-			vidmem = (char *) 0xb8000;
-			vidport = 0x3d4;
-		}
-
-		lines = boot_params->screen_info.orig_video_lines;
-		cols = boot_params->screen_info.orig_video_cols;
-
-		/* real mode 的 setup 代码调用过，此处自然是非 16-bit boot protocol 的情况。*/
+		/* 下面有大片代码都对本文重点不重要，比如 console debug output 之类，暂时略过 */
+		...
+		/* real mode 的 setup 代码调用过，此处是非 16-bit boot protocol 的情况 */
 		console_init();
 		debug_putstr("early console in extract_kernel\n");
 
@@ -3805,24 +3798,20 @@ arch/x86/boot/compressed/misc.c:
 		free_mem_end_ptr = heap + BOOT_HEAP_SIZE;
 
 		/* Report initial kernel position details. */
-		debug_putaddr(input_data);
-		debug_putaddr(input_len);
-		debug_putaddr(output);
-		debug_putaddr(output_len);
-		debug_putaddr(kernel_total_size);
-
-	#ifdef CONFIG_X86_64
-		/* Report address of 32-bit trampoline */
-		debug_putaddr(trampoline_32bit);
-	#endif
+		...
 
 		/*
 		 * The memory hole needed for the kernel is the larger of either
 		 * the entire decompressed kernel plus relocation table, or the
 		 * entire decompressed kernel plus .bss and .brk sections.
 		 */
-		/* KASLR 是另一个大话题，以后再详细分析。现在只考虑最简单的情况:
-		 * 无 KASLR，无 relocation */
+		/* KASLR 是本节重点只一，下方详细分析此函数。
+		 * 倒数第二个入参的 max() 的意思是，压缩数据可能包括 relocation 信息，如果包括，
+		 * 则 output_len 比 kernel_total_size 大; output 和 virt_addr 分别表示
+		 * kaslr 后的物理地址和虚拟地址，作 out param 用。所以 output 的处理有点技巧：
+		 * 传入时二重指针转为一重指针，函数定义是一重指针，因为就是要修改指针(地址)变量的值。
+		 * 无 KASLR，无 relocation xxx...
+		 */
 		choose_random_location((unsigned long)input_data, input_len,
 					(unsigned long *)&output,
 					max(output_len, kernel_total_size),
@@ -3861,6 +3850,347 @@ arch/x86/boot/compressed/misc.c:
 		debug_putstr("done.\nBooting the kernel.\n");
 		return output;
 	}
+
+KASLR 的处理入口是 choose_random_location(), 定义在 compressed/kaslr.c:
+
+	/*
+	 * Since this function examines addresses much more numerically,
+	 * it takes the input and output pointers as 'unsigned long'.
+	 */
+	void choose_random_location(unsigned long input,
+				    unsigned long input_size,
+				    unsigned long *output,
+				    unsigned long output_size,
+				    unsigned long *virt_addr)
+	{
+		unsigned long random_addr, min_addr;
+
+		if (cmdline_find_option_bool("nokaslr")) {
+			warn("KASLR disabled: 'nokaslr' on cmdline.");
+			return;
+		}
+
+	#ifdef CONFIG_X86_5LEVEL
+		if (__read_cr4() & X86_CR4_LA57) {
+			__pgtable_l5_enabled = 1;
+			pgdir_shift = 48;
+			ptrs_per_p4d = 512;
+		}
+	#endif
+
+		boot_params->hdr.loadflags |= KASLR_FLAG;
+
+		/* Prepare to add new identity pagetables on demand. */
+		initialize_identity_maps();
+
+		/* Record the various known unsafe memory ranges. */
+		mem_avoid_init(input, input_size, *output);
+
+		/*
+		 * Low end of the randomization range should be the
+		 * smaller of 512M or the initial kernel image
+		 * location. 对可用空间的起始地址做个限制
+		 */
+		min_addr = min(*output, 512UL << 20);
+
+		/* Walk available memory entries to find a random address. */
+		random_addr = find_random_phys_addr(min_addr, output_size);
+		if (!random_addr) {
+			warn("Physical KASLR disabled: no suitable memory region!");
+		} else {
+			/* Update the new physical address location. */
+			if (*output != random_addr) {
+				add_identity_map(random_addr, output_size);
+				*output = random_addr;
+			}
+
+			/*
+			 * This loads the identity mapping page table.
+			 * This should only be done if a new physical address
+			 * is found for the kernel, otherwise we should keep
+			 * the old page table to make it be like the "nokaslr"
+			 * case.
+			 */
+			finalize_identity_maps();
+		}
+
+
+		/* Pick random virtual address starting from LOAD_PHYSICAL_ADDR. */
+		if (IS_ENABLED(CONFIG_X86_64))
+			random_addr = find_random_virt_addr(LOAD_PHYSICAL_ADDR, output_size);
+		*virt_addr = random_addr;
+	}
+
+	/* 此函数注释非常长，省略，在代码中查看。
+	 * 2019/1/31 update： input size 是 ZO 的文件 size, 是不包括 .bss section 的；
+	 * 而 ZO 运行时的 memory 的 size: ZO_end - ZO_startup_32, 是包括 .bss 的. ZO 中
+	 * stack 和 heap 都定义在 .bss section。这么长的注释，最终看起来是要得出结论: ZO 被
+	 * relocated 后的 memory range 是要 avoid 的。
+	 * 为什么对这些不能用来解压的空间做 add_identity_map 呢?
+	 */
+	static void mem_avoid_init(unsigned long input, unsigned long input_size,
+				   unsigned long output)
+	{
+		unsigned long init_size = boot_params->hdr.init_size;
+		u64 initrd_start, initrd_size;
+		u64 cmd_line, cmd_line_size;
+		char *ptr;
+
+		/*
+		 * Avoid the region that is unsafe to overlap during
+		 * decompression. 这一段是 ZO relocate 后的运行空间，所以叫 ZO_RANGE
+		 */
+		mem_avoid[MEM_AVOID_ZO_RANGE].start = input;
+		mem_avoid[MEM_AVOID_ZO_RANGE].size = (output + init_size) - input;
+		add_identity_map(mem_avoid[MEM_AVOID_ZO_RANGE].start,
+				 mem_avoid[MEM_AVOID_ZO_RANGE].size);
+
+		/* Avoid initrd. */
+		initrd_start  = (u64)boot_params->ext_ramdisk_image << 32;
+		initrd_start |= boot_params->hdr.ramdisk_image;
+		initrd_size  = (u64)boot_params->ext_ramdisk_size << 32;
+		initrd_size |= boot_params->hdr.ramdisk_size;
+		mem_avoid[MEM_AVOID_INITRD].start = initrd_start;
+		mem_avoid[MEM_AVOID_INITRD].size = initrd_size;
+		/* No need to set mapping for initrd, it will be handled in VO. */
+
+		/* Avoid kernel command line. */
+		cmd_line  = (u64)boot_params->ext_cmd_line_ptr << 32;
+		cmd_line |= boot_params->hdr.cmd_line_ptr;
+		/* Calculate size of cmd_line. */
+		ptr = (char *)(unsigned long)cmd_line;
+		for (cmd_line_size = 0; ptr[cmd_line_size++];)
+			;
+		mem_avoid[MEM_AVOID_CMDLINE].start = cmd_line;
+		mem_avoid[MEM_AVOID_CMDLINE].size = cmd_line_size;
+		add_identity_map(mem_avoid[MEM_AVOID_CMDLINE].start,
+				 mem_avoid[MEM_AVOID_CMDLINE].size);
+
+		/* Avoid boot parameters. boot_params 的值是由 RSI 寄存器传递过来*/
+		mem_avoid[MEM_AVOID_BOOTPARAMS].start = (unsigned long)boot_params;
+		mem_avoid[MEM_AVOID_BOOTPARAMS].size = sizeof(*boot_params);
+		add_identity_map(mem_avoid[MEM_AVOID_BOOTPARAMS].start,
+				 mem_avoid[MEM_AVOID_BOOTPARAMS].size);
+
+		/* We don't need to set a mapping for setup_data. */
+
+		/* Mark the memmap regions we need to avoid。下方简略分析 */
+		handle_mem_options();
+
+	#ifdef CONFIG_X86_VERBOSE_BOOTUP
+		/* Make sure video RAM can be used. */
+		add_identity_map(0, PMD_SIZE);
+	#endif
+	}
+
+	/* 专为处理 memmap=, mem=, hugepages 三个参数。*/
+	static void handle_mem_options(void)
+	{
+		...
+		/* 着重分析 memmap=。参考 Documentation/admin-guide/kernel-parameters.txt。
+		 * nn@ss 指定的区域为可用的 memory range，可用作摆放解压后的 kernel; 其他 3 个
+		 * 符号: #$! 指定的空间明显不能使用。同时会记录 mem= 的值, 等同于 memmap= 不指定
+		 * ss，表示系统所能使用的 memory size, 表示解压缩后的 kernel 不能超过这个 limit.
+		 */
+		if (!strcmp(param, "memmap")) {
+			mem_avoid_memmap(val);
+		} else if (strstr(param, "hugepages")) {
+			...
+		} else if (!strcmp(param, "mem")) {
+			...
+		}
+	}
+
+	/* 地址随机化用的最小起始地址和解压后的 size 都有了，可以直奔主题了 */
+	static unsigned long find_random_phys_addr(unsigned long minimum,
+						   unsigned long image_size)
+	{
+		/* Check if we had too many memmaps. */
+		if (memmap_too_large) {
+			debug_putstr("Aborted memory entries scan (more than 4 memmap= args)!\n");
+			return 0;
+		}
+
+		/* Make sure minimum is aligned. 是不是多余? 512M 肯定对齐，bootloader 加载
+		 * decompressor 的地址在 head_32/64.S 都会对齐到 CONFIG_PHYSICAL_ALIGN */
+		minimum = ALIGN(minimum, CONFIG_PHYSICAL_ALIGN);
+
+		/* 暂不考虑 EFI firmware */
+		if (process_efi_entries(minimum, image_size))
+			return slots_fetch_random();
+
+		process_e820_entries(minimum, image_size);
+		return slots_fetch_random();
+	}
+
+不考虑 EFI 的情况，所以只看最后两个函数即可。process_e820_entries 内容很简单，遍历 boot param 中的 E820 信息，包装成 mem_vector 形式，交给 process_mem_region 处理：
+
+	/* entry 是 E820 来的信息，表示 RAM 的地址空间；名字 "entry" 隐含 E820 entry 的意思 */
+	static void process_mem_region(struct mem_vector *entry,
+				       unsigned long minimum,
+				       unsigned long image_size)
+	{
+		/* 可想而知本函数将对各种情况的判断，包含各种 corner case，比较繁琐，故省略详细分析.
+		 * 总体逻辑是: E820 entry 的 range, 必须 overlap (minimum - mem_limit).
+		 * 粗略描述：对入参 entry 判断优化 range 后放入*/
+	}
+
+
+compressed/kaslr_64.c:
+
+
+	/* Used to track our allocated page tables. */
+	static struct alloc_pgt_data pgt_data;
+
+	/* The top level page table entry pointer. */
+	static unsigned long top_level_pgt;
+
+	/* __PHYSICAL_MASK_SHIFT 的注释已过时，Documentation/x86/x86_64/mm.txt 的内容
+	 * 已 overhaul。它现在被定义为 52，表示 x86_64 平台最大支持 52-bit 的物理地址宽度，
+	 * 参考 Intel 开发者手册3A, chapter 4.1.4 的最后两条：最大物理地址宽度是 52；一般
+	 * 情况下, linear-address(或者叫虚拟地址) 宽度是 48(显然是在没有 5-level paging
+	 * 的 long mode 下)
+	 */
+	phys_addr_t physical_mask = (1ULL << __PHYSICAL_MASK_SHIFT) - 1;
+	/* 同时注意到，有个相应的 __VIRTUAL_MASK_SHIFT 定义如下：
+	 *   #ifdef CONFIG_X86_5LEVEL
+	 *     #define __VIRTUAL_MASK_SHIFT	(pgtable_l5_enabled() ? 56 : 47)
+	 *   #else
+	 *     #define __VIRTUAL_MASK_SHIFT	47
+	 *   #endif
+	 * 我们已知 long mode 下 linear address(or virtual address) 的位宽是 48(或 57
+	 * in 5-level paging)，为什么这里的定义都少了 1？看起来是因为 canonical address
+	 * 的原因。i386 下不存在 canonical address 的概念，因为虚拟地址是 32 bits 且全部
+	 * 使用；而 x86_64 有 64-bit 虚拟地址且不全部使用，因为 64-bit mode 下要求
+	 * 地址必须是 canonical address 的形式，即 address bits 63 through to the
+	 * most-significant implemented bit are set to either all ones or all zeros,
+	 * 所以其实 the most-significant address bit 其实是不用的。
+	 */
+
+	/*
+	 * Mapping information structure passed to kernel_ident_mapping_init().
+	 * Due to relocation, pointers must be assigned at run time not build time.
+	 */
+	static struct x86_mapping_info mapping_info;
+
+	/* Locates and clears a region for a new top level page table. */
+	void initialize_identity_maps(void)
+	{
+		/* If running as an SEV guest, the encryption mask is required. */
+		/* AMD 的特性，mem_encrypt.S 中的汇编函数。略过 */
+		set_sev_encryption_mask();
+
+		/* Exclude the encryption mask from __PHYSICAL_MASK */
+		/* AMD 的特性，mem_encrypt.S 中的变量。略过 */
+		physical_mask &= ~sme_me_mask;
+
+		/* Init mapping_info with run-time function/buffer pointers. */
+		mapping_info.alloc_pgt_page = alloc_pgt_page;
+		mapping_info.context = &pgt_data;
+		mapping_info.page_flag = __PAGE_KERNEL_LARGE_EXEC | sme_me_mask;
+		mapping_info.kernpg_flag = _KERNPG_TABLE;
+
+		/*
+		 * It should be impossible for this not to already be true,
+		 * but since calling this a second time would rewind the other
+		 * counters, let's just make sure this is reset too.
+		 */
+		pgt_data.pgt_buf_offset = 0;
+
+		/*
+		 * If we came here via startup_32(), cr3 will be _pgtable already
+		 * and we must append to the existing area instead of entirely
+		 * overwriting it.
+		 *
+		 * With 5-level paging, we use '_pgtable' to allocate the p4d page table,
+		 * the top-level page table is allocated separately.
+		 *
+		 * p4d_offset(top_level_pgt, 0) would cover both the 4- and 5-level
+		 * cases. On 4-level paging it's equal to 'top_level_pgt'.
+		 *
+		 * 原以为上面第一段注释 outdated，研究其 commit 3a94707d7a7b 后发觉并不是。
+		 * (注意：2016年还没有5级页表的概念)。32-bit boot protocol 时，startup_32()
+		 * 在 kernel 自己的数据区域 _pgtable 处为 64-bit mode build 4-level page
+		 * table，然后走入 startup_64(); 64-bit boot protocol 的入口是 startup_64()，
+		 * 此时 bootloader 已经备好 identity mapping 的 page table，但肯定不在 kernel
+		 * 的 _pgtable 处，所以可以任性使用 _pgtable 处的空间来建立额外需要的 page table。
+		 * 这就是为什么 if/else 分支中内容，以及 debug 信息长这样。
+		 *
+		 * Tips: 本函数只在 x86_64 long mode 下; 开始是 5-level 的情况只有 kdump，
+		 * production kernel 是 5-level, capture kernel 可以是 4-level 或 5-level.
+		 * Linux kernel 进入 long mode 时默认是 4-level paging.
+		 * 有 4 种情况：
+		 * 1. power on 后 paging moding 不变，即 4->4, then, cr3 = _pgtable;
+		 * 2. power on 后 4->5 切换, 那么 cr3 != _pgtable, 而 = top_pgtable.
+		 * 3. kdump 下 5->4, 那么 cr3 != _pgtable, 而 = top_pgtable.
+		 * 4. kdump 下 5->5, 则不知道 cr3 的值，既 != _pgtable, 也 != top_pgtable
+		 */
+		top_level_pgt = read_cr3_pa();
+		if (p4d_offset((pgd_t *)top_level_pgt, 0) == (p4d_t *)_pgtable) {
+			debug_putstr("booted via startup_32()\n");
+			pgt_data.pgt_buf = _pgtable + BOOT_INIT_PGT_SIZE;
+			pgt_data.pgt_buf_size = BOOT_PGT_SIZE - BOOT_INIT_PGT_SIZE;
+			memset(pgt_data.pgt_buf, 0, pgt_data.pgt_buf_size);
+		} else {
+			/* 没有 5-level paging 前，此 debug string 没问题，现在多了上述 2/3/4
+			 * 三种情况没有提到。*/
+			debug_putstr("booted via startup_64()\n");
+			pgt_data.pgt_buf = _pgtable;
+			pgt_data.pgt_buf_size = BOOT_PGT_SIZE;
+			memset(pgt_data.pgt_buf, 0, pgt_data.pgt_buf_size);
+			top_level_pgt = (unsigned long)alloc_pgt_page(&pgt_data);
+		}
+	}
+
+linux kernel 页表实现了一套兼容所有 paging mode 的数据结构。5-level paging 以前，kernel 用 PGD -> PUD -> PMD -> PTE : Page 的结构描述所有 paging mode；5-level paging 出现后，在 PGD 和 PUD 中间插入一级 P4D，所以现在是 PGD -> P4D -> PUD -> PMD -> PTE : Page 的结构描述所有 paging mode。此刻尚未熟练掌握，暂且仅从代码角度笨拙的分析 p4d_offset 的实现。kaslr_64.c 中 #include 了 asm/pgtable.h，其中有 p4d_offset 的定义，但是被 #if CONFIG_PGTABLE_LEVELS 包裹，此配置项定义在 arch/x86/Kconfig 中：
+
+	config PGTABLE_LEVELS
+	        int
+	        default 5 if X86_5LEVEL
+	        default 4 if X86_64
+	        default 3 if X86_PAE
+	        default 2
+
+它在配置阶段是 user invisible 的，也就是说根据环境自动配置。在 64-bit mode 下，只有 2 种情况, CONFIG_PGTABLE_LEVELS 等于 4 或 5。还好头文件的包含关系比较简单，可以肉眼分析。asm/pgtable.h 中 #include 了 asm/pgtable_types.h，这两个头文件中都根据 CONFIG_PGTABLE_LEVELS 的不同分别定义符号和 include 头文件。
+
+先看 CONFIG_PGTABLE_LEVELS = 4 的情况。简单分析可知，此时 p4d_offset 定义在 asm-generic/pgtable-nop4d.h：
+
+	/* 入参 pgd 指向 PGT 中某 entry，即 P4D table 的地址, 返回可以 cover 入参 address
+	 * 的 P4D table entry 的地址，所以函数名叫 p4d_offset。
+	 * 4-level paging 下没有 p4d，用 kernel 的术语说收 p4d folded into ggd. 此时，
+	 * pgd 本身就是第 4 级页表，所以返回入参 pgd
+	 */
+	static inline p4d_t *p4d_offset(pgd_t *pgd, unsigned long address)
+	{
+		return (p4d_t *)pgd;
+	}
+
+再看 CONFIG_PGTABLE_LEVELS = 5 的情况。此时 p4d_offset 定义在 asm/pgtable.h:
+
+	/* to find an entry in a page-table-directory. */
+	static inline p4d_t *p4d_offset(pgd_t *pgd, unsigned long address)
+	{
+		/* 是否 enable 5-level 的逻辑是：
+		 *   - 硬件支持(CR4.LA57)
+		 *     &&
+		 *   - 软件需要(CONFIG_X86_5LEVEL)
+		 */
+		if (!pgtable_l5_enabled())
+			return (p4d_t *)pgd;
+		return (p4d_t *)pgd_page_vaddr(*pgd) + p4d_index(address);
+	}
+
+杂乱memo:
+
+ 1. 看起来 CONFIG_PGTABLE_LEVELS 不会为 1，虽然理论上有1级页表，在 32-bit paging w/ Page Size Extension 的情况下，但推测 Linux Kernel 并不支持。
+ 2. 引入 4-level paging 时，引入了 PUD
+ 3. CONFIG_PGTABLE_LEVELS = 2 时，对应 32-bit paging w/o PSE, 在 linux kernel 中是 PGD -> PTE : Page, 所以会包含头文件 pgtable-nop4d.h, pgtable-nopud.h, pgtable-nopmd.h
+ 4. CONFIG_PGTABLE_LEVELS = 3 时，对应 PAE paging, 在 linux kernel 中是 PGD -> PMD -> PTE : Page, 所以会包含头文件 pgtable-nop4d.h, pgtable-nopud.h
+ 5. CONFIG_PGTABLE_LEVELS = 4 时，对应 long mode 64-bit paging, 在 linux kernel 中是 PGD -> PUD -> PMD -> PTE : Page, 所以会包含头文件 pgtable-nop4d.h
+ 6. https://www.kernel.org/doc/gorman/html/understand/understand006.html
+ 7. https://lwn.net/Articles/717293/
+ 8. https://lwn.net/Articles/117749/
+ 
 
 #### string operation under x86/boot
 
@@ -3968,11 +4298,11 @@ head_64.S 和 head_32.S 中有用到 macro: BP_init_size，它表示 header.S �
 
 你会发现 INIT_SIZE 的定义非常复杂，牵扯了一堆 ZO_、VO_ 开头的变量，这些变量分别定义在 arch/x86/boot/ 下的 zoffset.h 和 voffset.h 中，若不理解 arch/x86/boot/vmlinux.bin 的处理流程，很难理解这些变量的含义。所以，是时候兑现上文的诺言了。kernel 文档中没有发现对 VO/ZO 的官方权威解释，唯一的解释在 [patch](https://lore.kernel.org/patchwork/patch/674100/) 中。
 
-相关文件的处理过程定义在 Makefile 中，技术细节属于 kbuild 领域，本文不展开解释，仅直接告诉结果：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin；vmlinux.bin 被压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S；piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 剥离为上一层目录的 vmlinux.bin，即 arch/x86/boot/vmlinux.bin，此 vmlinux.bin 与同目录的 setup.bin 一起被 host program `build` 打包在一起成 bzImage。
+相关文件的处理过程定义在 Makefile 中，技术细节属于 kbuild 领域，本文不展开解释，仅直接告诉结果：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin；vmlinux.bin(和可选的vmlinux.relocs 一起) 被压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S；piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 剥离为上一层目录的 vmlinux.bin，即 arch/x86/boot/vmlinux.bin，此 vmlinux.bin 与同目录的 setup.bin 一起被 host program `build` 打包在一起成 bzImage。
 
 piggy.S 由 `mkpiggy` 生成，有必要看一下 `mkpiggy` 做了什么。[mkpiggy 的源代码](https://github.com/torvalds/linux/blob/master/arch/x86/boot/compressed/mkpiggy.c)很简单，但需要结合 [gzip spec](https://tools.ietf.org/html/rfc1952) 才能理解。
 
->gzip spec tips: 一个 gzip 文件由一系列 members (compressed data sets) 组成，member 是一个被压缩的文件；多字节整数在 gzip 压缩文件中以 Little-endian 存放。
+>gzip spec tips: 一个 gzip 文件由一系列 members (compressed data sets) 组成，因为可以多个文件被压缩在一起，所以一个 member 表示一个被压缩的文件；而 kernel 压缩是以 `cat file | gzip` 的方式，所以只有 member。多字节整数在 gzip 压缩文件中以 Little-endian 存放。
 
 目前，linux kernel 支持 6 种压缩算法：`.gz`, `.bz2`, `.lzma`, `.xz`, `.lzo`, `.lz4`，为了直观感受 objcopy 的剥离效果，以及各种压缩算法的效果，在我的测试环境下，各相关文件 size 如下：
 
@@ -4028,7 +4358,7 @@ piggy.S 由 `mkpiggy` 生成，有必要看一下 `mkpiggy` 做了什么。[mkpi
 	.incbin "arch/x86/boot/compressed/vmlinux.bin.gz"
 	input_data_end:
 
-它记录了内核压缩前后的 size，把压缩后的 kernel 放在一个独立的 section 中。
+它记录了内核压缩前后的 size，把压缩后的 kernel 放在一个独立的 section 中。这有个小 tip: 汇编语言中定义符号(label)，给符号赋的值其实是地址。也就是说，这里把本来表示 size 的值赋值给符号。但是 piggy.S 中定义的符号并没有被代码直接使用，只在后续的 nm 处理中，提取符号的值(地址)放入 .h 文件中使用。
 
 zoffset.h 和 voffset.h 两个文件在编译过程中生成，只有了解他们的生成细节，才能理解文件中那些变量的含义。arch/x86/boot/voffset.h 由 arch/x86/boot/compressed/Makefile 定义:
 
@@ -4081,17 +4411,22 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 
 可以推断：前缀 ZO 中的 Z 表示压缩后。理解了这些，再来分析 header.S 中的 INIT_SIZE 的含义：
 
-	# 为方便阅读，格式有做优化。源文件中本段代码上面有大段的注释详细解释为什么需要 extra bytes，
-	# 不在作者的知识领域，我们仅需知道：为了 safety decompression in place, 解压缩 buffer
-	# 的大小是原文件 size + extra bytes。
+	/* 为方便阅读，格式有做优化。源文件中本段代码上面有大段注释解释为什么需要 extra bytes，
+	 * 不在作者的知识领域，我们仅需知道：为了 safety decompression in place, 解压缩
+	 * buffer 的大小是原文件 size + extra bytes。以我的环境为例: 1e04eec >> 8 + 65536
+	 * = 188494 bytes, 约等于 184k。
+	 */
 	#define ZO_z_extra_bytes	((ZO_z_output_len >> 8) + 65536)
 
 	#if ZO_z_output_len > ZO_z_input_len
-	/* 应该是绝大多数情况，没听说过压缩后比压缩前文件 size 还大。压缩文件放在解压缩
-	 * buffer 的尾端，此变量表示它在 buffer 中的 offset */
+		/* 这是正常情况，没听过压缩后比压缩前文件 size 还大。压缩文件放在解压缩 buffer 的
+		 * 尾端，此宏表示它在 buffer 中的 offset. 本例中其值约为：30M + 184k - 8.3M,
+		 * 约等于 22M */
 	    # define ZO_z_extract_offset	(ZO_z_output_len + ZO_z_extra_bytes - \
 						 				ZO_z_input_len)
 	#else
+		/* 由 https://lore.kernel.org/patchwork/patch/674100/ 可知，压缩后比压缩前
+		 * 大的情况 uncommon but possible */
 	    # define ZO_z_extract_offset	ZO_z_extra_bytes
 	#endif
 
@@ -4101,27 +4436,29 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 	 * overwrite the head code itself.
 	 */
 	#if (ZO__ehead - ZO_startup_32) > ZO_z_extract_offset
-	    /* 二者相减是 ZO 中的的 .head.text section 的 size。本段代码其他信息参考:
+	    /* 二者相减是 ZO 中的 .head.text section 的 size。本段代码其他信息参考:
 	     * https://lore.kernel.org/patchwork/patch/674095 */
 	    # define ZO_z_min_extract_offset ((ZO__ehead - ZO_startup_32 + 4095) & ~4095)
 	#else
-	    /* 正常情况下，只将 extract offset 向上对齐到 4k 边界 */
+	    /* 正常情况下，只将 extract offset 向上对齐到 4k 边界，基本还是 22M */
 	    # define ZO_z_min_extract_offset ((ZO_z_extract_offset + 4095) & ~4095)
 	#endif
 
-	/* 前两个变量相减是 arch/x86/boot/compressed/vmlinux 被加载到内存中的 size */
+	/* 前两个变量相减是 arch/x86/boot/compressed/vmlinux 被加载到内存中的 size. 也是
+	 * 约等于 30M */
 	#define ZO_INIT_SIZE	(ZO__end - ZO_startup_32 + ZO_z_min_extract_offset)
-	/* vmlinux 在内存中的 size */
+	/* vmlinux 在内存中的 size, 本例中约等于 26M! 原来的认知被颠覆了 = =! */
 	#define VO_INIT_SIZE	(VO__end - VO__text)
 
-	/* 谁大选谁。正常情况下，以我的环境为例，INIT_SIZE 是 VO_INIT_SIZE */
+	/* 谁大选谁。认知颠覆后，本例中就是 ZO_INIT_SIZE, 这样看来，extract_kernel 注释中的
+	 * 图示开始 make sense */
 	#if ZO_INIT_SIZE > VO_INIT_SIZE
 		# define INIT_SIZE ZO_INIT_SIZE
 	#else
 		# define INIT_SIZE VO_INIT_SIZE
 	#endif
 
--------------------
+现在回头看 Documentation/x86/boot.txt 中 init_size 的定义，也发现开始 make sense 了。其实可能不用纠结 INIT_SIZE 的计算过程，只需要知道需要这么一块 memory 作 buffer，来 in-place decompression, 这块 memory 的起始地址是 kernel 的 runtime start address。
 
 
 #### linker script
@@ -4181,6 +4518,11 @@ output section description 的完整描述长这样：
 
 X86 下链接 vmlinux 用的 script 是 arch/x86/kernel/vmlinux.lds.S，但这只是原始模板，它会被 C Preprocessor(cpp) 处理为 arch/x86/kernel/vmlinux.lds，后者才是真正使用的 linker script，但是因为被 cpp 处理过，所以格式上很不 Human-friendly。
 
+#### To Be Done
+
+ 1. UEFI 启动分析，EFI handover protocol, 即 X86-64 CPU 上，32-bit EFI firmware 启动 64-bit kernel
+ 2. 使用 ld version < 2.24 编译，查看 decompressor 中得 GOT 前三个 entry
+ 
 ## APPENDIX
 
 ### 常见汇编指令快速参考
