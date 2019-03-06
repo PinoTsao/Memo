@@ -4035,7 +4035,7 @@ KASLR 的处理入口是 choose_random_location(), 选择随机的物理地址�
 		 * 范围是 (LOAD_PHYSICAL_ADDR, KERNEL_IMAGE_SIZE)，会觉得很奇怪，实际是基于
 		 * 地址 __START_KERNEL_map 的。
 		 * Base on 分配给 VO 的地址 __START_KERNEL_map, 随机化后的虚拟地址选择范围
-		 * 大约是：(LOAD_PHYSICAL_ADDR, KERNEL_IMAGE_SIZE - VO image size), 以
+		 * 大约是：[LOAD_PHYSICAL_ADDR, KERNEL_IMAGE_SIZE - VO image size), 以
 		 * CONFIG_PHYSICAL_ALIGN 为 slot size 单位，同样产生一个随即数，选择一个 slot
 		 * 作为起始虚拟地址. 由此可见，随机化前后，虚拟地址的 delta 相对是比较小的，不会
 		 * 超过 (KERNEL_IMAGE_SIZE - VO image size).
@@ -4516,7 +4516,7 @@ Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是
 		/* 局部变量 min_addr/max_addr 的含义： VO 中做 relocation 的位置必须在 VO 的
 		 * file image 范围内，从代码来看就是 VO 解压地址到 .bss section 之前. 这也是本
 		 * 函数的核心内容：根据已知信息，找到 VO memory image 中需要 relocation 的物理
-		 * 地址, 将原虚拟地址和新虚拟地址的 delta, apply 到 relocation 发生的位置.
+		 * 地址, 将原虚拟地址和新虚拟地址的 delta, apply 到 relocation 的位置.
 		 */
 
 		/*
@@ -4532,7 +4532,6 @@ Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是
 		 * create an adjustment for kernel memory addresses to the self map.
 		 * This will involve subtracting out the base address of the kernel.
 		 */
-		/* map 很大概率是个负值。是 VO 物理地址范围中中*/
 		map = delta - __START_KERNEL_map;
 
 		/*
@@ -4554,9 +4553,10 @@ Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是
 		 * extended = extended(虚拟地址) + map
 		 * 			= extended(虚拟地址) + delta - __START_KERNEL_map
 		 * 			= extended(虚拟地址) + min_addr - LOAD_PHYSICAL_ADDR - __START_KERNEL_map
+		 * 			= extended(虚拟地址) + min_addr - (LOAD_PHYSICAL_ADDR + __START_KERNEL_map)
 		 *
 		 * 注：等式左边的 extended 是待求值的重定位物理地址；右边的 extended 是 relocation
-		 * entry 中的原重定位的虚拟地址；(LOAD_PHYSICAL_ADDR - __START_KERNEL_map) 是
+		 * entry 中的原重定位的虚拟地址；(LOAD_PHYSICAL_ADDR + __START_KERNEL_map) 是
 		 * VO 的链接起始虚拟地址，extended 减去它便得到上面说的 offset; 将不变的 offset
 		 * 加到 VO 的物理地址 min_addr 上，便得到 VO 的 memory image 中需要做 relocation
 		 * 的地址。
