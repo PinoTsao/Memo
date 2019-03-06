@@ -2515,15 +2515,19 @@ linux kernel 的 real mode 代码终于结束，跳入了 protect mode。
 
 bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 kernel 本尊(源码根目录下的 vmlinux)和重定位信息。
 
-需要先简单了解它是如何生成的：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin; 若 kernel 编译为 relocatable 的，还将剥离其重定位信息到 vmlinux.relocs; 二者被一起压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S; piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 处理输出为 arch/x86/boot/vmlinux.bin. 有 host program `build` 将 vmlinux.bin 与 setup.bin 一起打包成 bzImage。图示的 bzImage 文件布局重点强调了 vmlinux.bin 的内容:
+需要先简单了解它是如何生成的：源码根目录下的 vmlinux 被 `objcopy -R .comment -S` 为 arch/x86/boot/compressed/vmlinux.bin; 若 kernel 编译为 relocatable 的，还将剥离其重定位信息到 vmlinux.relocs; 二者被一起压缩为 vmlinux.bin.gz(默认压缩算法)，作为同目录下 host program `mkpiggy` 的输入，生成 piggy.S; piggy.S 和同目录的其他源代码文件一起编译生成该目录下的 vmlinux；此 vmlinux 被 objcopy 处理输出为 arch/x86/boot/vmlinux.bin. 有 host program `build` 将 vmlinux.bin 与 setup.bin 一起打包成 bzImage。
+
+图示的 bzImage 文件布局重点强调了 vmlinux.bin 的内容:
 
 ![Alt text](bzimagefilelayout.png)
 
-有必要先简单了解下面几个术语，因为下文将多处使用他们，在 "VO/ZO" 一节中有更多的细节描述。但注意：表示同一个概念时，不同的地方常常使用不同的术语，混合使用容易让读者产生混淆，本文尽量阐明。
+图示的比例无法准确描述 bzImage 的内部 layout，从图示中的 size 数据(从我的环境中获得)可以看出，几乎整个 bzImage(vmlinux.bin) 的内容是 compressed kernel.
+
+有必要简单了解几个术语先，因为下文将多处使用他们，在 "VO/ZO" 一节中有更多的细节描述。注意：表示同一个概念时，不同的地方可能使用不同的术语，混合使用容易让读者产生混淆，本文尽量阐明。
 
  1. VO: 指源码根目录下的 vmlinux, 从代码角度来说是 VO__end - VO__text 范围内的内容, 有时也被叫做 decompressed kernel；
- 2. ZO: 上面的图示清楚的标记了它的范围，它的内容是 vmlinux.bin.gz, 有时也被叫做 compressed kernel;
- 3. decompressor: vmlinux.bin 最主要的功能是将压缩的数据解压缩，所以通常被叫做这个名字。但有时也被叫做 ZO 或者 ZO image, 比如 kernel 代码中。
+ 2. ZO: 上面的图示清楚的标记了它的范围，它的内容是 boot/compressed/vmlinux, 有时也被叫做 ZO image 或 decompressor(因为最重要的功能是解压缩 kernel);
+ 3. compressed kernel: 压缩的数据实际上包括 compressed/vmlinux.bin 和 compressed/vmlinux.relocs, 但通常简称为 compressed kernel.
 
 以 x86-64 为例分析这部分代码。首先看下 arch/x86/boot/compressed/vmlinux 的代码布局，定义在 arch/x86/boot/compressed/vmlinux.lds：
 
@@ -2610,12 +2614,17 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 	 * data at 0x1e4 (defined as a scratch field) are used as the stack
 	 * for this calculation. Only 4 bytes are needed.
 	 */
-	/* call 指令将下一条指令地址(label 1的运行时地址)压栈，然后弹出到 ebp，再和 label 1
-	 * 的链接时地址相减，差值放在 ebp 中。差值即编译地址和运行地址之 delta，其实也是符号
-	 * startup_32 的运行时地址，因为 startup_32 的编译地址是 0。
-	 * 由上文分析可知，decompressor 被加载到内存的地址，由 boot protocol(header.S) 中
-	 * 的 code32_start(0x100000 = 1M) 表示. grub 没有修改它，且也是用这个值来 load
-	 * decompressor. startup_32 是 decompressor 的入口，所以它的运行地址是 0x100000.
+	/* ZO(protect mode kernel) 被加载到内存的地址，由 boot protocol(header.S) 中的
+	 * code32_start(0x100000/1M) 表示, 即 boot loader 应将加载地址写入这个 field.
+	 *
+	 * 16-bit boot protocol 的 grub 代码直接使用 GRUB_LINUX_BZIMAGE_ADDR 作为加载
+	 * ZO 的地址, 且 setup 中使用 code32_start 跳转到 protect mode kernel.
+	 * 32-bit boot-protocol 时 grub 代码在不同情况下分别使用 GRUB_LINUX_BZIMAGE_ADDR
+	 * 或字段 pref_address 作为 ZO 的加载地址。
+	 *
+	 * call 指令将下一条指令地址(label 1 的运行地址)压栈; 再弹出到 ebp，再和 label 1
+	 * 的链接地址相减，差值放 ebp 中。这个差值(delta)即是符号 startup_32 的运行地址，
+	 * 因为 startup_32 的链接地址是 0. (16-bit boot protocol 下它的运行地址是 0x100000)
 	 * setup 中有设置 esp，这里再设置应该也是 32-bit boot protocol 的情况。
 	 */
 		leal	(BP_scratch+4)(%esi), %esp
@@ -2647,20 +2656,21 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 	 * contains the address where we should move the kernel image temporarily
 	 * for safe in-place decompression.
 	 */
-	/* 英文注释对经过下面的代码计算后 ebp 和 ebx 表示的含义，解释的很清楚。
-	 * kernel_alignment 在 header.S(boot protocol) 中定义为: CONFIG_PHYSICAL_ALIGN,
-	 * 64-bit 下，其范围是 0x200000(2M) - 0x1000000(16M)，且必须是 2M 的倍数，因为
-	 * early page table 使用 2M 的 page(grub 没有修改它). ebp 是 decompressor 的
-	 * 加载地址(0x100000)，这段代码将该地址向上对齐到 kernel_alignment，对齐后的值放 ebx.
-	 * 比较 LOAD_PHYSICAL_ADDR 和 ebx，若 ebx < LOAD_PHYSICAL_ADDR，则给 ebx 赋值
-	 * LOAD_PHYSICAL_ADDR. arch/x86/Kconfig 中符号 “RELOCATABLE” 有描述此行为。
+	/* kernel_alignment 在 header.S(boot protocol) 中定义为: CONFIG_PHYSICAL_ALIGN,
+	 * 64-bit 下，其范围是 0x200000(2M) - 0x1000000(16M)，且必须是 2M 的倍数，可能因为
+	 * early boot page table 使用 2M 的 page. 16-bit boot protocol 的 grub 没有
+	 * 修改它.
+	 *
+	 * ebp 是 ZO 的加载地址(0x100000). CONFIG_RELOCATABLE 下，代码将该地址向上对齐到
+	 * kernel_alignment，对齐后的值放 ebx. 比较 LOAD_PHYSICAL_ADDR 和 ebx，若
+	 * ebx < LOAD_PHYSICAL_ADDR， 则给 ebx 赋值 LOAD_PHYSICAL_ADDR. 说明即使 ZO 是
+	 * relocatable, 其最小加载地址也不能小于 LOAD_PHYSICAL_ADDR. arch/x86/Kconfig
+	 * 中的符号 “RELOCATABLE” 有描述此行为。
 	 *
 	 * 所以 ebx 是解压缩 buffer 的地址，也即 VO 的起始地址？
 	 * 2019/12/29 update：上述推论正确！ LOAD_PHYSICAL_ADDR 在代码中被定义为:
 	 * CONFIG_PHYSICAL_START 对齐到 CONFIG_PHYSICAL_ALIGN。阅读 arch/x86/Kconfig
-	 * 中 PHYSICAL_START 和 PHYSICAL_ALIGN 的定义，会发现上面的推论正确！！！而且，在
-	 * CONFIG_RELOCATABLE 时，LOAD_PHYSICAL_ADDR 将作为加载 decompressed kernel
-	 * 的最小地址。
+	 * 中 PHYSICAL_START 和 PHYSICAL_ALIGN 的定义，会发现上面的推论正确！！！
 	 */
 	#ifdef CONFIG_RELOCATABLE
 		movl	%ebp, %ebx
@@ -2677,15 +2687,15 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 
 	/* Target address to relocate to for decompression */
 	/* _end 定义在 linker script，表示 arch/x86/boot/compressed/vmlinux 的链接结束
-	 * 地址，因链接起始地址是 0, 它的值也即 decompressor 的 memory image size, 比文件
-	 * size 大，因为 SHT_NOBITS 类型的 section(.bss, .pgtable) 不占据文件空间;
+	 * 地址，因链接起始地址是 0, 它也表示 ZO 的 memory image size, 比文件size 大，
+	 * 因为 SHT_NOBITS 类型的 section(.bss, .pgtable) 不占据文件空间;
 	 *
-	 * init_size 定义在 header.S，定义比较复杂，在 “VO/ZO” 一节中有详细描述。它表示可
+	 * init_size 在 header.S 中的定义比较复杂，在 “VO/ZO” 一节中有详细描述。它表示可
 	 * 安全 in-place decompress 所需的 buffer size, 经实际计算发现, 一般情况下它等于
 	 * ZO_INIT_SIZE;
 	 *
-	 * 二者相减得到 offset, 加到 ebx(解压缩 buffer 的地址)，所以，现在 ebx 表示
-	 * decompressor 的 memory image 被 copy/relocate 到解压缩 buffer 中的地址。
+	 * 二者相减的 offset 加到 ebx(解压缩 buffer 的地址)，所以，现在 ebx 表示 ZO memory
+	 * image 被 copy/relocate 到解压缩 buffer 中的地址. 即 ZO 紧贴 buffer 的底部摆放.
 	 * 压缩后 size 大于压缩前的情况是怎样???
 	 */
 	1:
@@ -2696,9 +2706,8 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 	/* Prepare for entering 64 bit mode */
 
 		/* Load new GDT with the 64bit segments using 32bit descriptor */
-		/* GDT 定义在文件下方的 .data section。ebp 的值是 decompressor 的加载/运行时
-		 * 地址，加上它得到 label: gdt 的运行时地址。虽然 lgdt，但暂未重新 load 段寄存器，
-		 * 所以此刻还没有生效
+		/* GDT 定义在文件下方的 .data section. ebp 是 ZO 的加载/运行地址，加上它得到
+		 * label: gdt 的运行地址。虽然 lgdt，但未重新 load 段寄存器，所以此刻没有生效.
 		 */
 		addl	%ebp, gdt+2(%ebp)
 		lgdt	gdt(%ebp)
@@ -2715,7 +2724,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 		 * This will insure that when the kernel is copied and decompressed
 		 * it will be done so encrypted. */
 		/* 此函数定义在 mem_encrypt.S。AMD Secure Encrypted Virtualization (SEV)
-		 * 是 AMD 的特性，不是本文重点，略过。这段代码也是最近才加入。直接跳到 1: 继续分析 */
+		 * 是 AMD 的特性，代码也是最近合入, 不是本文焦点，略过。直接跳到 1: 继续分析 */
 		call	get_sev_encryption_bit
 		xorl	%edx, %edx
 		testl	%eax, %eax
@@ -2728,8 +2737,8 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 		/* label: pgtable 定义在本文件最底部的 .pgtable section 中，指向 size 为
 		 * BOOT_PGT_SIZE 的空间，它的地址在 arch/x86/boot/compressed/vmlinux.lds.S
 		 * 中被对齐到 4k(page size)！ 注意！这里 leal 指令是基于 ebx 寄存器，上文说过，
-		 * ebx 是 decompressor 的 memory image 在解压缩 buffer 中的地址，所以初始化
-		 * 的页表位于解压缩 buffer 中的相应空间。
+		 * ebx 是 ZO memory image 被 relocate 到解压缩 buffer 中的地址，所以初始化
+		 * 的页表位于解压缩 buffer 中 ZO 的相应空间。
 		 *
 		 * 阅读页表代码须掌握基础知识，权威材料是 Intel 软件开发者手册 3A 的 "chapter
 		 * 4: paging"。由上面注释可知，early boot 只需映射 4G 的物理地址空间，所以只需
@@ -2805,9 +2814,9 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 		jnz	1b
 
 		/* Enable the boot page tables */
-		/* 获得解压缩 buffer 中 top paging structure 物理地址。此刻还没开启 paging，
-		 * 又因为段基址是 0，label 的值表示地址，也表示 offset, 所以这里 lea 得到的
-		 * effective address 也是物理地址
+		/* 获得解压缩 buffer 中 top paging structure 运行(物理)地址。此刻还没开启
+		 * paging. 因 ZO 链接起始地址是 0，label 的值表示地址，也表示 offset. Tip: lea
+		 * 得到的 effective address 是运行地址。问题：和 CS 基址有没有联系？
 		 */
 		leal	pgtable(%ebx), %eax
 		movl	%eax, %cr3
@@ -2965,11 +2974,10 @@ Tips:
 		movl	%eax, %gs
 
 		/* 这段 & 更下面的代码的逻辑在 startup_32 中出现过，同样是因为 64-bit boot
-		 * protocol 的原因又做一遍，下面的英文注释也有讲。
-		 *
-		 * 将 decompressor 的加载物理地址，向上对齐到 kernel_alignment 后放入 ebp，
-		 * 作为解压缩 buffer 的起始地址； ebx 是 decompressor 的 memory image 被
-		 * copy/relocate 到解压缩 buffer 中的物理地址。
+		 * protocol 的原因又做一遍，下面的英文注释也有讲。 重复一遍 FYI:
+		 * 将 ZO 的加载物理地址，向上对齐到 kernel_alignment 后放入 ebp，作为解压缩
+		 * buffer 的起始地址; ebx 是 ZO memory image 被 copy/relocate 到解压缩
+		 * buffer 中的物理地址。
 		 *
 		 * 2019/2/12 update: 起初以为下面 comments 中的 "2M boundary" 不严谨，认为是
 		 * aligned to CONFIG_PHYSICAL_ALIGN, 但看过 CONFIG_PHYSICAL_ALIGN 的注释，
@@ -3022,13 +3030,13 @@ Tips:
 
 		1:
 		/* Target address to relocate to for decompression */
-		/* rbp 是解压缩 buffer 的起始物理地址. 计算后，rbx 是 decompressor 的 memory
-		 * image 被 copy/relocate 到解压缩 buffer 中物理地址 */
+		/* rbp 是解压缩 buffer 的物理起始地址. 计算后，rbx 是 ZO memory image 被 copy/
+		 * relocate  到解压缩 buffer 中物理地址 */
 		movl	BP_init_size(%rsi), %ebx
 		subl	$_end, %ebx
 		addq	%rbp, %rbx
 
-		/* Set up the stack. 使用 relocated 后的 boot_stack_end 做 stack */
+		/* Set up the stack. 使用 relocated 后的 ZO 中的 boot_stack_end 做 stack */
 		leaq	boot_stack_end(%rbx), %rsp
 
 		/*
@@ -3042,24 +3050,25 @@ Tips:
 		 * 对注释的理解只能停留在表面。关于动态链接，共享对象，位置无关代码(PIC)，对我来说目前
 		 * 最 make sense 的讲解是：<一个程序员的自我修养>，第7章“动态链接”。
 		 *
-		 * 为何 compressed kernel 中有 Global Offset Table(GOT)? 答案是：使用 -fPIC
-		 * 或 -fPIE 编译位置无关代码，会生成 .got section，因为 GOT 是实现 PIC 的核心技术。
+		 * 为何 ZO 中有 Global Offset Table(GOT)? 分析：使用 -fPIC 或 -fPIE 编译位置
+		 * 无关代码，会生成 .got section，因为 GOT 是实现 PIC 的核心技术。
+		 *
 		 * 查看引入上面注释的 commit 5c9b0b1c498 可知：为生成 X86_64 的位置无关代码，新
 		 * 版本 binutils 使用 RIP relative addressing 的方式(这也是我脑中最自然的方式)，
 		 * 而老版本 binutils 则使用 GOT。
 		 *
-		 * 下面的描述仅是粗浅个人理解，很可能不准确，仅作理解当前代码用。盼指正。
-		 * 本例中，GOT entry 的内容应是相应符号的地址，因不涉及动态链接，所以不会 involve
+		 * 下面的分析是个人粗浅理解，很可能不准确，仅作理解当前代码用。盼指正。
+		 * 本例中，GOT entry 的内容应是相应符号的编译地址，因不涉及动态链接，不会 involve
 		 * Procedure Link Table(PLT)。entry size 在 i386 下为 4 bytes，X86_64 下
 		 * 为 8 bytes。普通可执行程序与动态库链接时默认使用 -fPIC，对每一个动态库中符号的
 		 * 引用都生成一条 GOT entry；程序执行时，run time linker 会修改 GOT entry 中的
 		 * 值，使其等于目标符号的运行时地址。可执行程序主体中所有对 .so 中符号的引用都变成对
 		 * 自身 GOT 中相应 entry 的引用。
 		 *
-		 * 对老版本 binutils 生成 GOT 不太理解，因为 compressed kernel 作为一个独立运行
-		 * 的个体，不引用外部模块的变量或函数，不存在动态链接，所以为什么 paging_prepare，
-		 * cleanup_trampoline 的调用会在 GOT 中有 reference？推测：对于从汇编直接调用的
-		 * C 函数，会生成 GOT entry，所以 head_32.S 中也有调整 got 的相同操作。
+		 * 对老版本 binutils 会生成 GOT 不完全理解，因为 ZO image 作为独立运行的个体，不引用
+		 * 外部模块的变量或函数，所以不存在动态链接。是部分函数如 paging_prepare，
+		 * cleanup_trampoline 还是全部函数都会在 GOT 中有 reference? 推测: 对全部
+		 * global C 函数都会生成 GOT entry, head_32.S 中也有调整 got 的相同操作。
 		 *
 		 * 暂时不纠结这个问题，因为老版本中 -fPIC 会生成 GOT 是事实，那么只有 bootloader
 		 * 有机会对它做 PIC 的调整(对于普通应用程序来说，叫动态链接)，但从未听说有此说法，且
@@ -3068,7 +3077,7 @@ Tips:
 		 * kernel 做 PIC 的调整，这个调整就是对 GOT entry 的内容重新计算。既然之前没有人做
 		 * GOT adjust，所以此刻 adjust_got 无需 undo previous adjustment，只需 apply
 		 * current adjustment。   那么又引出别的问题：adjustment 的值如何决定？GOT 中的
-		 * 初始值是什么？这两个问题本质上是一个，假设并推理一下：GOT 的内容是符号的编译时地址，
+		 * 初始值是什么？这两个问题本质上是一个，假设并推理一下：GOT 的内容是符号的编译地址，
 		 * 所以此处 adjust_got 只需加上编译地址和加载地址之 delta，即可更新为运行地址，又
 		 * 因为编译起始地址是 0，所以加载地址就是这个 delta。
 		 *
@@ -3177,7 +3186,7 @@ Tips:
 		 * Load the address of trampoline_return() into RDI.
 		 * It will be used by the trampoline to return to the main code.
 		 */
-		/* lea 指令拿到(运行时) effective address，为了后面的 absolute jump */
+		/* lea 指令拿到符号的运行地址，为了后面的 absolute jump */
 		leaq	trampoline_return(%rip), %rdi
 
 		/* Switch to compatibility mode (CS.L = 0 CS.D = 1) via far return */
@@ -3193,8 +3202,8 @@ Tips:
 
 	trampoline_return:
 		/* Restore the stack, the 32-bit trampoline uses its own stack */
-		/* 回忆：rbx 是 decompressor memory image 被 copy/relocate 到解压缩 buffer
-		 * 中的物理地址. boot_stack_end 的值这里用作 offset */
+		/* 回忆：rbx 是 ZO memory image 被 copy/relocate 到解压缩 buffer 中的物理地址.
+		 * boot_stack_end 的值这里用作 offset, 以 buffer 中 ZO 的空间作 stack */
 		leaq	boot_stack_end(%rbx), %rsp
 
 		/*
@@ -3217,9 +3226,9 @@ Tips:
 		call	cleanup_trampoline
 		popq	%rsi
 
-		/* 截至目前，decompressor memory image 被 relocated 的目标空间在代码中只有
-		 * 两处使用，一是使用它作 stack；二是存放页表：刚刚 copy 的 top_pgtable，及
-		 * startup_32 中初始化页表 pgtable
+		/* 截至目前，被 relocate 到 buffer 的 ZO memory image 空间在代码中只有两处使用:
+		 * 1. 作 stack；2. 存放页表, 即刚刚 copy 的 top_pgtable，及 startup_32 中
+		 * 初始化页表 pgtable。恰好都是 .bss section 的空间。
 		 */
 
 		/* Zero EFLAGS。为什么需要？ */
@@ -3238,10 +3247,9 @@ Tips:
 		subq	$1b, %rax
 
 		/* The new adjustment is the relocation address */
-		/* 温馨提示： rbx 是 decompressor memory image 被 copy/relocate 到解压缩
-		 * buffer 中的物理地址，作为新的 GOT adjustment。在当前运行地址处使用 relocated
-		 * 后的地址做完 PIC 的调整，就可以将 decompressor memory image copy 到
-		 * relocated 地址 & 跳过去执行了
+		/* 温馨提示： rbx 是 ZO memory image 被 copy/relocate 到解压缩 buffer 中的
+		 * 物理地址，用作新的 GOT adjustment。在当前运行地址处使用 relocated 后的地址
+		 * 做完 PIC 调整，就可将 ZO memory image 拷贝到 relocated 处 & 跳过去执行了
 		 */
 		movq	%rbx, %rdi
 		call	adjust_got
@@ -3250,13 +3258,13 @@ Tips:
 	 * Copy the compressed kernel to the end of our buffer
 	 * where decompression in place becomes safe.
 	 */
-	/* _bss 定义在 linker script，bss 之前的 section 是需要被 copy 的内容，后面详细
-	 * 说明。decompressor 的编译起始地址是 0，所以 _bss 的值其实是待 copy 的 size.
-	 * std(Set Direction Flag) 指令表示使用逆序 copy，即从内容的后端->前端进行 copy；
-	 * 当前在 64 位下，所以每次可 copy 一个 quadruple word。要注意！虽整体是逆序 copy,
-	 * 但 copy 一个单位(8 bytes)时是正常的顺序！否则 copy 后内容就乱了，这就是 _bss-8
-	 * 的含义！那么，copy 的次数自然是 size/8，因 .bss 地址(待 copy size)在 linker
-	 * script 中已对齐到 64(2^6)，所以 size/8 的结果肯定是整数。
+	/* _bss 定义在 linker script，_bss 之前的 section 是待 copy 的内容。
+	 * ZO 的编译起始地址是 0，所以 _bss 的值也表示待 copy 的 size. std(Set Direction
+	 * Flag) 指令表示使用逆序 copy，即从内容的后端->前端进行 copy; 当前运行在 long mode,
+	 * 所以每次可 copy 一个 quadruple word. 要注意! 虽整体是逆序 copy, 但 copy 一个单位
+	 * (8 bytes)时是正常的顺序! 否则 copy 后内容就乱了，这就是 _bss-8 的含义! So，copy
+	 * 次数自然是 size/8，因 .bss 地址(待 copy size)在 linker script 中已对齐到
+	 * 64(2^6), 所以 size/8 的结果肯定是整数。
 	 * copy 结束则 cld 恢复 direction flag. rsi 保存着 boot_params 的地址，字符串
 	 * 操作要用到它，所以 push 保存一下。
 	 */
@@ -3271,10 +3279,10 @@ Tips:
 		popq	%rsi
 
 	/* Jump to the relocated address. */
-	/* 因为编译起始地址是 0，所以每个 label 既是地址，又是 offset. lea 出 label
-	 * relocated: 在解压缩 buffer 中的 effective 地址，then, absolute jump to it.
+	/* 再提醒: ZO 编译起始地址是 0，所以 label 既是地址，又是 offset. lea 出 relocated
+	 * ZO 中 label： relocated 的 effective 地址，then, absolute jump to it.
 	 * 自此，将从解压缩 buffer(relocated 地址) 的 label relocated: 处执行，也就是说，
-	 * 后面运行的代码是 decompressor 在 relocated 处的拷贝。
+	 * 后面运行的代码是 ZO 在 relocated 处的拷贝。
 	 */
 		leaq	relocated(%rbx), %rax
 		jmp	*%rax
@@ -3283,6 +3291,7 @@ Tips:
 		/* 不关注 EFI 相关流程，snip... */
 	#endif
 
+	/* 重要细节！！！解压后下方 Jump to the decompressed kernel 指令不会被覆盖的原因！*/
 		.text
 	relocated:
 
@@ -3301,7 +3310,7 @@ Tips:
 
 	/*
 	 * Do the extraction, and jump to the new kernel..
-	 * extract_kernel 有 6 个入参，都是指针或整数，返回值是指针。根据 calling conventions，
+	 * extract_kernel 有 6 个入参，都是指针或整数，返回指针。根据 calling conventions，
 	 * 从左到右，入参依次使用 %rdi, %rsi, %rdx, %rcx, %r8 and %r9；返回值通过 %rax。
 	 * 因 extract_kernel 内容复杂，涉及到 kaslr 处理，elf 解析，重定位处理，将在下文
 	 * 作为独立一节进行分析。
@@ -3311,7 +3320,7 @@ Tips:
 		leaq	boot_heap(%rip), %rsi	/* malloc area for uncompression */
 		leaq	input_data(%rip), %rdx  /* input_data */
 		movl	$z_input_len, %ecx	/* input_len. */
-		movq	%rbp, %r8		/* output target address。看了C函数后可知，作为物理地址 */
+		movq	%rbp, %r8		/* output target address。看C函数后可知，作物理地址 */
 		movq	$z_output_len, %r9	/* decompressed length, end of relocs */
 		call	extract_kernel		/* returns kernel location in %rax */
 		popq	%rsi
@@ -3468,8 +3477,10 @@ Tips:
 	#include "../../kernel/verify_cpu.S"
 
 		.data
-	/* gdt64 的四行也是由 commit 7beebaccd50 引入。表示 X86_64 下 GDTR 的内容。base
-	 * 是 64 bits 长，但分别 .long，.word，.quad 是什么情况？待向社区提问 */
+	/* gdt64 的四行是 commit 7beebaccd50 引入。表示 X86_64 下 GDTR 的内容, base 是 64
+	 * bits，但分别 .long，.word，.quad 是何意? 经咨询: https://lkml.org/lkml/2019/1/22/420
+	 * 应该是作者手误。遂投 patch(https://lkml.org/lkml/2019/1/23/198) 修正.
+	 */
 	gdt64:
 		.word	gdt_end - gdt
 		.long	0
@@ -3785,6 +3796,56 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		memcpy(trampoline_32bit, trampoline_save, TRAMPOLINE_32BIT_SIZE);
 	}
 
+#### command line parsing under x86/boot
+
+此节的存在，来自分析 paging_prepare->cmdline_find_option_bool 时遇到的小困惑。command line 解析在 boot/ 和 compressed/ 目录下都会用到，在 boot/ 目录遇到时并没细看，但来到 compressed/ 后，就有了一些小困惑：fs/gs 寄存器的使用问题，本节旨在解释 fs/gs 使用在 boot/ 和 compressed/ 下的差异，并非 parsing 本身。So, let's go~
+
+command line parsing 在 compressed/ 中第一次出现如上所述：paging_prepare->cmdline_find_option_bool("no5lvl")。compressed/cmdline.c 中 #include 了 boot/ 下的 cmdline.c，所以实际使用的核心函数来自 boot/cmdline.c，而 compressed/cmdline.c 中只是定义了 wrapper 函数和 helper 函数(set_fs, rdfs8)。来看 boot/cmdline.c 中的核心函数 __cmdline_find_option_bool：
+
+	/* 仅关注 fs/gs 相关代码 */
+	int __cmdline_find_option_bool(unsigned long cmdline_ptr, const char *option)
+	{
+		addr_t cptr;
+		...
+
+		/* 此函数既运行在 real mode, 也运行在 protect mode/long mode，两种情况分别分析。
+		 * 入参 cmdline_ptr 是 command line 在 RAM 中的线性(物理)地址。
+		 *
+		 * 1. 作为 setup 的代码运行在 real mode
+		 * 线性(即物理)地址的计算方式：linear address = segment base << 4 + offset,
+		 * 第一行开始没想明白，后来逆向思考明白了，这两行代码后，按照 real mode 计算地址
+		 * 的方式，fs << 4 + cptr = cmdline_ptr
+		 *
+		 * 2. 作为 ZO 运行在 protect mode/long mode
+		 * 这个情况略复杂，因为地址计算方式不一样，此时的所有 segment base 都是 0。所以
+		 * compressed/cmdline.c 定义了自己的 set_fs 和 rdfs8，代替 boot/ 中的。看
+		 * 定义，便明白了。
+		 */
+		cptr = cmdline_ptr & 0xf;
+		set_fs(cmdline_ptr >> 4);
+
+		/* real mode 下，segment 的 size 是固定的 64k = 0x10000 */
+		while (cptr < 0x10000) {
+			c = rdfs8(cptr++);
+			...
+		}
+
+		return 0;
+	}
+
+	/* compressed/cmdline.c */
+	static unsigned long fs;
+	static inline void set_fs(unsigned long seg)
+	{
+		fs = seg << 4;  /* shift it back */
+	}
+
+	typedef unsigned long addr_t;
+	static inline char rdfs8(addr_t addr)
+	{
+		return *((char *)(fs + addr));
+	}
+
 #### extract_kernel:
 
 如上文所述，extract_kernel 函数的内容复杂，涉及 kaslr 处理，elf 解析，重定位处理，本节将逐个进行分析。
@@ -3815,6 +3876,7 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 					  unsigned char *output,
 					  unsigned long output_len)
 	{
+		/* VO 的 memory image size, 包括了 .bss, .brk section */
 		const unsigned long kernel_total_size = VO__end - VO__text;
 		unsigned long virt_addr = LOAD_PHYSICAL_ADDR;
 
@@ -3873,8 +3935,11 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 	#endif
 
 	#ifndef CONFIG_RELOCATABLE
-		/* 无 KASLR 时，VO 的运行(解压缩)地址是 LOAD_PHYSICAL_ADDR，在 head_64.S 中
-		 * enforced. 因为是 identity mapping，虚拟地址(线性地址) = 物理地址 */
+		/* 无 CONFIG_RELOCATABLE 时，是解压缩 buffer 的地址(也即 VO 的运行物理地址)是
+		 * LOAD_PHYSICAL_ADDR，在 head_64.S 中 enforced. 如果是非 relocatable 的
+		 * ZO
+		 * Tip: CONFIG_RELOCATABLE 仅影响解压 buffer 的地址，即 VO 的物理地址。
+		 */
 		if ((unsigned long)output != LOAD_PHYSICAL_ADDR)
 			error("Destination address does not match LOAD_PHYSICAL_ADDR");
 		if (virt_addr != LOAD_PHYSICAL_ADDR)
@@ -3960,10 +4025,21 @@ KASLR 的处理入口是 choose_random_location(), 选择随机的物理地址�
 		}
 
 		/* Pick random virtual address starting from LOAD_PHYSICAL_ADDR. */
-		/* 看起来虚拟地址的初始选择范围是 (0, KERNEL_IMAGE_SIZE), 然后以 LOAD_PHYSICAL_ADDR
-		 * 对齐到 CONFIG_PHYSICAL_ALIGN 后的值作为 minimum, 也就是说，选择范围被优化为
-		 * (minimum, KERNEL_IMAGE_SIZE), 以 CONFIG_PHYSICAL_ALIGN 为 slot size
-		 * 单位，同样产生一个随即数，从 minimum 开始选择一个 slot 起始地址作为虚拟地址
+		/* "真正"看懂此函数是需要背景知识的。VO 的链接起始地址(在 linker script 中)是：
+		 *
+		 *     __START_KERNEL_map + LOAD_PHYSICAL_ADDR
+		 *
+		 * 根据 Documentation/x86/x86_64/mm.txt 可知，分配给 VO 的虚拟地址范围起始于
+		 * __START_KERNEL_map. 综上所述，此函数所描述的虚拟地址随机化其实是 base on
+		 * __START_KERNEL_map 的，但代码上省略了这一描述。所以初看感觉虚拟地址的的选择
+		 * 范围是 (LOAD_PHYSICAL_ADDR, KERNEL_IMAGE_SIZE)，会觉得很奇怪，实际是基于
+		 * 地址 __START_KERNEL_map 的。
+		 * Base on 分配给 VO 的地址 __START_KERNEL_map, 随机化后的虚拟地址选择范围
+		 * 大约是：(LOAD_PHYSICAL_ADDR, KERNEL_IMAGE_SIZE - VO image size), 以
+		 * CONFIG_PHYSICAL_ALIGN 为 slot size 单位，同样产生一个随即数，选择一个 slot
+		 * 作为起始虚拟地址. 由此可见，随机化前后，虚拟地址的 delta 相对是比较小的，不会
+		 * 超过 (KERNEL_IMAGE_SIZE - VO image size).
+		 * 理解了这一点，对看懂 handle_relocations 将很有帮助
 		 */
 		if (IS_ENABLED(CONFIG_X86_64))
 			random_addr = find_random_virt_addr(LOAD_PHYSICAL_ADDR, output_size);
@@ -3973,9 +4049,9 @@ KASLR 的处理入口是 choose_random_location(), 选择随机的物理地址�
 	/* 此函数注释非常长，省略，在代码中查看。
 	 *
 	 * 之前发了个错误的 patch： https://lore.kernel.org/patchwork/patch/1037742/，
-	 * 因为混淆了 input_size 和 ZO image(decompressor) size! input_size 只是压缩
-	 * 文件的 size, 即 .rodata..compressed section 的 size; 而 ZO image 包含
-	 * .rodata..compressed(ZO) 和其他 sections!
+	 * 因为混淆了 input_size 和 ZO memory image size! input_size 只是压缩文件的
+	 * size, 即 .rodata..compressed section 的 size; 而 ZO memory image 包含
+	 * .rodata..compressed 和其他所有 sections!
 	 *
 	 * 另发现：.bss 和 .pgtable section 都不占据文件空间。.bss 无需解释，而 .pgtable
 	 * 在 head_64.S 中使用 .section directive 定义时使用了 section type: nobits,
@@ -4276,19 +4352,273 @@ linux kernel 页表实现了一套兼容所有 paging mode 的数据结构。5-l
  7. https://lwn.net/Articles/717293/
  8. https://lwn.net/Articles/117749/
 
-完成 kaslr 处理后，做 ELF 解析，入口函数是 parse_elf：
+终于结束 kaslr 的代码分析，总结一下结果，随机选择了解压物理地址 & 虚拟地址, 两个地址都是 CONFIG_PHYSICAL_ALIGN 对齐的，虚拟地址范围是(LOAD_PHYSICAL_ADDR, KERNEL_IMAGE_SIZE), 物理地址范围是 (min(ZO加载地址, 512M), memory 上限). kaslr 后，便对 decompressed kernel(VO) 做 ELF 解析，即函数 parse_elf：
 
+	/* VO 是 elf 格式，所以先 validate ELF header. 然后根据 ELF program header 的
+	 * indication 加载 VO 中的 segment. 看后半段函数需要熟悉 ELF 格式. */
 	static void parse_elf(void *output)
 	{
-		// TBD
+	#ifdef CONFIG_X86_64
+		Elf64_Ehdr ehdr;
+		Elf64_Phdr *phdrs, *phdr;
+	#else
+		Elf32_Ehdr ehdr;
+		Elf32_Phdr *phdrs, *phdr;
+	#endif
+		void *dest;
+		int i;
+
+		memcpy(&ehdr, output, sizeof(ehdr));
+		if (ehdr.e_ident[EI_MAG0] != ELFMAG0 ||
+		   ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
+		   ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
+		   ehdr.e_ident[EI_MAG3] != ELFMAG3) {
+			error("Kernel is not a valid ELF file");
+			return;
+		}
+
+		debug_putstr("Parsing ELF... ");
+
+		phdrs = malloc(sizeof(*phdrs) * ehdr.e_phnum);
+		if (!phdrs)
+			error("Failed to allocate space for phdrs");
+
+		memcpy(phdrs, output + ehdr.e_phoff, sizeof(*phdrs) * ehdr.e_phnum);
+
+		for (i = 0; i < ehdr.e_phnum; i++) {
+			phdr = &phdrs[i];
+
+			switch (phdr->p_type) {
+			case PT_LOAD:
+	#ifdef CONFIG_X86_64
+				/* 为什么 p_align 需要 2M 对齐?
+				 * man elf 中定义：p_align 的值应是 integral power of two. segment
+				 * 在文件中的偏移 p_offset 和虚拟地址 p_vaddr 应对齐到 p_align, 而
+				 * p_align 应该对齐到 page size. 所以问题变成，链接时，linker 怎么知道
+				 * page size 是多少？ 答案在 arch/x86/Makefile 中的链接选项:
+				 * "-z max-page-size=0x200000", 同时参考 MAXPAGESIZE of `info ld`.
+				 * 看来 linker 中每个 arch 有 default max page size, 但我们可以修改它.
+				 */
+				if ((phdr->p_align % 0x200000) != 0)
+					error("Alignment of LOAD segment isn't multiple of 2MB");
+	#endif
+
+	#ifdef CONFIG_RELOCATABLE
+				dest = output;
+				dest += (phdr->p_paddr - LOAD_PHYSICAL_ADDR);
+	#else
+				dest = (void *)(phdr->p_paddr);
+	#endif
+				/* 按照 program header 中 p_paddr 的指示, load 各 segment 到其希望
+				 * 的地址.*/
+				memmove(dest, output + phdr->p_offset, phdr->p_filesz);
+				break;
+			default: /* Ignore other PT_* */ break;
+			}//switch
+		}//for
+
+		free(phdrs);
 	}
 
-然后是重定位处理，入口函数是 handle_relocations:
+参考: [change alignment of code segment in elf](https://stackoverflow.com/questions/33005638/how-to-change-alignment-of-code-segment-in-elf)
+
+然后是重定位处理(handle_relocations), 因为默认情况下压缩数据中有 vmlinux.relocs 文件, 它的产生定义在 arch/x86/boot/compressed/Makefile： arch/x86/tools/relocs 处理 vmlinux(VO) 得到. handle_relocations 函数专为处理 vmlinux.relocs 中的数据而存在. 但为什么默认会生成 vmlinux.relocs? 是时候对这个故事的来龙去脉做一下梳理:
+
+>KASLR 特性的开启，导致 VO 的虚拟地址也被随机化，所以 VO 编译时使用的虚拟地址已不再有效，对于原编译链接时 relocation 的位置，需要 base on 随机化的新虚拟地址对 VO 再次 relocate，那就需要保留辅助 relocation 的信息，即各 .o 文件中的 relocation section, 用于 KASLR 后的再次 relocation 用。
+
+背景已经知道，第一件事是保留 relocation 信息，如何保留？查看 vmlinux 的 section header 信息，发现有很多 .rela section, 说明 relocation 信息被保留下来了。本来 vmlinux 是完全链接(relocate)过的可执行文件，不会存在 .rela section, vmlinux 中的 .relaXXX section 是怎么来的？ 查看 arch/x86/Makefile 发现代码：
+
+	ifdef CONFIG_X86_NEED_RELOCS
+		LDFLAGS_vmlinux := --emit-relocs
+	endif
+
+CONFIG_X86_NEED_RELOCS 仅在 CONFIG_RANDOMIZE_BASE(kaslr) 开启时才打开，且不可配置，即 `make menuconfig` 时找不到 CONFIG_X86_NEED_RELOCS. `man ld` 中对 “--emit-relocs” 的解释：
+
+>Leave relocation sections and contents in fully linked executables.  Post link analysis and optimization tools may need this information in order to perform correct modifications of executables.  This results in larger executables.
+
+这下明白了。relocation 信息保存在 relocaton section 中，在 `man elf` 中有描述，被表示为 relocation entry，其中的 r_offset 字段是我们关心的重点，它表示需要进行 relocation 的具体位置，其解释如下：
+
+>For a relocatable file, the value is the byte offset from the beginning of the section to the storage unit affected by the relocation.  For an executable file or shared object, the value is the virtual address of the storage unit affected by the relocation.
+
+有了所有这些背景知识，再来从头看代码。首先分析工具 relocs，代码不算难，熟悉 ELF 文件格式的话比较容易阅读。总的来说：relocs 工具读取 vmlinux 文件中的所有 section，过滤出 relocation section，将所有 relocation entry 中的 r_offset 字段数据保留下来，输出到 vmlinux.relocs 文件，用于后续 KASLR 的 relocation processing 使用。
+
+relocs 的大部分代码比较普通，没有难度，分析一下部分比较 tricky 的代码：
+
+	static int do_reloc64(struct section *sec, Elf_Rel *rel, ElfW(Sym) *sym,
+		      const char *symname)
+	{
+		unsigned r_type = ELF64_R_TYPE(rel->r_info);
+		/* 这里 offset 指 VO 中发生重定位的虚拟地址处 */
+		ElfW(Addr) offset = rel->r_offset;
+		...
+
+		/*
+		 * Adjust the offset if this reloc applies to the percpu section.
+		 * percpu section 还不理解，待分析。
+		 */
+		if (sec->shdr.sh_info == per_cpu_shndx)
+			offset += per_cpu_load_addr;
+
+		switch (r_type) {
+		case ...
+
+		case R_X86_64_32:
+		case R_X86_64_32S:
+		case R_X86_64_64:
+			...
+			/*
+			 * Relocation offsets for 64 bit kernels are output
+			 * as 32 bits and sign extended back to 64 bits when
+			 * the relocations are processed.
+			 * Make sure that the offset will fit.
+			 */
+			/* 没有背景知识的话，很难理解上面的 comments. 查看 VO 的 linker script
+			 * arch/x86/kernel/vmlinux.lds.S 和 Documentation/x86/x86_64/mm.txt
+			 * 可知, x86_64 下，VO(kernel) 的虚拟地址被安排在 ffffffff80000000 起始
+			 * 的范围(__START_KERNEL_map), 除了 .data..percpu section 的虚拟地址从 0
+			 * 开始, 而 .data..percpu section 的 size 很小(0x23000 bytes 在我的环境)。
+			 * 所以 r_offset 的值只可能有 2 种样子: 0xffffffff 8xxxxxxx 或
+			 * 0x00000000 000xxxxx, 这样的话，我们可以只保存它的低 32 bits，使用的时候
+			 * 在 sign extended back to 64 bits. 之前理解困难，是因为最基础的知识欠缺：
+			 * 有符号整数的扩展. 比如: 将 32 bits 负数 -249346713(0xF1234567) sign
+			 * extend 到 64 bits 是 0xFFFFFFFF F1234567.
+			 * 对 offset 的 if 判断，就是保证 address form 是上述的样子，只有这样的
+			 * address 才能安全 sign extend back 而数值不会改变.
+			 * 这 3 种 relocation type 的地址计算方式都是 S(symbol value) + A(addend),
+			 * 即直接在需要 relocation 的位置填入 reference 的目标符号的地址即可
+			 * */
+			if ((int32_t)offset != (int64_t)offset)
+				die("Relocation offset doesn't fit in 32 bits\n");
+
+			if (r_type == R_X86_64_64)
+				add_reloc(&relocs64, offset);
+			else
+				add_reloc(&relocs32, offset);
+			break;
+		}
+
+		return 0;
+	}
+
+Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是 (S + A)的 relocation entry 的 r_offset(relocation 发生的地址) 字段保存到 vmlinux.relocs 文件. 可想而知，若虚拟地址被 KASLR 随机化，原来 relocation 位置中的符号地址，要根据随机化后的新地址相应的更新，这就是 handle_relocations 函数要做的事情。理解这个函数的细节，需要了解一个**很重要的逻辑**: 不管是从 vmlinux 的加载(物理)地址，还是链接的虚拟地址，还是 vmlinux 文件偏移看，relocation 的位置相对起始点的 offset 是不变的，即: relocation 的 file offset = relocation 的物理地址 - vmlinux 物理起始地址 = relocation 的虚拟地址 - vmlinux 的虚拟起始地址。
+
+理解了上述逻辑，就容易理解 *handle_relocations* 了：
 
 	#if CONFIG_X86_NEED_RELOCS
 	static void handle_relocations(void *output, unsigned long output_len,
 				       unsigned long virt_addr)
 	{
+		int *reloc;
+		unsigned long delta, map, ptr;
+		unsigned long min_addr = (unsigned long)output;
+		unsigned long max_addr = min_addr + (VO___bss_start - VO__text);
+
+		/* 局部变量 min_addr/max_addr 的含义： VO 中做 relocation 的位置必须在 VO 的
+		 * file image 范围内，从代码来看就是 VO 解压地址到 .bss section 之前. 这也是本
+		 * 函数的核心内容：根据已知信息，找到 VO memory image 中需要 relocation 的物理
+		 * 地址, 将原虚拟地址和新虚拟地址的 delta, apply 到 relocation 发生的位置.
+		 */
+
+		/*
+		 * Calculate the delta between where vmlinux was linked to load
+		 * and where it was actually loaded.
+		 */
+		delta = min_addr - LOAD_PHYSICAL_ADDR;
+
+		/*
+		 * The kernel contains a table of relocation addresses. Those
+		 * addresses have the final load address of the kernel in virtual
+		 * memory. We are currently working in the self map. So we need to
+		 * create an adjustment for kernel memory addresses to the self map.
+		 * This will involve subtracting out the base address of the kernel.
+		 */
+		/* map 很大概率是个负值。是 VO 物理地址范围中中*/
+		map = delta - __START_KERNEL_map;
+
+		/*
+		 * 32-bit always performs relocations. 64-bit relocations are only
+		 * needed if KASLR has chosen a different starting address offset
+		 * from __START_KERNEL_map.
+		 */
+		if (IS_ENABLED(CONFIG_X86_64))
+			delta = virt_addr - LOAD_PHYSICAL_ADDR;
+
+		if (!delta) {
+			debug_putstr("No relocation needed... ");
+			return;
+		}
+		debug_putstr("Performing relocations... ");
+
+		/* 上面几个变量的算术运算，单独看的话理解有困难，不妨结合下面的代码展开：
+		 *
+		 * extended = extended(虚拟地址) + map
+		 * 			= extended(虚拟地址) + delta - __START_KERNEL_map
+		 * 			= extended(虚拟地址) + min_addr - LOAD_PHYSICAL_ADDR - __START_KERNEL_map
+		 *
+		 * 注：等式左边的 extended 是待求值的重定位物理地址；右边的 extended 是 relocation
+		 * entry 中的原重定位的虚拟地址；(LOAD_PHYSICAL_ADDR - __START_KERNEL_map) 是
+		 * VO 的链接起始虚拟地址，extended 减去它便得到上面说的 offset; 将不变的 offset
+		 * 加到 VO 的物理地址 min_addr 上，便得到 VO 的 memory image 中需要做 relocation
+		 * 的地址。
+		 */
+
+		/*
+		 * Process relocations: 32 bit relocations first then 64 bit after.
+		 * Three sets of binary relocations are added to the end of the kernel
+		 * before compression. Each relocation table entry is the kernel
+		 * address of the location which needs to be updated stored as a
+		 * 32-bit value which is sign extended to 64 bits.
+		 *
+		 * Format is:
+		 *
+		 * kernel bits...
+		 * 0 - zero terminator for 64 bit relocations
+		 * 64 bit relocation repeated
+		 * 0 - zero terminator for inverse 32 bit relocations
+		 * 32 bit inverse relocation repeated
+		 * 0 - zero terminator for 32 bit relocations
+		 * 32 bit relocation repeated
+		 *
+		 * So we work backwards from the end of the decompressed image.
+		 */
+		for (reloc = output + output_len - sizeof(*reloc); *reloc; reloc--) {
+			long extended = *reloc; /* sign extend back 得到完整的重定位地址 */
+			extended += map; /* 获得要做 relocation 的物理地址 */
+
+			/* relocation 的物理地址必须在 VO 的加载物理地址范围内 */
+			ptr = (unsigned long)extended;
+			if (ptr < min_addr || ptr > max_addr)
+				error("32-bit relocation outside of kernel!\n");
+
+			/* 物理地址处的内容是引用的符号的链接时绝对(虚拟)地址，加上随机化后虚拟地址的
+			 * delta 即得到符号的新虚拟地址。处理 32 bit relocation，所以是 uint32_t.
+			 */
+			*(uint32_t *)ptr += delta;
+		}
+	#ifdef CONFIG_X86_64
+		while (*--reloc) {
+			long extended = *reloc;
+			extended += map;
+
+			ptr = (unsigned long)extended;
+			if (ptr < min_addr || ptr > max_addr)
+				error("inverse 32-bit relocation outside of kernel!\n");
+
+			*(int32_t *)ptr -= delta;
+		}
+		for (reloc--; *reloc; reloc--) {
+			long extended = *reloc;
+			extended += map;
+
+			ptr = (unsigned long)extended;
+			if (ptr < min_addr || ptr > max_addr)
+				error("64-bit relocation outside of kernel!\n");
+
+			*(uint64_t *)ptr += delta;
+		}
+	#endif
+}
+
 	}
 	#endif
 
@@ -4337,58 +4667,6 @@ memset() 的情况引出了 [patch](https://lkml.org/lkml/2019/1/7/60)。x86 mai
 	$(obj)/pgtable_64.o: KBUILD_CFLAGS += -mstringop-strategy=libcall
 
 后编译，观察 kaslr.o 和 pgtable_64.o 的 nm 输出，并 `grep mem*`，就可确认编译选项生效，与 hack 之前的结果相反，符合预期。
-
-#### command line parsing under x86/boot
-
-此节的存在，来自分析 paging_prepare->cmdline_find_option_bool 时遇到的小困惑。command line 解析在 boot/ 和 compressed/ 目录下都会用到，在 boot/ 目录遇到时并没细看，但来到 compressed/ 后，就有了一些小困惑：fs/gs 寄存器的使用问题，本节旨在解释 fs/gs 使用在 boot/ 和 compressed/ 下的差异，并非 parsing 本身。So, let's go~
-
-command line parsing 在 compressed/ 中第一次出现如上所述：paging_prepare->cmdline_find_option_bool("no5lvl")。compressed/cmdline.c 中 #include 了 boot/ 下的 cmdline.c，所以实际使用的核心函数来自 boot/cmdline.c，而 compressed/cmdline.c 中只是定义了 wrapper 函数和 helper 函数(set_fs, rdfs8)。来看 boot/cmdline.c 中的核心函数 __cmdline_find_option_bool：
-
-	/* 仅关注 fs/gs 相关代码 */
-	int __cmdline_find_option_bool(unsigned long cmdline_ptr, const char *option)
-	{
-		addr_t cptr;
-		...
-
-		/* 此函数既运行在 real mode, 也运行在 protect mode/long mode，两种情况分别分析。
-		 * 入参 cmdline_ptr 是 command line 在 RAM 中的线性(物理)地址。
-		 *
-		 * 1. 作为 setup 的代码运行在 real mode
-		 * 线性(即物理)地址的计算方式：linear address = segment base << 4 + offset,
-		 * 第一行开始没想明白，后来逆向思考明白了，这两行代码后，按照 real mode 计算地址
-		 * 的方式，fs << 4 + cptr = cmdline_ptr
-		 *
-		 * 2. 作为 decompressor 运行在 protect mode/long mode
-		 * 这个情况略复杂，因为地址计算方式不一样，此时的所有 segment base 都是 0。所以
-		 * compressed/cmdline.c 定义了自己的 set_fs 和 rdfs8，代替 boot/ 中的。看
-		 * 定义，便明白了。
-		 */
-		cptr = cmdline_ptr & 0xf;
-		set_fs(cmdline_ptr >> 4);
-
-		/* real mode 下，segment 的 size 是固定的 64k = 0x10000 */
-		while (cptr < 0x10000) {
-			c = rdfs8(cptr++);
-			...
-		}
-
-		return 0;
-	}
-
-	/* compressed/cmdline.c */
-	static unsigned long fs;
-	static inline void set_fs(unsigned long seg)
-	{
-		fs = seg << 4;  /* shift it back */
-	}
-
-	typedef unsigned long addr_t;
-	static inline char rdfs8(addr_t addr)
-	{
-		return *((char *)(fs + addr));
-	}
-
-
 
 #### VO/ZO
 
@@ -4562,6 +4840,9 @@ arch/x86/boot/zoffset.h 由 arch/x86/boot/Makefile 定义：
 	#endif
 
 现在回头看 Documentation/x86/boot.txt 中 init_size 的定义，也发现开始 make sense 了。可以不用纠结 INIT_SIZE 的计算过程，只需要知道需要这么一块 memory 作 buffer，来 in-place decompression, 这块 memory 的起始地址是 kernel 的 runtime start address。
+
+github 上电子书 《Linux Inside》 有一个 [issue](https://github.com/0xAX/linux-insides/issues/597), 虽然提问内容不太对, 但还是触发了一个问题(我猜很少人会想到)：解压缩完毕后，会使用 `jmp	*%rax` 跳到 VO 中执行，这条指令 jmp 不会覆盖吗? 这个问题需要结合多个 facts：上面的实例数据，更上面的 bzImage file layout 图示，代码细节。buffer size 是 ~30.4M; 解压数据中 VO memory size 是 ～26.5M, vmlinux.relocs 是 ～0.8M, 总计 ~27.3M; ZO memory size 是 ～7.9M, 几乎全被 .rodata..compressed(压缩数据占据)，紧贴 buffer 底部摆放，重点是！解压代码(extract_kernel) 和 label: relocated 都位于 .text(这点不容易注意到)，在 .rodata..compressed 之后,  .head.text 和 .rodata..compressed 部分空间会被覆盖, .text 不会被解压数据覆盖，所以 jmp 指令不会被覆盖.
+
 
 #### linker script
 
