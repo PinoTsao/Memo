@@ -1,0 +1,73 @@
+Early page table mapping
+------------------------
+
+Shows mapping relation in vmlinux early page table before x86_64_start_kernel.
+Not taking CONFIG_RELOCATABLE & CONFIG_RANDOMIZE_BASE(KASLR) into
+consideration.
+
+From left to right, top to down, the pages illustrated is adjacent in memory.
+
+
+
+                                              +--->early_dynamic_pgts+-----+-->+-------------------+
+                                              |    (64 x 4k)               |   |                   |                      vmlinux memory image-----+
+                                              |                            |   |                   |                        physical address       |
+                                              |  +-------------------------+   |                   |                                               v
+                                              |  |                             |                   |                                               +------------------------+
+                                              |  |                             +- - - - - - - - - -+                     +------------------------>| 2M physical page frame |<---------+
+                                              |  |                           j | identity mapping  |---------+           |                         +- - - - - - - - - - - --+          |
+                                              |  |                             +- - - - - - - - - -+         |           |  +--------------------->| 2M physical page frame |<--------------+
+                                              |  |                       j + 1 | Encrypt in Place  |----+    |           |  |                      +- - - - - - - - - - - --+          |    |
+                                              |  |                             +- - - - - - - - - -+    |    |           |  |                      | 2M physical page frame |          |    |
+                                              |  |                             |                   |    |    |           |  |                      +- - - - - - - - - - - --+          |    |
+                                              |  |                             |                   |    |    |           |  |                      | ...                    |          |    |
+                                              |  |   early_dynamic_pgts + 4k-->+-------------------+<---+----+           |  |                      | ...                    |          |    |
+                                              |  |                             | empty entries     |                     |  |                      |                        |          |    |
+                                              |  |                             | caused by         |                     |  |                      |                        |          |    |
+      early_top_pgt--->+-------------------+  |  |                             | identity mapping  |                     |  |                      |                        |          |    |
+                       |                   |  |  |                             +- - - - - - - - - -+                     |  |                      |                        |          |    |
+                       |                   |  |  |                             | mapping 2M page   |---------------------+  |                      |                        |          |    |
+                       |                   |  |  |                             +- - - - - - - - - -+                        |                      |                        |          |    |
+                       |                   |  |  |                             | mapping 2M page   |------------------------+                      |                        |          |    |
+                       +- - - - - - - - - -+  |  |                             +- - - - - - - - - -+                                               |                        |          |    |
+                     i | identity mapping  |--+  |                             |                   |                                               |                        |          |    |
+                       +- - - - - - - - - -+     |                             |                   |                                               |                        |          |    |
+                 i + 1 | Encrypt in Place  |-----+   early_dynamic_pgts + 8k-->+-------------------+                                               |                        |          |    |
+                       +- - - - - - - - - -+                                   |                   |                                               |                        |          |    |
+                       |                   |                                   |                   |                                               |                        |          |    |
+                       |                   |                                   |                   |                                               +------------------------+          |    |
+                       |                   |                                   |                   |                                                                                   |    |
+                       |                   |    early_dynamic_pgts + 64 x 4k-->+-------------------+                                                                                   |    |
+                       |                   |                                                                                                                                           |    |
+                       |                   |                 init_top_pgt--->+-------------------+                                                                                     |    |
+                       |                   |                 (4k bytes)      |                   |                                                                                     |    |
+                       |                   |                                 |                   |  +---->level2_kernel_pgt---->+-----------------+                                    |    |
+                       |                   |                                 |                   |  |     (4k bytes)            | entries not     | Because                            |    |
+                       |                   |                                 |                   |  |                           | mapping vmlinux | ALIGN(CONFIG_PHYSICAL_START,       |    |
+                       |                   |                                 |                   |  |                           |                 |       CONFIG_PHYSICAL_ALIGN)       |    |
+                       +- - - - - - - - - -+                                 |                   |  |                           +- - - - - - - - -+                                    |    |
+                   511 | level3_kernel_pgt |---+                             |                   |  |                           | mapping 2M page |------------------------------------+    |
+early_top_pgt + 4k---->+-------------------+   |                             |                   |  |                           +- - - - - - - - -+                                         |
+                                               |                             |                   |  |                           | mapping 2M page |-----------------------------------------+
+                                               |                             |                   |  |                           +- - - - - - - - -+
+                                               |                             |                   |  |                           |                 |
+                                               |                             |                   |  |                           |                 |
+                                               +------->level3_kernel_pgt--->+-------------------+  |                           |                 |   +---level1_fixmap_pgt--->+------------+
+                                                         (4k bytes)          |                   |  |                           |                 |   |    (2 x 4k bytes)      |            |
+                                                                             |                   |  |  +---level2_fixmap_pgt--->------------------+   |                        |            |
+                                                                             |                   |  |  |   (4k bytes)           |                 |   |                        |            |
+                                                                             |                   |  |  |                        |                 |   |                        |            |
+                                                                             |                   |  |  |                        |    506 empty    |   |                        |            |
+                                                                             |                   |  |  |                        |     entries     |   |                        |            |
+                                                                             |                   |  |  |                        |                 |   |                        |            |
+                                                                             |                   |  |  |                        |                 |   |                        |            |
+                                                                             +- - - - - - - - - -+  |  |                        |                 |   |   +------------------->-------------+
+                                                                         510 | level2_kernel_pgt |--+  |                        +- - - - - - - - -+   |   |                    |            |
+                                                                             +- - - - - - - - - -+     |                    506 |                 |---+   |                    |            |
+                                                                         511 | level2_fixmap_pgt |-----+                        +- - - - - - - - -+       |                    |            |
+                                                                             +-------------------+                          507 |                 |-------+                    |            |
+                                                                                                                                +- - - - - - - - -+                            |            |
+                                                                                                                                | 4 empty entries |                            |            |
+                                                                                                      level2_fixmap_pgt + 4k--->+-----------------+                            |            |
+                                                                                                                                                                               +------------+
+
