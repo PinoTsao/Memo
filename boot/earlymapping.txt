@@ -5,11 +5,11 @@ Shows mapping relation in vmlinux early page table before x86_64_start_kernel.
 Not taking CONFIG_RELOCATABLE & CONFIG_RANDOMIZE_BASE(KASLR) into
 consideration.
 
-From left to right, top to down, the pages illustrated is adjacent in memory.
+From left to right, top to down, the pages illustrated are adjacent in memory.
 
 
 
-                                              +--->early_dynamic_pgts+-----+-->+-------------------+
+                                              +--->early_dynamic_pgts------+-->+-------------------+
                                               |    (64 x 4k)               |   |                   |                      vmlinux memory image-----+
                                               |                            |   |                   |                        physical address       |
                                               |  +-------------------------+   |                   |                                               v
@@ -30,7 +30,7 @@ From left to right, top to down, the pages illustrated is adjacent in memory.
                        |                   |  |  |                             +- - - - - - - - - -+                        |                      |                        |          |    |
                        |                   |  |  |                             | mapping 2M page   |------------------------+                      |                        |          |    |
                        +- - - - - - - - - -+  |  |                             +- - - - - - - - - -+                                               |                        |          |    |
-                     i | identity mapping  |--+  |                             |                   |                                               |                        |          |    |
+                     i | identity mapping  |--+  |                             | ...               |                                               |                        |          |    |
                        +- - - - - - - - - -+     |                             |                   |                                               |                        |          |    |
                  i + 1 | Encrypt in Place  |-----+   early_dynamic_pgts + 8k-->+-------------------+                                               |                        |          |    |
                        +- - - - - - - - - -+                                   |                   |                                               |                        |          |    |
@@ -41,7 +41,7 @@ From left to right, top to down, the pages illustrated is adjacent in memory.
                        |                   |                                                                                                                                           |    |
                        |                   |                 init_top_pgt--->+-------------------+                                                                                     |    |
                        |                   |                 (4k bytes)      |                   |                                                                                     |    |
-                       |                   |                                 |                   |  +---->level2_kernel_pgt---->+-----------------+                                    |    |
+                       |                   |                                 |                   |  +-----level2_kernel_pgt---->+-----------------+                                    |    |
                        |                   |                                 |                   |  |     (4k bytes)            | entries not     | Because                            |    |
                        |                   |                                 |                   |  |                           | mapping vmlinux | ALIGN(CONFIG_PHYSICAL_START,       |    |
                        |                   |                                 |                   |  |                           |                 |       CONFIG_PHYSICAL_ALIGN)       |    |
@@ -50,7 +50,7 @@ From left to right, top to down, the pages illustrated is adjacent in memory.
 early_top_pgt + 4k---->+-------------------+   |                             |                   |  |                           +- - - - - - - - -+                                         |
                                                |                             |                   |  |                           | mapping 2M page |-----------------------------------------+
                                                |                             |                   |  |                           +- - - - - - - - -+
-                                               |                             |                   |  |                           |                 |
+                                               |                             |                   |  |                           | ...             |
                                                |                             |                   |  |                           |                 |
                                                +------->level3_kernel_pgt--->+-------------------+  |                           |                 |   +---level1_fixmap_pgt--->+------------+
                                                          (4k bytes)          |                   |  |                           |                 |   |    (2 x 4k bytes)      |            |
