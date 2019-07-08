@@ -5207,7 +5207,9 @@ INIT_PER_CPU(irq_stack_union);
 #endif /* CONFIG_X86_32 */
 ```
 
-### .head.text
+### before start_kernel
+
+**start_kernel** 是一个很有名的函数，其中包含真正的 kernel 初始化，即各子系统的初始化。在它之前，依然是各种准备工作。
 
 由上一节的 linker script 可知，output section ".text" 最开头的 input section 是 .head.text, 说明它位于 VO image 的开头，这是有意而为。.head.text section 的内容只在两个文件中: arch/x86/kernel/head_64.S & arch/x86/kernel/head64.c, 但这两个文件的内容不仅属于它.
 
@@ -5619,8 +5621,8 @@ ENTRY(phys_base)
 	 *   VMA: [0xffffffff80000000 + offset -- KERNEL_IMAGE_SIZE]
 	 *   LMA: [0                  + offset -- KERNEL_IMAGE_SIZE]
 	 *
-	 * KERNEL_IMAGE_SIZE = 512M or 1G(KASLR);
-	 * offset = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)
+	 *   KERNEL_IMAGE_SIZE = 512M or 1G(KASLR);
+	 *   offset = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)
 	 *
 	 * level2_kernel_pgt 可映射 1G 空间, 且是按照上述 VMA -> LMA 的关系进行映射，所以
 	 * 第一个 entry 映射物理地址 0; C 函数 __startup_64 将通过将物理地址的 load_delta
@@ -5911,7 +5913,7 @@ ffffffff8100022f:       4c 8d 83 00 80 79 82    lea    -0x7d868000(%rbx),%r8
   - little-endian 将 number "82798000" 表示为 "00 80 79 82";
   - R_X86_64_32S 的 S 表示 sign extended, 所以 "82798000" 实际被 sign extended 为 "ffffffff82798000".
 
-是时候回答上文埋下的问题了：无论是 relocatable 带来的物理地址随机化，还是 kaslr 带来的物理/虚拟双随机化，其符号引用问题都在 __startup_64 函数 fix 页表时被 fix. 上面的分析 cover 了 relocatable kernel(仅物理地址发生变化) 的情况，没有 involve 虚拟地址随机化. KASLR 引入的虚拟地址随机化使得细节变得复杂，针对 kaslr 的情况再次分析 __startup_64：
+是时候回答上文埋下的问题了：无论是 relocatable 带来的物理地址随机化，还是 kaslr 带来的物理/虚拟双随机化，其符号引用问题都在 __startup_64 函数 fix 页表时被 fix. 上面的分析 cover 了 relocatable kernel(仅物理地址发生变化) 的情况，没有 involve 虚拟地址随机化. KASLR 引入的虚拟地址随机化使得细节变得复杂，针对虚拟地址被随机化的情况再次分析 __startup_64：
 
 ```
 /* 将 KASLR 后的物理地址和虚拟地址的差值分别命名为 p_delta, v_delta, 与 linker script
@@ -6008,6 +6010,7 @@ unsigned long __head __startup_64(unsigned long physaddr,
 
 看到这里，可以回到上文 head_64.S 中继续分析了。Not long from now, head_64.S 会跳到 x86_64_start_kernel 执行：
 
+
 ```
 asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 {
@@ -6050,8 +6053,11 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 
 	kasan_early_init();
 
+	/* 值的单独一节进行分析，见下文："Task Management in x86" 和 “Early Interrupt
+	 * Initialization” */
 	idt_setup_early_handler();
 
+	/* 有趣的 __va, 入参是符号的物理地址，下文单独分析 */
 	copy_bootdata(__va(real_mode_data));
 
 	/*
@@ -6065,7 +6071,36 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	x86_64_start_reservations(real_mode_data);
 }
 ```
-在 ZO 中也看到 BUILD_BUG_ON 的定义, 但 VO 中的实现不同，VO 中的实现才是正宗的，来详细看看
+__va() 分析：
+```
+/* 入参是物理地址 */
+#define __va(x)			((void *)((unsigned long)(x) + PAGE_OFFSET))
+
+#define PAGE_OFFSET		((unsigned long)__PAGE_OFFSET)
+
+/* 此配置默认开启，暂不管其含义 */
+#ifdef CONFIG_DYNAMIC_MEMORY_LAYOUT
+	#define __PAGE_OFFSET           page_offset_base
+#else
+	#define __PAGE_OFFSET           __PAGE_OFFSET_BASE_L4
+#endif /* CONFIG_DYNAMIC_MEMORY_LAYOUT */
+
+#ifdef CONFIG_DYNAMIC_MEMORY_LAYOUT
+unsigned long page_offset_base __ro_after_init = __PAGE_OFFSET_BASE_L4;
+...
+#endif
+
+#define __PAGE_OFFSET_BASE_L4	_AC(0xffff888000000000, UL)
+...
+#endif
+
+代码展开后其实逻辑很简单，只是给入参物理地址加上了 0xffff888000000000 得到其虚拟地址，但
+明白其背景才是重要的。由 Documentation/x86/x86_64/mm.rst 可看出，4-level paging 时，
+[ffff888000000000, ffffc87fffffffff] 的 64TB 空间用于 direct mapping of all
+physical memory, 也就是说，虚拟地址 ffff888000000000 被映射物理地址 0.
+```
+
+在 ZO 中也看到 BUILD_BUG_ON 的定义, 但 VO 中的实现不同，VO 中的实现才是正宗的：
 
 ```
 # in include/linux/build_bug.h, 按照出境顺序列出所有相关定义
@@ -6109,9 +6144,396 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 #endif
 
 /* Refer: https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html
- * Tip: 1. 使用此 attribute 的函数，若被调用，则 break build.
+ * Tip: 1. 使用此 attribute 声明的函数，若被调用，则 break build with included message.
  *      2. it is possible to leave the function undefined */
 #define __compiletime_error(message) __attribute__((__error__(message)))
+```
+
+#### Task Management in x86
+
+为什么要莫名的插入这个 topic 呢？在学习 interrupt 基础知识的时候，分析一个中断的详细流程，不可避免的涉及到 task switch, stack switch 等等概念，这些概念都属于 task management, 关于它的详细描述在 Intel SDM 3a 的 chapter 7 整整一章中。此处仅在逻辑上梳理下概念。
+
+Intel x86 CPU 在硬件上提供了 multi-tasking 的机制，这种机制仅仅 available 在 protect mode(IA-32). IA-32 提供的 task management 机制包括保存 task state, dispatching task for execution, task switch. **当 CPU 运行在 protect mode, 所有 CPU 的运行都源于一个 task.** 虽然 X86 提供了硬件的 multi-tasking 机制，但一个 OS 也可以实现自己的 software level multi-tasking mechanism.
+
+一个 task 在概念上包括 2 部分: task execution space & task-state segment (TSS). Task execution space 指代码运行 related 的 code/data/stack segment, 还有可能包括 privilege protection mechanism 带来的 stack segment per privilege level; TSS 则是一个 memory segment, 其中描述了 task 执行所需要的所有 segment, 以及提供了保存 task state info 的空间，只能定义在 GDT 中。
+
+我们在谈论 task 时，它的身份是通过这个 task 的 TSS 的 segment selector 标识出来。一个 task 的 state，主要是它的执行上下文，也就是它执行时的所有 register value. 执行一个 task 的方式可想可知核心是通过 task gate。
+
+CPU 为了管理 task, 定义了 5 种数据结构(格式在 Intel SDM 中，不赘述)：
+
+  - Task-state segment (TSS).
+  - Task-gate descriptor.
+  - TSS descriptor.
+  - Task register.
+  - NT flag in the EFLAGS register.
+
+当 CPU 运行在 protect mode, 必须至少定义一个 TSS 及 TSS descriptor, 且 TSS 的 segment selector 必须已加载到 task register.  这几种结构之间的关系： TR --(selector)--> TSS; Task-gate descriptor --(selector)--> TSS.
+
+64-bit mode 下，task state 和 数据结构都与 protect mode 相似，但 task switching 机制不可用，task management 和 task switch 都必须在软件中执行。虽然如此，一个 64-bit 的 TSS 依然必须存在。
+
+对于我们下面中断的分析，本章节存在的最重要意义是，通过 gate 进入 interrupt/exception handler 时，stack push 的情况，这些内容不详述，需要多读 INTEL SDM.
+
+补了基础知识，来对照 kernel 代码复习一下。boot code 工作在 real mode, 跳转到 protect mode(64-bit further more) 的 ZO, 然后跳转到 64-bit 的 VO。
+
+```
+/* real mode, boot code */
+void go_to_protected_mode(void)
+{
+	...
+		/* Actual transition to protected mode... */
+	/* 此函数中定义的 GDT 中有一个 TSS，但也说明了，实际没有用，因为我们没有 privilege 的切换 */
+	setup_gdt();
+	protected_mode_jump(boot_params.hdr.code32_start,
+			    (u32)&boot_params + (ds() << 4));
+
+}
+
+/* arch/x86/boot/pmjump.S */
+
+	/* 进入 protect mode 前，准备好 TSS 的 segment selector */
+	movw	$__BOOT_TSS, %di
+	...
+
+	# Set up TR to make Intel VT happy
+	/* 进入 protect mode 后，立刻 load TR 里*/
+	ltr	%di
+```
+ZO 运行时：
+```
+/* head_64.S */
+
+	/* 进入 64-bit mode 前，加载了 64 bit 的 TSS descriptor */
+	/* After gdt is loaded */
+	xorl	%eax, %eax
+	lldt	%ax
+	movl    $__BOOT_TSS, %eax
+	ltr	%ax
+
+/* GDT 定义中有 TSS，但是 base address, limit 都是 0，看起来也没用，仅为 load TR. */
+gdt:
+	.word	gdt_end - gdt
+	.long	gdt
+	.word	0
+	.quad	0x00cf9a000000ffff	/* __KERNEL32_CS */
+	.quad	0x00af9a000000ffff	/* __KERNEL_CS */
+	.quad	0x00cf92000000ffff	/* __KERNEL_DS */
+	.quad	0x0080890000000000	/* TS descriptor */
+	.quad   0x0000000000000000	/* TS continued */
+gdt_end:
+```
+VO 的 head_64.S 中没有 ltr 操作，下文有解释。
+
+#### Early Interrupt Initialization
+
+上文分析到 `copy_bootdata(__va(real_mode_data))` 时，又有一个小问题： real_mode_data 是物理地址，代码中要 access 时须使用它的虚拟地址，走 page table，所以使用 __va 进行转换。由 Documentation/x86/x86_64/mm.rst 可知，4-level paging 时，虚拟地址 ffff888000000000 到 ffffc87fffffffff 的 64 TB 是用于 direct mapping of all physical memory (page_offset_base) 的，即物理地址 [0, 64TB) 映射虚拟地址 [ffff888000000000, ffffc87fffffffff)。但是截至 copy_bootdata 函数前，没有看到有初始化页表做这个 mapping。调查过程中忘记不小心 blame 到某个 commit 提示说, Interrupt Descriptor Table(IDT) 中的 page fault handler 会自动做这件事。原本想暂时推后中断代码的分析，看起来天不遂人愿:p
+
+中断架构是相对独立的一个系统，开始之前，有必要温故一些基础知识。中断初始化的入口是 idt_setup_early_handler, 一眼看到 set_intr_gate 函数，熟读 Intel software developer manual 的同学应该可以想到这是在说 gate descriptor, 所以我们将从它开始科普。
+
+x86 架构定义了几个 descriptor table: GDT(Global), LDT(Local), IDT. Descriptor table，顾名思义，table 中是一个个 descriptor entry. Descriptor 的基本结构参考 Intel SDM 3a "3.4.5 Segment Descriptors". 根据 descriptor 中的 S flag, 可分类为:
+
+  1. system descriptor. 包括如下几种:
+    * Local descriptor-table (LDT).
+    * Task-state segment (TSS) descriptor.
+    * Call-gate descriptor.
+    * Interrupt-gate descriptor.
+    * Trap-gate descriptor.
+    * Task-gate descriptor.
+
+  2. code or data segment descriptor
+
+system descriptor 的前 2 个描述特殊用途的 memory segment; 后 4 个叫 gate descriptor, to provide controlled access to code segments with different privilege levels(Intel SDM 3a, 5.8.2 Gate Descriptors). Gate descriptor 使用的场景跨越很大，所以它的格式定义散落在 Intel SDM 3a 中: 5.8.3 Call Gates, 6.11 IDT DESCRIPTORS, 7.2.5 Task-Gate Descriptor. 二者的区别，一眼可以看到的: segment descriptor 用于描述一个 memory segment; 而 gate descriptor 用于描述某个 code segment 中特定 procedure 的地址。
+
+跨 privilege level 的 procedure transfer, 通常是通过指令 call 或 jmp 一个 far pointer(segment selector: segment offset). 根据 far pointer 的不同，可以分为 Direct Calls or Jumps to Code Segments(Intel SDM 3a, 5.8.1), 和 call gate 两种. 两种 far pointer 的区别是： 使用 call gate 时，offset 可以随意填写，processor 不会检查，因为实际的 offset 在 gate descriptor 中。两种方式都会做 privilege level checking, 但肯定是有不同，参考 Intel SDM 3a 的:
+
+  * Figure 5-6. Privilege Check for Control Transfer Without Using a Gate
+  * Figure 5-11. Privilege Check for Control Transfer with Call Gate
+
+尤其, call gate 用于 transferring program control between 16-bit and 32-bit code segments.
+
+我个人 prefer 将 descriptor 这样分类：
+
+  1. segment descriptor: 描述一个 memory segment. 根据 descriptor 中的 S flag, 又细分为
+    * system segment: LDT & TSS
+    * code or data segment
+
+  2. gate descriptor:
+    * Call gates
+    * Trap gates
+    * Interrupt gates
+    * Task gates
+
+上面的背景知识属于 x86 architecture. 下面开始 x86 interrupt 的科普。
+
+Gate descriptor 中, Task gate 用于 multi-tasking 管理, provides an indirect, protected reference to a task; Interrupt gate & trap gate 用于 interrupt 和 exception 的处理, 二者的区别是，interrupt gate 时, processor 会 clear EFLAGS register 中的 IF flag, 屏蔽 maskable external interrupt, 避免干扰当前 handler 的执行，而 trap gate 不会 clear IF flag.
+
+IDT 可以包含三种 descriptor: Task-gate descriptor, Interrupt-gate descriptor, Trap-gate descriptor. 目前猜测 Linux kernel 都是用后 2 种 gate descriptor.
+
+当 processor 检测到 interrupt 或 exception 发生时，会做下面任意一种动作:
+
+  - Executes an implicit call to a handler procedure.
+  - Executes an implicit call to a handler task.
+
+call to handler procedure 通过 interrupt gate 或 trap gate; call to handler task 通过 task gate.
+
+Quick memo: Intel SDM volume 1, 6.4.1 Call and Return Operation for Interrupt or Exception Handling Procedures.
+
+通过 handler procedure 处理 interrupt 或 exception 时，若 handler procedure 的 privilege level 与正在执行的程序相同，则不会发生 stack switch; 若 handler procedure 的 privilege level 更高，则会发生 stack switch.
+
+若无 stack switch，调用 interrupt/exception handler procedure 时 processor 会做如下事:
+
+  1. Pushes the current contents of the EFLAGS, CS, and EIP registers (in that order) on the stack.
+  2. Pushes an error code (if appropriate) on the stack.
+  3. Loads the segment selector for the new code segment and the new instruction pointer (from the interrupt gate or trap gate) into the CS and EIP registers, respectively.
+  4. If the call is through an interrupt gate, clears the IF flag in the EFLAGS register.
+  5. Begins execution of the handler procedure.
+
+若有 stack switch，调用 interrupt/exception handler procedure 时 processor 会做如下事:
+
+  1. Temporarily saves (internally) the current contents of the SS, ESP, EFLAGS, CS, and EIP registers.
+  2. Loads the segment selector and stack pointer for the new stack (that is, the stack for the privilege level being called) from the TSS into the SS and ESP registers and switches to the new stack.
+  3. Pushes the temporarily saved SS, ESP, EFLAGS, CS, and EIP values for the interrupted procedure’s stack onto the new stack.
+  4. Pushes an error code on the new stack (if appropriate).
+  5. Loads the segment selector for the new code segment and the new instruction pointer (from the interrupt gate or trap gate) into the CS and EIP registers, respectively.
+  6. If the call is through an interrupt gate, clears the IF flag in the EFLAGS register.
+  7. Begins execution of the handler procedure at the new privilege level.
+
+Handler task 与 handler procedure 的不同在于： handler task 顾名思义，是 x86 架构定义的 task, 处理 interrupt/exception 时，等同于 task switch. 而 task switch 时，被 interrupted program 的 context 会保存到 TSS. task 有自己的 address space, 而 handler procedure 与被 interrupted program 在同一个 address space.
+
+64-bit mode 下，interrupt/exception 的处理行为都略有不同，详细参考 Intel SDM 3a, 6.14 EXCEPTION AND INTERRUPT HANDLING IN 64-BIT MODE.
+
+Error code: 32-bit value, exception 才会 push error code, 表示这个 exception condition 与某特定 segment selector 或 IDT vector 有关。参考 Intel SDM 3a, Table 6-1. Protected-Mode Exceptions and Interrupts 的 Error Code 一列。
+
+Tip: 代码到目前为止，maskable external interrupts 是被 mask 的，ZO 的入口, compressed 目录下 head_64.s 中开头有 `cli` 指令。
+
+ 现在可以回到代码上了：
+```
+/* arch/x86/kernel/idt.c */
+
+/* Must be page-aligned because the real IDT is used in a fixmap. */
+/* 之前还未关注过 bss section. 这时可以看一下 linker script 中的 .bss section 处理。*/
+gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;
+
+void __init idt_setup_early_handler(void)
+{
+	int i;
+
+	/* X86 上, Vector numbers [0 - 31] 是预留给 architecture-defined exceptions
+	 * and interrupts 的，又因为 maskable external interrupts 目前一直被 mask，所以
+	 * 才可以初始化 IDT 且只初始化 vector 0-31. 入参 early_idt_handler_array 定义在
+	 * head_64.S 中，在下方详细分析。*/
+	for (i = 0; i < NUM_EXCEPTION_VECTORS; i++)
+		set_intr_gate(i, early_idt_handler_array[i]);
+#ifdef CONFIG_X86_32
+	for ( ; i < NR_VECTORS; i++)
+		set_intr_gate(i, early_ignore_irq);
+#endif
+	load_idt(&idt_descr);
+}
+
+/* 补充背景知识：为了 task switch(IDT 中的 gate descriptor 也是一种)，需要 TSS 的存在。
+ * ZO 中的 GDT 有定义 TSS，但 VO 中至今未看到，Intel SDM 3a, 7.7 TASK MANAGEMENT IN
+ * 64-BIT MODE 给出了间接答案：
+ *   Although hardware task-switching is not supported in 64-bit mode, a 64-bit
+ *   task state segment (TSS) must exist...
+ *   The operating system must create at least one 64-bit TSS after activating
+ *   IA-32e mode....
+ * 直接答案是：若从 ZO 跳转到 VO，TSS 已定义且已 TR load; 若从 64-bit boot loader 而来，
+ * 则 loader 必须也已定义 TSS 并 load TR.
+ *
+ * 但是！！！至今为止，其实都没有发生 task switch with privilege change, ZO 中的 TSS
+ * 也只是假的，有 descriptor, 没有实际空间(看 ZO head_64.S 中 GDT 中的 TSS 定义)。*/
+static void set_intr_gate(unsigned int n, const void *addr)
+{
+	/* idt_data 为描述 IDT 的 descriptor 而定义. 从其名字可看出. */
+	struct idt_data data;
+
+	BUG_ON(n > 0xFF);
+
+	memset(&data, 0, sizeof(data));
+	data.vector	= n;
+	data.addr	= addr;
+	/* 回忆一下，当前用的 VO 自己的 GDT 定义在 arch/x86/kernel/cpu/common.c. 当前是
+	 * long mode, 所以需要 64-bit code segment, __KERNEL_CS 正是它的 selector. */
+	data.segment	= __KERNEL_CS;
+	/* type 0xE, 使用 interrupt gate, Why not trap gate for exception? 没有使用
+	 * interrupt stack table(ist) 为 0，说明使用 modified version of the legacy
+	 * stack-switching mechanism, 参考 Intel SDM 3a, 6.14.4 Stack Switching in
+	 * IA-32e Mode */
+	data.bits.type	= GATE_INTERRUPT; /* */
+	data.bits.p	= 1;
+
+	idt_setup_from_table(idt_table, &data, 1, false);
+}
+
+static void
+idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sys)
+{
+	gate_desc desc; /* 局部变量当作 buffer */
+
+	for (; size > 0; t++, size--) {
+		/* 可以看出很简单，一对一填充 descriptor field. */
+		idt_init_desc(&desc, t);
+		/* 在非 paravirt 情况下，此函数最终仅是 memcpy 的动作*/
+		write_idt_entry(idt, t->vector, &desc);
+		/* 暂且 non of my business, skip. */
+		if (sys)
+			set_bit(t->vector, system_vectors);
+	}
+}
+
+/* early_idt_handler_array 定义在 assembly, 在 C 中被 declare 为 array */
+extern const char early_idt_handler_array[NUM_EXCEPTION_VECTORS][EARLY_IDT_HANDLER_SIZE];
+
+/* arch/x86/kernel/head_64.S */
+
+	__INIT
+ENTRY(early_idt_handler_array)
+/* EXCEPTION_ERRCODE_MASK(0x27d00) 用 bitmask 的方式标识有 error code 的 exception,
+ * 将 0x27d00 展开为 binary, 对照 Intel SDM 3a, Table 6-1. Protected-Mode Exceptions
+ * and Interrupts 的 Error Code 一列，会发现一一对应.
+ *
+ * 对于没有 error code 的 exception, push 一个 dummy errory code 0, 初看还无法理解，
+ * 等完整分析后才会恍然大悟.
+ *
+ * EARLY_IDT_HANDLER_SIZE 是 9，它的注释已给出解释。参考指令手册中 push 的描述可知，
+ * PUSH imm8 只需 2 bytes(下面 2 个 push 的操作数都是 imm8), 而对于 jmp 指令，通过
+ * objdump -d 可知，使用 PC relative 方式寻址，有时是 5 bytes，有时是 2 bytes，这就是
+ * 注释中: up to five bytes 的含义。因为我们声明它为 2 维数组，且第 2 维 size 是 9, 所以
+ * 不管少几个 byte, ".fill" 都将该数组元素填满为 9 bytes. */
+
+	i = 0
+	.rept NUM_EXCEPTION_VECTORS
+	.if ((EXCEPTION_ERRCODE_MASK >> i) & 1) == 0
+		...
+		pushq $0	# Dummy error code, to make stack frame uniform
+	.else
+		...
+	.endif
+
+	pushq $i		# 72(%rsp) Vector number
+	jmp early_idt_handler_common
+	...
+	i = i + 1
+	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
+	.endr
+	...
+END(early_idt_handler_array)
+```
+至此，early IDT 的 setup 完成，后面就是等待 exception 的发生，和 exception handler 的执行。回忆一下，目前所 care 的是 copy_bootdata 导致的 page fault exception, 所以我们将 focus 它的处理流程。page fault exception 的详细描述在 Intel SDM 3a, 6.15 EXCEPTION AND INTERRUPT REFERENCE. 触发 page fault 的几种情况中，最直接的是 P flag 不存在，也就是我们这个 case 的情况，明显，虚拟地址 ffff888000000000 还没在页表中映射。
+
+分析 page fault 前，依然有背景知识(画外音：怎么还有= =|): Intel SDM 3a, 6.14 EXCEPTION AND INTERRUPT HANDLING IN 64-BIT MODE. 简而言之，其过程是：发生 interrupt/exception 时，首先 stack pointer (SS:RSP)无条件压栈；然后将 EFLAGS, CS, EIP 依次压栈；若有 error code，则把 error code 压栈。所有 stack push 完成，跳转到 gate 表示的 handler entry 执行.
+
+Linux kernel 的代码到目前为止都运行在 ring 0, 不存在 privilege level change. 所以发生 interrupt/exception 时，其 stack 情况如 Intel SDM 3a, Figure 6-8. IA-32e Mode Stack Usage After Privilege Level Change 右侧所示。在我们的代码示例中，stack 的情况扩展为这样：
+
+![Alt text](hstack.png)
+
+不看代码还不能完全理解，所以 let's take page fault for example and get back to code:
+```
+#ifdef CONFIG_PARAVIRT_XXL
+...
+#else
+	#define GET_CR2_INTO(reg) movq %cr2, reg
+	#define INTERRUPT_RETURN iretq
+#endif
+
+early_idt_handler_common:
+	/*
+	 * The stack is the hardware frame, an error code or zero, and the
+	 * vector number.
+	 */
+	cld /* 为了 string operation 做准备 */
+
+	incl early_recursion_flag(%rip) /* early_recursion_flag++, 看起来统计重入而已 */
+
+	/* x86_64 下，pt_regs 定义在 arch/x86/include/asm/ptrace.h, 而下面的一堆 push，
+	 * 明显在保存 interrupted routine 的上下文为 pt_regs 结构。通过上面 handler stack
+	 * 图示，配合 pt_regs 定义，才能理解下面注释的含义 */
+
+	/* The vector number is currently in the pt_regs->di slot. */
+	pushq %rsi				/* pt_regs->si */
+	movq 8(%rsp), %rsi			/* RSI = vector number */
+	movq %rdi, 8(%rsp)			/* pt_regs->di = RDI */
+	pushq %rdx				/* pt_regs->dx */
+	pushq %rcx				/* pt_regs->cx */
+	pushq %rax				/* pt_regs->ax */
+	pushq %r8				/* pt_regs->r8 */
+	pushq %r9				/* pt_regs->r9 */
+	pushq %r10				/* pt_regs->r10 */
+	pushq %r11				/* pt_regs->r11 */
+	pushq %rbx				/* pt_regs->bx */
+	pushq %rbp				/* pt_regs->bp */
+	pushq %r12				/* pt_regs->r12 */
+	pushq %r13				/* pt_regs->r13 */
+	pushq %r14				/* pt_regs->r14 */
+	pushq %r15				/* pt_regs->r15 */
+	UNWIND_HINT_REGS
+
+	/* 看起来本 interrupt procedure 存在的意义基本是为了 page fault */
+	cmpq $14,%rsi		/* Page fault? */
+	jnz 10f
+	/* 知识点：page fault 时，cpu 自动将导致 page fault 的虚拟地址 Load 到 CR2 */
+	GET_CR2_INTO(%rdi)	/* Can clobber any volatile register if pv */
+	/* Tip: x86-64 ABI 定义整数入参的传递依次使用: %rdi, %rsi, %rdx, %rcx, %r8 and %r9
+	 * 根据已知的 virt address 和 phys address, 在页表中做映射，细节分析暂时忽略。 */
+	call early_make_pgtable
+	/* x86-64 ABI: 整数返回值在 eax 中. 映射 OK, 则跳到 20f */
+	andl %eax,%eax
+	jz 20f			/* All good */
+
+10:
+	movq %rsp,%rdi		/* RDI = pt_regs; RSI is already trapnr */
+	call early_fixup_exception
+
+20:
+	decl early_recursion_flag(%rip)
+	/* handler procedure 完成，time to return to interrupted routine.
+	 * 该函数定义在 arch/x86/kernel/entry/entry.S */
+	jmp restore_regs_and_return_to_kernel
+END(early_idt_handler_common)
+
+/* Entry.S */
+GLOBAL(restore_regs_and_return_to_kernel)
+#ifdef CONFIG_DEBUG_ENTRY
+	...
+#endif
+	/* 定义在 arch/x86/kernel/entry/calling.h 中的 assembly macro, 依次 pop 上面
+	 * push 的 register, 直到 rdi. */
+	POP_REGS
+	addq	$8, %rsp	/* skip regs->orig_ax */
+	/*
+	 * ARCH_HAS_MEMBARRIER_SYNC_CORE rely on IRET core serialization
+	 * when returning from IPI handler.
+	 */
+	INTERRUPT_RETURN
+
+/* x86-64 下的 iret 比 x86 曲折一些。x86 下的 INTERRUPT_RETURN 就是一条 iret. */
+#define INTERRUPT_RETURN	jmp native_iret
+
+ENTRY(native_iret)
+	UNWIND_HINT_IRET_REGS
+	/*
+	 * Are we returning to a stack segment from the LDT?  Note: in
+	 * 64-bit mode SS:RSP on the exception stack is always valid.
+	 */
+#ifdef CONFIG_X86_ESPFIX64
+	/* SS(160) - RIP(128) = 32, 参考上面 handler stack 图示可知，正是 SS 的 segment
+	 * selector. 再参考 Intel SDM 3a, Figure 3-6. Segment Selector 可知，测试其 TI
+	 * bit, 代码目测处理比较繁琐，还好目前我们没有定义任何 LDT, 可忽略。*/
+	testb	$4, (SS-RIP)(%rsp)
+	jnz	native_irq_return_ldt
+#endif
+
+.global native_irq_return_iret
+native_irq_return_iret:
+	/*
+	 * This may fault.  Non-paranoid faults on return to userspace are
+	 * handled by fixup_bad_iret.  These include #SS, #GP, and #NP.
+	 * Double-faults due to espfix64 are handled in do_double_fault.
+	 * Other faults here are fatal.
+	 */
+	/* 不知道我们这个 page fault case 下会有什么错误, anyway, 一条简单的 iretq 符合认知.
+	 * 可以回到 interrupted routine 继续分析了 */
+	iretq
 ```
 
 ## APPENDIX
