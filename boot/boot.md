@@ -1131,7 +1131,8 @@ linux16 命令由 1inux16 模块提供，代码在 grub-core/loader/i386/pc/linu
 	  ...
 
 	  /* Create kernel command line. */
-	  /* 在 real mode 部分(setup.bin)空间后面写入 linux kernel 的 command line */
+	  /* 在 real mode 部分(setup.bin)的空间后面写入 linux kernel 的 command line.
+	   * 注意，特意在前面加上了 “BOOT_IMAGE=” */
 	  grub_memcpy ((char *)grub_linux_real_chunk + GRUB_LINUX_CL_OFFSET,
 			LINUX_IMAGE, sizeof (LINUX_IMAGE));
 	  /* 这里的 -1 是因为 LINUX_IMAGE 表示的字符串末尾是空字符(0)结尾 */
@@ -5207,7 +5208,7 @@ INIT_PER_CPU(irq_stack_union);
 #endif /* CONFIG_X86_32 */
 ```
 
-### before start_kernel
+### prior to start_kernel
 
 **start_kernel** 是一个很有名的函数，其中包含真正的 kernel 初始化，即各子系统的初始化。在它之前，依然是各种准备工作。
 
@@ -5420,7 +5421,9 @@ ENTRY(secondary_startup_64)
 	 * 此阶段, percpu 特性还没有初始化 & 使用，现在使用的 percpu 变量还是"原始数据", 这是
 	 * 原注释中的 "Note that, bluhbluh" 的含义.
 	 * x86 是 little-endian, 所以 initial_gs+4(%rip) 的值放在 edx(higher 32-bit).
-	 * 但不知此时初始化 MSR_GS_BASE 的目的是什么?
+	 * 但不知此时初始化 MSR_GS_BASE 的目的是什么? 2019/7/18 update: 后面分析 percpu
+	 * 变量的读时，是使用汇编语言，而汇编语句就是使用了 %gs: symbol 的形式，可知现在初始化
+	 * %gs 的用处。
 	 *
 	 * 刚开始对原注释说的 "bottom of the irqstack" 有点困惑，不确定 bottom 指一段地址的
 	 * "开头" 还是 "结尾"，现在可以确定是指 "开头". 而且看过 union irq_stack_union 定义
@@ -5485,7 +5488,8 @@ END(secondary_startup_64)
 	GLOBAL(initial_code)
 	.quad	x86_64_start_kernel
 	GLOBAL(initial_gs)
-	/* 参考 linker script 一节中 percpu 相关描述 */
+	/* 参考 linker script 一节中 percpu 相关描述. 2019/7/18 update: 真是没有想到，
+	 * 这么底层的代码还会被改的机会，见 commit: e6401c1309317 */
 	.quad	INIT_PER_CPU_VAR(irq_stack_union)
 	GLOBAL(initial_stack)
 	/*
@@ -5614,9 +5618,9 @@ early_gdt_descr_base:
 ENTRY(phys_base)
 	/* This must match the first entry in level2_kernel_pgt */
 	/*
-	 * 看起来 phys_base 就是为了存储 LMA 和实际物理地址的 delta, 原注释何意? 想了半天终于
-	 * 明白了！故事要从 linker script 定义的 VMA 和 LMA 说起. 上文已提到, vmlinux 占据
-	 * 的地址空间被设计为：
+	 * 看起来 phys_base 就是为了存储 LMA 和实际物理地址的 delta, 名不符实, and 原注释何意?
+	 * 想了半天终于明白了! 故事要从 linker script 定义的 VMA 和 LMA 说起. 上文已提到,
+	 * vmlinux 占据的地址空间被设计为：
 	 *
 	 *   VMA: [0xffffffff80000000 + offset -- KERNEL_IMAGE_SIZE]
 	 *   LMA: [0                  + offset -- KERNEL_IMAGE_SIZE]
@@ -5634,7 +5638,7 @@ ENTRY(phys_base)
 EXPORT_SYMBOL(phys_base)
 
 ```
-分析 __startup_64 函数前埋下一个问题: KASLR 开启时，VO 代码执行时，符号引用是如何不出错的? 待分析后解答。
+分析 __startup_64 函数前埋下一个问题: KASLR 开启时，VO 代码执行时，符号引用是如何不出错的?
 
 **Tip**: __startup_64 函数工作在 identity-mapped paging 下, 虚拟地址 = 物理地址。
 
@@ -5947,7 +5951,7 @@ unsigned long __head __startup_64(unsigned long physaddr,
 
 ...
 	/* early_top_pgt 和 fixup_pointer 函数中的 _text 都是 R_X86_64_32S.
-	 * level3_kernel_pgt 是 R_X86_64_64.         展开：
+	 * level3_kernel_pgt 是 R_X86_64_64.     将 fixup_pointer 展开：
 	 *
 	 * pgd = early_top_pgt - (void *)_text + (void *)physaddr;
 	 *     = (early_top_pgt + v_delta) - (_text + v_delta) + physaddr
@@ -6006,7 +6010,7 @@ unsigned long __head __startup_64(unsigned long physaddr,
 
   1. 背景，VO 原始的映射关系定义在 linker script 中，即在图中水平映射，如第一条横线所示。图中的 **start** 表示 VO(vmlinux) 的起始虚拟地址，物理地址。
   2. 若只有物理地址发生变化，则只需在 PMD 的 entry 中加上 p_delta
-  3. 若虚拟地址和物理地址都发生变化(under KASLR), 如图所示，original VMA -> new VMA, original LMA -> new LMA, new VMA 本来 map 到物理地址 X, KASLR 后要 map 到 new LMA, 即 new VMA -> X + (p_delta - v_delta),so, 上面分析中难理解的地方恍然大悟了。
+  3. 若虚拟地址和物理地址都发生变化(under KASLR), 即如图所示: original VMA -> new VMA, original LMA -> new LMA. 原映射关系下，new VMA 本来 map 到物理地址 X, KASLR 后要 map 到 new LMA, 即 new VMA -> X + (p_delta - v_delta),so, 上面分析中难理解的地方恍然大悟了。
 
 看到这里，可以回到上文 head_64.S 中继续分析了。Not long from now, head_64.S 会跳到 x86_64_start_kernel 执行：
 
@@ -6065,11 +6069,32 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	 */
 	load_ucode_bsp();
 
-	/* set init_top_pgt kernel high mapping*/
+	/* set init_top_pgt kernel high mapping。另一个 top pgt 终于初始化了，等待使用 */
 	init_top_pgt[511] = early_top_pgt[511];
 
 	x86_64_start_reservations(real_mode_data);
 }
+
+void __init x86_64_start_reservations(char *real_mode_data)
+{
+	/* version is always not zero if it is copied */
+	/* 不明白，为什么 copy 后还可能为 0? */
+	if (!boot_params.hdr.version)
+		copy_bootdata(__va(real_mode_data));
+
+	/* quick glace 可知，一堆 quirks, 特定平台的小怪僻 */
+	x86_early_init_platform_quirks();
+
+	switch (boot_params.hdr.hardware_subarch) {
+	case X86_SUBARCH_INTEL_MID:
+		x86_intel_mid_early_setup();
+		break;
+	default:
+		break;
+	}
+
+	/* 终于，来了这里，长征总算开始了，海阔凭鱼跃，天高任鸟飞，可以开始研究感兴趣的子系统了 */
+	start_kernel();
 ```
 __va() 分析：
 ```
@@ -6097,13 +6122,13 @@ unsigned long page_offset_base __ro_after_init = __PAGE_OFFSET_BASE_L4;
 代码展开后其实逻辑很简单，只是给入参物理地址加上了 0xffff888000000000 得到其虚拟地址，但
 明白其背景才是重要的。由 Documentation/x86/x86_64/mm.rst 可看出，4-level paging 时，
 [ffff888000000000, ffffc87fffffffff] 的 64TB 空间用于 direct mapping of all
-physical memory, 也就是说，虚拟地址 ffff888000000000 被映射物理地址 0.
+physical memory, 也就是说，虚拟地址 ffff888000000000 映射到物理地址 0.
 ```
 
 在 ZO 中也看到 BUILD_BUG_ON 的定义, 但 VO 中的实现不同，VO 中的实现才是正宗的：
 
 ```
-# in include/linux/build_bug.h, 按照出境顺序列出所有相关定义
+/* in include/linux/build_bug.h, 按照出境顺序列出所有相关定义 */
 /**
  * BUILD_BUG_ON - break compile if a condition is true.
  * @condition: the condition which the compiler should know is false.
@@ -6337,8 +6362,8 @@ void __init idt_setup_early_handler(void)
  *   task state segment (TSS) must exist...
  *   The operating system must create at least one 64-bit TSS after activating
  *   IA-32e mode....
- * 直接答案是：若从 ZO 跳转到 VO，TSS 已定义且已 TR load; 若从 64-bit boot loader 而来，
- * 则 loader 必须也已定义 TSS 并 load TR.
+ * 直接答案是：若从 ZO 跳转到 VO，TSS 已定义且已 load TR; 若从 64-bit boot protocol
+ * 而来，则 loader 必须也已定义 TSS 并 load TR.
  *
  * 但是！！！至今为止，其实都没有发生 task switch with privilege change, ZO 中的 TSS
  * 也只是假的，有 descriptor, 没有实际空间(看 ZO head_64.S 中 GDT 中的 TSS 定义)。*/
@@ -6362,6 +6387,8 @@ static void set_intr_gate(unsigned int n, const void *addr)
 	data.bits.type	= GATE_INTERRUPT; /* */
 	data.bits.p	= 1;
 
+	/* idt_table 定义再 idt.c 文件头部，IDTR 的格式，与 GDTR 的格式一样，limit 在前面。
+	 * 参考： Intel SDM 3a, Figure 3-11. Pseudo-Descriptor Formats */
 	idt_setup_from_table(idt_table, &data, 1, false);
 }
 
@@ -6481,6 +6508,11 @@ early_idt_handler_common:
 	jz 20f			/* All good */
 
 10:
+	/* All the other exceptions handled here. 对于看习惯 Intel SDM 的人，trapnr
+	 * 这个名字略有困扰，就是 vector number 而已。rsp 恰好指向一个 pt_regs 结构，此时
+	 * 才发现，上面按照 pt_regs 结构体定义的逆向(自下向上) push 的奥妙。
+	 * early_fixup_exception 中最重要的是调用 fixup_exception 函数，目前唯一的文档线索
+	 * 是：Documentation/x86/exception-tables.rst. 待需要时研究。*/
 	movq %rsp,%rdi		/* RDI = pt_regs; RSI is already trapnr */
 	call early_fixup_exception
 
@@ -6497,7 +6529,7 @@ GLOBAL(restore_regs_and_return_to_kernel)
 	...
 #endif
 	/* 定义在 arch/x86/kernel/entry/calling.h 中的 assembly macro, 依次 pop 上面
-	 * push 的 register, 直到 rdi. */
+	 * push 的 register, 直到 rdi. 我们的 case 中，regs->orig_as 是 error code. */
 	POP_REGS
 	addq	$8, %rsp	/* skip regs->orig_ax */
 	/*
@@ -6506,7 +6538,7 @@ GLOBAL(restore_regs_and_return_to_kernel)
 	 */
 	INTERRUPT_RETURN
 
-/* x86-64 下的 iret 比 x86 曲折一些。x86 下的 INTERRUPT_RETURN 就是一条 iret. */
+/* x86-64 下的 iret 比 x86 曲折(x86 下的 INTERRUPT_RETURN 就是一条 iret.) */
 #define INTERRUPT_RETURN	jmp native_iret
 
 ENTRY(native_iret)
@@ -6534,6 +6566,135 @@ native_irq_return_iret:
 	/* 不知道我们这个 page fault case 下会有什么错误, anyway, 一条简单的 iretq 符合认知.
 	 * 可以回到 interrupted routine 继续分析了 */
 	iretq
+```
+
+### start_kernel
+
+鸿蒙处辟原无姓，打破顽空须悟空~
+
+从"此"开始，也可以叫做鸿蒙，所有 sub-system 在此初始化。common sense tell us, people almost can't know all area mentioned in this function, 所以从此开始，可以选择感兴趣的 sub-system 进行分析。但不妨先看一下函数声明：
+```
+asmlinkage __visible void __init start_kernel(void)
+{
+}
+```
+这里出现的几个 attribute 值的说明一下： `asmlinkage` 已在 extract_kernel 的分析中解释过；__visible 定义如下:
+
+```
+/* 如注释所说, __has_attribute 是 C-preprocessor 的 operator, 低于特定版本时不支持。
+ * 一般 object 默认都 visible out of the current compilation unit, 这样显式使用也是
+ * 为了兼容所有 corner case. */
+#if __has_attribute(__externally_visible__)
+# define __visible                      __attribute__((__externally_visible__))
+#else
+# define __visible
+#endif
+```
+__init 定义如下:
+```
+#define __init		__section(.init.text) __cold  __latent_entropy __noinitretpoline
+```
+cold, 顾名思义，很少被执行到, 显然 start_kernel 只会执行依次一次；使用 modules 的话，__noinitretpoline 定义为空；中间那个暂时忽略。
+
+面对这么庞大的函数，如果没有特定兴趣点，一时还不知如何开始，不妨随意看一下先：
+```
+asmlinkage __visible void __init start_kernel(void)
+{
+	char *command_line;
+	char *after_dashes;
+
+	set_task_stack_end_magic(&init_task);
+	/* 有趣的函数，可以搜到它在 start_kernel 之上定义为空，且有 attribute “__weak__”.
+	 * 实际上，此函数只在少数 arch 中有定义，如：arm64, S390. 在 arch/ 目录下 grep 一下
+	 * 可知。x86 arch 没有定义此函数，所以将链接到 __weak__ 的那个。*/
+	smp_setup_processor_id();
+	...
+
+	/* 下面最终调用的 printk, 稍微深挖它的代码会发现也很复杂, to be analysed. 一点 tip:
+	 * 当打开 console= 的命令行参数时，这是第一条 log. */
+	pr_notice("%s", linux_banner);
+	/* 这也是一个 Giant Function, 包含所有 x86 架构相关的 setup, 值的单独分析. */
+	setup_arch(&command_line);
+
+}
+```
+setup_arch 也是个巨大的函数，只能随性分析：
+```
+/*
+ * Determine if we were loaded by an EFI loader.  If so, then we have also been
+ * passed the efi memmap, systab, etc., so we should use these data structures
+ * for initialization.  Note, the efi init code path is determined by the
+ * global efi_enabled. This allows the same kernel image to be used on existing
+ * systems (with a traditional BIOS) as well as on EFI systems.
+ */
+/*
+ * setup_arch - architecture-specific boot-time initializations
+ *
+ * Note: On x86_64, fixmaps are ready for use even before this is called.
+ */
+
+void __init setup_arch(char **cmdline_p)
+{
+	/* 被 KASLR 下的 __pa_symbol 迷惑了一会儿，还特意 review 上面 VO fix KASLR address
+	 * 的相关分析，弯弯绕还是很多的= =| 无 KASLR 时很容易理解。将单独分析 KASLR 的情况。
+	 * 注意：这里两次出现的 _text 重定位类型都是绝对地址寻址，即 S + A 类型，这个信息在下面
+	 * 的分析中很重要。__bss_stop - _text 是 VO memory image 的 size。
+	 * 正式开始使用 memblock 机制。 */
+	memblock_reserve(__pa_symbol(_text),
+		 (unsigned long)__bss_stop - (unsigned long)_text);
+
+	...
+	/* 新概念 get: One Laptop Per Child. Open FirmWare. 可以略过 */
+	olpc_ofw_detect();
+	/* 64-bit mode 下，特地初始化了 #DB 和 #BP 的 handler. 一个小问题: 修改 IDT，需要
+	 * reload IDTR? */
+	idt_setup_early_traps();
+	...
+	/* 新概念 get: https://lwn.net/Articles/412072/ */
+	jump_label_init();
+	/* 概念 ioremap: CPU 通过 physical address 访问 I/O device, 代码则需要 virtual
+	 * address, 通过 paging 翻译城 physical address. 值的仔细分析。*/
+	early_ioremap_init();
+}
+```
+#### setup_arch: early_ioremap_init
+
+```
+void __init early_ioremap_init(void)
+{
+	pmd_t *pmd;
+
+#ifdef CONFIG_X86_64
+	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+#else
+	WARN_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+#endif
+
+}
+```
+
+#### __pa_symbol
+```
+/* 针对 KASLR， 将 __pa_symbol 涉及的 macro 全部展开分析 */
+/* arch/x86/include/asm/page.h */
+#define __pa_symbol(x) \
+	__phys_addr_symbol(__phys_reloc_hide((unsigned long)(x)))
+
+/* arch/x86/include/asm/page_64.h */
+#define __phys_reloc_hide(x)	(x)
+
+#define __phys_addr_symbol(x) \
+	((unsigned long)(x) - __START_KERNEL_map + phys_base)
+
+/* 上文已说，因为 _text 是绝对寻址，ZO 会加上 v_delta. 展开后是：
+ *
+ *   VMA + v_delta - __START_KERNEL_map + p_delta - v_delta
+ * = VMA - __START_KERNEL_map + p_delta
+ * = LMA + p_delta
+ * = 符号的实际物理地址
+ *
+ * 这里的窍门是:  VMA - __START_KERNEL_map = LMA, 这一点没有快速的认识到 = =|
+ */
 ```
 
 ## APPENDIX
