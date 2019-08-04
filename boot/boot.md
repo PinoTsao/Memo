@@ -15,7 +15,7 @@ Power-up 后，寄存器 CR0 的值为 0x60000010，意味着将 CPU 置于关�
 
 segment register 包含 visual part 和 hidden part(有时也叫做 descriptor cache 或 shadow register)，当 segment selector 被加载进 visual part 时，处理器会自动将相应 segment descriptor 中的 Base Address, Limit, Accesstion Information 加载进 hidden part。这些 cache 在 segment register 中的信息，使得处理器做地址翻译时不必从 segment descriptor 中读取 base address 等信息，从而省去了不必要的 bus cycle。如果 segment descriptor table 发生了变化，处理器需要显式的重新加载 segment register，否则，地址翻译仍使用老的 segment descriptor 中的信息。也就是说，当使用 CS:EIP 的方式去寻址时(或者说在计算 linear address 时)，实际是使用 hidden part 中的 Base Address + EIP value。
 
-由上文知， BSP 从 CS：EIP 中取第一条指令来执行。Power-up 后，CS.Base = FFFF0000H, EIP=0000FFF0H，所以第一条指令的地址 = FFFF0000H + 0000FFFFH = FFFFFFF0H，这个地址被映射到 ROM(ROM 是一种古老存储技术，用于存储 firmware，但这种技术不断更新。为避免困扰，本文仍然通称为 ROM) 上的 BIOS 中的某条指令。当 PC 复位后第一次加载新的值到 CS 后，接下来的 linear address 的翻译方式就是我们知道的： selector value << 4 + IP。
+由上文知， BSP 从 CS：EIP 中取第一条指令来执行。Power-up 后，CS.Base = FFFF0000H, EIP=0000FFF0H，所以第一条指令的地址 = FFFF0000H + 0000FFFFH = FFFFFFF0H，这个地址被映射到 ROM(一种古老存储技术，用于存储 firmware，但这种技术不断更新。为避免困扰，本文仍然通称为 ROM) 上的 BIOS 中的某条指令。当 PC 复位后第一次加载新的值到 CS 后，接下来的 linear address 的计算方式就是我们知道的： selector value << 4 + IP。
 
 主板上的 chipset 把第一条指令的地址 FFFFFFF0H 映射到包含 BIOS 的 ROM 中，典型的第一条指令是：
 
@@ -23,7 +23,7 @@ segment register 包含 visual part 和 hidden part(有时也叫做 descriptor c
 
 这个跳转指令会刷新 CS 的值，那么 CS.Base 的值就变成了 F0000H(F000H << 4)，接下来的寻址就是按照 real mode 的方式： CS selector << 4 + EIP。
 
-BIOS 第一条指令的具体细节很可能在不同的芯片/平台上而不同，BIOS 代码一般不是开源的，况且近年来出现的新的 firmware: EFI，就目前网络上各种资料看下来，笔者还无法得出一个 general 的答案。基于上面的典型第一条指令，可以推理一种执行过程：第一条指令跳转后，下面的地址都在1M范围内了。以 Q35 chipset 举例，chipset 的 Programmable Attribute Map(PAM) 寄存器会控制 768 KB 到 1 MB 地址空间中的 13 个 sections 的访问属性，开机后这些寄存器默认值的行为是 DRAM Disabled: All accesses are directed to DMI，也就是说对上述地址范围的访问会被 route 到 4G 的最后 1M 空间内，也就是说执行的代码还是来自 ROM 中的BIOS。后续 BIOS 是否做 memory shadowing(将自己 copy 到第 1M 地址空间的 DRAM)都可，只是 access 的速度有差别。另一方面，传统的 BIOS 都是运行在 real mode 下，它能看到的地址空间只有第 1M。 此外，所谓的带外管理技术(如 Intel 的 Management Engine)，也可能提前将 BIOS copy 到第 1M 的 DRAM 空间中。
+BIOS 第一条指令的具体细节很可能在不同的芯片/平台上而不同，BIOS 代码一般不是开源的，况且近年来出现的新的 firmware: EFI，就目前网络上各种资料看下来，笔者还无法得出一个 general 的答案。基于上面的典型第一条指令，可以推理一种执行过程：第一条指令跳转到第 1M 地址范围内，以 Q35 chipset 举例，chipset 的 Programmable Attribute Map(PAM) 寄存器会控制 768 KB 到 1 MB 地址空间中的 13 个 sections 的访问属性，开机后这些寄存器默认值的行为是 DRAM Disabled: All accesses are directed to DMI，也就是说对上述地址范围的访问会被 route 到 4G 的最后 1M 空间内，也就是说执行的代码还是来自 ROM 中的BIOS。后续 BIOS 是否做 memory shadowing(将自己 copy 到第 1M 地址空间的 DRAM)都可，只是 access 的速度有差别。另一方面，传统的 BIOS 都是运行在 real mode 下，它能看到的地址空间只有第 1M。此外，所谓的带外管理技术(如 Intel 的 Management Engine)，也可能提前将 BIOS copy 到第 1M 的 DRAM 空间中。
 
 BIOS 执行到最后是从已设置的启动设备中加载第一个 sector 的内容到内存，并跳转过去执行。我们 grub2 的硬盘启动为例分析。
 
@@ -50,7 +50,7 @@ core.img 又包含了多个 image 和模块，它的布局如下：
 ![grub core image](core_image.png)
 
 ### boot.img/MBR/boot sector
-boot.img 仅仅将 core.img 的第一个 sector 的内容(即 diskboot.img)加载到内存执行，core.img 中剩余的部分由它的 diskboot.img 继续加载到内存。boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。
+boot.img 仅将 core.img 的第一个 sector (即 diskboot.img)加载到内存执行，core.img 中剩余的部分由它的 diskboot.img 继续加载到内存。boot.img 对应的 grub2 的源码文件是 grub-core/boot/i386/pc/boot.S。
 
 对于 boot.S 的完整分析可以参考：
 
@@ -68,7 +68,7 @@ boot.img 仅仅将 core.img 的第一个 sector 的内容(即 diskboot.img)加�
 
 其中, .macro scratch 只是声明了一些变量空间，用于下面的代码使用 BIOS INT 13h 时使用。
 
-boot.s 的开头为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间，BPB 是一个存储在 VBR(volumn boot record) 中用来描述磁盘或者分区的物理布局的数据结构。BPB 空间对于 MBR 来说是不必要的，但某些场景下 grub 使用同一个 boot.img 安装到 VBR 中，VBR 是可能需要 BPB 的，所以需要预留这部分空间。在[这篇介绍](https://en.wikipedia.org/wiki/BIOS_parameter_block)的表：Format of full DOS 7.1 Extended BIOS Parameter Block (79 bytes) for FAT32 中，可以看出，BPB 开始于 boot sector 的 offset 0xB 处，BPB 的 size 是 0x47 + 0x8 = 0x4F，0xB + 0x 4F = 0x5A，正是宏 *GRUB_BOOT_MACHINE_BPB_END* 的值。
+boot.s 的开头为兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间。BPB 是存储在 [Volumn Boot Record(VBR)](https://en.wikipedia.org/wiki/Volume_boot_record) 中数据结构，用来描述磁盘或者分区的物理布局的数据结构。BPB 空间对于 MBR 来说是不必要的，它的存在是为了 compatibility(比如？某些场景下 grub 使用同一个 boot.img 安装到 VBR 中，VBR 可能需要 BPB)。由[这篇介绍](https://en.wikipedia.org/wiki/BIOS_parameter_block)的表：Format of full DOS 7.1 Extended BIOS Parameter Block (79 bytes) for FAT32 可以看出：BPB 起始于 boot sector 的 offset 0xB 处，size 是 79 (bytes) = 0x4F = 0x47 + 0x8.  0x52 + 0x8 = 0x5A，正是 *GRUB_BOOT_MACHINE_BPB_END* 的值。
 
 接下来是一堆参数定义，需要在安装 grub 的时候被写入(除了GRUB_BOOT_MACHINE_KERNEL_ADDR)：
 
@@ -85,10 +85,11 @@ boot.s 的开头为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间�
 
 		.org GRUB_BOOT_MACHINE_BOOT_DRIVE
 	boot_drive:
+		/* 在 grub install 时，这个 field 也被再次写入 0xff，见 write_rootdev 函数 */
 		.byte 0xff	/* the disk to load kernel from */
 				    /* 0xff means use the boot drive */
 
-在 grub 的上下文中，kernel 指的是 core.img。*kernel_sector* & *kernel_sector_high* 记录 core.img 在磁盘上的第一个扇区号; *kernel_address* 表示 core.img 第一个扇区被加载到内存中的地址，由宏  *GRUB_BOOT_MACHINE_KERNEL_ADDR* 定义，在 i386 PC 上，这个宏的值是 0x8000，代码如下：
+在 grub 的上下文中，kernel 是指 core.img. *kernel_sector* & *kernel_sector_high* 记录 core.img 在磁盘上的起始 sector number, 即 diskboot.img 所在 sector number; *kernel_address* 表示 core.img 第一个 sector(diskboot.img) 加载到内存中的地址，由 *GRUB_BOOT_MACHINE_KERNEL_ADDR* 定义，在 i386 PC 上，这个宏的值是 0x8000，代码如下：
 
 	/* The address where the kernel is loaded.  */
 	#define GRUB_BOOT_MACHINE_KERNEL_ADDR	(GRUB_BOOT_MACHINE_KERNEL_SEG << 4)
@@ -105,26 +106,17 @@ boot.s 的开头为了兼容 FAT/HPFS BIOS parameter block(BPB) 预留了空间�
 
 	TARGET_CPPFLAGS =  -Wall -W  -DGRUB_MACHINE_PCBIOS=1 -DGRUB_MACHINE=I386_PC -m32 bluhbluh...
 
-这样就明白为什么 *GRUB_BOOT_MACHINE_KERNEL_ADDR* 的值是 0x8000 了。
+这样就明白为什么 *GRUB_BOOT_MACHINE_KERNEL_ADDR* 是 0x8000 了。
 
-BIOS 将控制权 transfer 到 grub 时会设置 DL 寄存器，指示一个 drive number，也即后续从哪个驱动器继续读取 grub kernel image。变量 boot_drive 的默认值是 0xff，根据注释可知，0xff 的意思是使用 (BIOS设置的)DL 中的值，但 grub-install 可以修改这个值。如果 boot_drive 的值不是 0xff，则 load boot_drive 到 DL。代码如下：
+BIOS 将控制权 transfer 到 grub 时会设置 DL 寄存器，指示 boot drive number，也即后续从哪个驱动器(drive)继续读取 grub kernel image。变量 boot_drive 的默认值是 0xff，根据注释可知，0xff 表示使用 (BIOS 设置的)DL 中的值。这个值可能会被修改为一个真正的(也可能是错误) boot drive number，但目测代码中没有修改 boot_drive 为其他值。如果 boot_drive 的值不是 0xff，则 load boot_drive 到 DL。见下方代码分析。
 
-		/* Check if we have a forced disk reference here */
-		movb   boot_drive, %al
-		cmpb	$0xff, %al
-		je	1f
-		movb	%al, %dl
-	1:
-		/* save drive reference first thing! */
-		pushw	%dx
-
-driver number 属于 BIOS 的知识范畴，因为 bootloader 在使用 BIOS 的磁盘读写中断服务时才会使用这个值，所以 BIOS 对其有解释权，但没有找到准确的介绍，这几篇可以参考一下：
+driver number 属于 BIOS 的知识范畴，因为 boot loader 在使用 BIOS 的磁盘读写中断服务时才会使用这个值，所以 BIOS 对其有解释权，但没有找到准确的介绍，这几篇可以参考一下：
 
 1. [list the BIOS drive index](https://stackoverflow.com/questions/45891044/any-way-to-list-the-bios-drive-numbers-in-real-mode)
 2. [PC boot: dl register and drive number](https://stackoverflow.com/questions/11174399/pc-boot-dl-register-and-drive-number)
 3. [BIOS to MBR interface](https://en.wikipedia.org/wiki/Master_boot_record#BIOS_to_MBR_interface)
 
-简而言之，如果 boot drive 是硬盘，则 DL 的最高 bit 为 1，即驱动器号范围是 0x80 - 0x8f；如果是软盘，则最高 bit 为 0，即驱动器号范围是 0x0 - 0xF。
+简而言之，boot drive number 用一个 byte 表示，若 boot drive 是 hard disk，则最高 bit 为 1，driver number range 是 0x80 - 0x8f；若是 floppy，则最高 bit 为 0，即驱动器号范围是 0x0 - 0xF。
 
 boot.S 第一指令是 jmp 到 after_BPB 处执行：
 
@@ -144,16 +136,23 @@ boot.S 第一指令是 jmp 到 after_BPB 处执行：
 	     */
 	     /* 上面的注释说：若 grub 被安装在硬盘上，dl 唯一的有效值是 0x80，因为这是唯一可能
 	      * 的 boot drive。如果是安装在软盘上的，这一段 do nothing. */
+		/* grub 安装在 HDD 时，jmp 指令被 overwrite 为 2 个 NOP 指令，详见
+		 * grub_util_bios_setup 函数。某些 buggy BIOS 会错误设置 DL 寄存器。
+		 * 进入下一条指令进行相关判断。如果是安装在软盘时，则不存在这个
+		 * 问题，直接跳到 3:, 进行软盘相关的判断。参考上面的文章 <BIOS to MBR interface> */
+
 		.org GRUB_BOOT_MACHINE_DRIVE_CHECK
 	boot_drive_check:
-		/* 当 grub 安装在 HDD 时，某些有问题的 BIOS 会错误的设置 DL 寄存器，所以 jmp 指令
-		 * 才可能被 overwrite，进入下一条指令进行相关判断。如果是安装在软盘时，则不存在这个
-		 * 问题，直接跳到 3:, 进行软盘相关的判断。参考上面的文章 <BIOS to MBR interface> */
+		/* 若被 overwrite，说明 grub 安装在 HDD. Refer: grub_util_bios_setup 函数.
+		 * 直接执行 test 指令，判断 dl 是否设置正确，正确的标准是最高 bit = 1, 表示安装在
+		 * HDD. 正确则执行 3:, 错误则执行 2:. */
 	    jmp     3f	/* grub-setup may overwrite this jump. */
-	    testb   $0x80, %dl /* 如果 dl 的最高 bit 不是 1，结果为0，跳到 2，强赋值为 0x80 */
+	    testb   $0x80, %dl /* 若 dl 的最高 bit ！= 1，则跳到 2，强赋值为 0x80 */
 	    jz      2f
 	3:
-		/* Ignore %dl different from 0-0x0f and 0x80-0x8f.  */
+		/* Ignore %dl different from 0-0x0f and 0x80-0x8f. */
+		/* 若 dl 的值不在 0-0xf, 或 0x80-0x8f 内, 说明 BIOS 设置错误，进入 2:, 强赋值
+		 * 为 0x80; 若在上述范围内，则认为 dl 的值正确，进入 1:, 然后跳入真正的代码入口。 */
 		testb   $0x70, %dl /* 等分析 grub-bios-setup 后再来补充 */
 		jz      1f
 	2:
@@ -166,18 +165,34 @@ boot.S 第一指令是 jmp 到 after_BPB 处执行：
 		ljmp	$0, $real_start
 
 	real_start:
-		xxx
+		...
 
+		/* Check if we have a forced disk reference here */
+		/* 正常情况下，boot_drive 是 0xff, 表示使用 BIOS 设置的 dl, then 直接 push
+		 * 保存 dl 到 stack; 但一些未知情况下，有人会修改 boot_drive, 说明有人想显式
+		 * 指定 boot drive，而不是 follow BIOS 的设置，那就 push 保存被显式指定的
+		 * boot_drive. */
+		movb   boot_drive, %al
+		cmpb	$0xff, %al
+		je	1f
+		movb	%al, %dl
+	1:
+		/* save drive reference first thing! */
+		pushw	%dx
 
-真正的代码开始于 real_start：通过调用 INT 0x13 判断磁盘是否支持 LBA 访问模式，否则使用传统的 CHS 模式。以 LBA 为例，继续调用 INT 0x13，从 core.img 的第一个 sector 的起始位置读入一个 sector(代码注释是："the blocks") 到地址为 *GRUB_BOOT_MACHINE_BUFFER_SEG*(0x7000):0 的 buffer 中，关于这个 INT 0x13 调用的详细解释参考 [wikipedia](https://en.wikipedia.org/wiki/INT_13H) 或 [这篇](http://www.ctyme.com/intr/rb-0708.htm)。然后调用函数 *copy_buffer*，从源地址 *GRUB_BOOT_MACHINE_BUFFER_SEG*:0 拷贝 512 bytes 到 0:*GRUB_BOOT_MACHINE_KERNEL_ADDR*，也即从 0x7000:0 拷贝到 0:0x8000，然后 jmp 到 *GRUB_BOOT_MACHINE_KERNEL_ADDR*。
+真正的代码开始于 real_start：通过调用 INT 0x13 判断磁盘是否支持 LBA 访问模式，否则使用传统的 CHS 模式。以 LBA 为例，继续调用 INT 0x13，从 core.img 中读取第一个 sector(代码注释是："the blocks") 到地址 GRUB_BOOT_MACHINE_BUFFER_SEG(0x7000) : 0 的 buffer 中。
 
-MBR 中的 boot.img 的工作就完成了。
+INT 0x13 详细解释可参考 [wikipedia](https://en.wikipedia.org/wiki/INT_13H) 或 [这篇](http://www.ctyme.com/intr/rb-0708.htm)。
+
+然后调用函数 copy_buffer，从源地址 GRUB_BOOT_MACHINE_BUFFER_SEG : 0 拷贝 512 bytes 到 0 : GRUB_BOOT_MACHINE_KERNEL_ADDR，也即从 0x7000 : 0 拷贝到 0 : 0x8000，然后 jmp 到 GRUB_BOOT_MACHINE_KERNEL_ADDR.
+
+That is what boot.img does.
 
 #### BIOS INT 13h
 
-顾名思义，BIOS 提供的 13h 号中断向量服务，主要功能是提供磁盘读写服务，参考[wikipedia](https://en.wikipedia.org/wiki/INT_13H)的介绍。boot.img 中使用了两次 INT 13h 服务，一是检查磁盘是否支持 LBA 读写模式，第二是读取磁盘上的 diskboot.img。简单了解一下细节。
+顾名思义，BIOS 提供的 13h 号中断向量服务，主要功能是提供磁盘读写服务。boot.img 中使用了两次 INT 13h 服务，一是检查磁盘是否支持 LBA 读写模式，二是读取磁盘上的 diskboot.img.
 
-第一处检查是否支持 LBA：
+检查是否支持 LBA：
 
 	Int 13/AH=41h/BX=55AAh: Check Extensions Present
 
@@ -185,11 +200,11 @@ MBR 中的 boot.img 的工作就完成了。
 
 	/* check if LBA is supported */
 
-第二处从磁盘读取 diskboot.img：
+从磁盘读取 diskboot.img：
 
 	INT 13h AH=42h: Extended Read Sectors From Drive
 
-使用指针 DS:SI 指向叫做 **disk address packet**(DAP) 的一块内存，INT 13h 的调用者需要初始化这段数据，INT 13h 从其中取得必要的入参进行操作，所以这块内存也被叫做 packet interface。参考[这里](https://en.wikipedia.org/wiki/INT_13H#INT_13h_AH=42h:_Extended_Read_Sectors_From_Drive)详细了解 INT 13 和 DAP 的格式。
+使用指针 DS:SI 指向叫做 **disk address packet**(DAP) 的一块内存，它是 INT 13h 的入参，所以调用者需要初始化这段数据。INT 13h 从 DAP 中取得必要的入参进行操作，所以这块内存也被叫做 packet interface. 参考[这里](https://en.wikipedia.org/wiki/INT_13H#INT_13h_AH=42h:_Extended_Read_Sectors_From_Drive)了解 INT 13h 和 DAP 的格式。
 
 boot.s 开头的代码定义了 DAP:
 
@@ -213,7 +228,7 @@ boot.s 开头的代码定义了 DAP:
 	/* more space... */
 	.endm
 
-可以看出格式并不遵循 DAP 定义，应该是还有其他用处，待分析。DAP 之前还有一个字段： mode，用于指示当前磁盘是否支持 LBA（1：支持，0：不支持），方便后面判断磁盘是否支持 LBA mode，因为在 boot.S 中已经通过 INT 13/AH=41h/BX=55AAh 判断过了，将结果保存在这个字段，后面的代码直接检查这个字段的值即可，而不用再使用 INT 13。
+可以看出格式并不遵循 DAP 定义，应该是还有其他用处，待分析。DAP 前还有一个字段: mode，指示当前磁盘是否支持 LBA(1：支持，0：不支持). boot.S 中通过 INT 13/AH=41h/BX=55AAh 判断过 LBA，将结果保存在这个字段，方便后续使用，后面的代码直接检查这个字段即可知道是否支持 LBA mode，而不用再使用 INT 13h.
 
 初始化 DAP 的代码如下：
 
@@ -244,15 +259,15 @@ boot.s 开头的代码定义了 DAP:
 
 ### diskboot.img
 
-由 core.img 的图示可知，它的第一个 sector 的内容是 diskboot.img。diskboot.img 对应的源代码文件是 grub-core/boot/i386/pc/diskboot.S。diskboot.img 的执行环境，也即寄存器，由 boot.img 设置，此时的环境如下：
+由 core.img 的图示可知，它的第一个 sector 的内容是 diskboot.img. diskboot.img 对应源代码文件 grub-core/boot/i386/pc/diskboot.S. diskboot.img 的执行环境，也即寄存器，由 boot.img 设置，此时的环境如下：
 
 1. 有可用的堆栈(SS 和 SP 已配置)。
 2. 寄存器 DL 中保存正确的引导驱动器。
 3. 寄存器 SI 保存着 DAP(Disk Address Packet) 的地址，因为还需要使用 INT 13 AH=42h 来继续读取磁盘 sector。
 
-diskboot.img 的工作是将 core.img 中剩余的部分继续加载到内存，并跳转过去执行。diskboot.img 的工作本质上和 boot.img 一样，都是借助 BIOS 的 interrupt service 读取磁盘 sector 的内容到内存，只不过 diskboot.img 需要加载多个 sector 而已。
+diskboot.img 的工作是将 core.img 中剩余的部分继续加载到内存，并跳转过去执行。diskboot.img 的工作本质上和 boot.img 一样，都是借助 BIOS 的 interrupt service 读取磁盘 sector 到内存，只不过 diskboot.img 需要加载多个 sectors 而已。
 
-diskboot.img 需要知道 core.img 剩余部分所在的 sector，显然，这是安装 grub 的时候才会知道，grub-install 时将 core.img 占据的 sector 信息写入 diskboot.img，这部分空间定义在 diskboot.S 的尾部：
+diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能去读。显然，address 在 grub-install 时才会知道. grub-install 将 core.img 占据的 sector 信息(address & size)写入 diskboot.img，这部分空间定义在 diskboot.S 的尾部：
 
 		.org 0x200 - GRUB_BOOT_MACHINE_LIST_SIZE
 	LOCAL(firstlist):	/* this label has to be before the first list entry!!! */
@@ -280,7 +295,7 @@ diskboot.img 需要知道 core.img 剩余部分所在的 sector，显然，这�
 	  grub_uint16_t segment;
 	} GRUB_PACKED;
 
-为什么这段空间被标以 label: firstlist 呢？一个 blocklist 描述一段连续的磁盘区域，而在某些情况下，core.img 有可能被分成多块安装在磁盘上，所以可能存在多个 blocklist，如果有多个的时候，这段空间会紧挨着 firstlist 向 diskboot.img 开始的方向延伸。 下面对代码做分析：
+为什么这段空间被标以 label: firstlist 呢? 一个 blocklist 描述一段连续的磁盘区域，而在某些未知情况下，core.img 有可能被分成多块安装在磁盘上，所以可能存在多个 blocklist. 若有多个 blocklist，他们的空间会紧挨着 firstlist, 且向 diskboot.img 头部延伸。 来看代码：
 
 
 		/* this sets up for the first run through "bootloop" */
@@ -6613,12 +6628,16 @@ asmlinkage __visible void __init start_kernel(void)
 	/* 下面最终调用的 printk, 稍微深挖它的代码会发现也很复杂, to be analysed. 一点 tip:
 	 * 当打开 console= 的命令行参数时，这是第一条 log. */
 	pr_notice("%s", linux_banner);
-	/* 这也是一个 Giant Function, 包含所有 x86 架构相关的 setup, 值的单独分析. */
+	/* 这也是一个 Giant Function, 包含所有 x86 架构相关的 setup, 单独一节分析. */
 	setup_arch(&command_line);
 
 }
 ```
-setup_arch 也是个巨大的函数，只能随性分析：
+
+### setup_arch
+
+这是个可以和 start_kernel 媲美的巨大函数，暂且随性分析：
+
 ```
 /*
  * Determine if we were loaded by an EFI loader.  If so, then we have also been
@@ -6652,28 +6671,34 @@ void __init setup_arch(char **cmdline_p)
 	...
 	/* 新概念 get: https://lwn.net/Articles/412072/ */
 	jump_label_init();
-	/* 概念 ioremap: CPU 通过 physical address 访问 I/O device, 代码则需要 virtual
-	 * address, 通过 paging 翻译城 physical address. 值的仔细分析。*/
+	/* ioremap concept: CPU 通过 physical address 访问 I/O device, 代码则需要
+	 * virtual address, 通过 paging 翻译出 physical address. 下文详细分析。*/
 	early_ioremap_init();
+	...
+
+	/* global variable: x86_init, defined in arch/x86/kernel/x86_init.c, include
+	 * a set of callback functions for setting up x86 platform. It is defined
+	 * with default functions for standard PC hardware. But for specific platforms,
+	 * such as Intel MID, Xen, they will substitute some default setup functions
+	 * with their specific ones, or complement with the missing callbacks. */
+	x86_init.oem.arch_setup();
+
+	/* Resource is managed by struct resource, which is tree-like structure,
+	 * indicating a range of address of I/O ports, physical address. Apparently,
+	 * x86_phys_bits is obtained via cpuid. So the expression is self-documented.*/
+	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
+
+	/* 拿到 boot_params 中的 E820 信息，并 sanitize it. */
+	e820__memory_setup();
+	/* 处理定义在 boot protocol 中的 setup data. 第一次注意到这个概念，大致浏览可发现，
+	 * setup data 提供了 E820 extension map info, device tree block, 以及 EFI data.
+	 * None of above interest me but a function among the process: early_memremap,
+	 * early_memunmap. */
+	parse_setup_data();
 }
 ```
-#### setup_arch: early_ioremap_init
 
-```
-void __init early_ioremap_init(void)
-{
-	pmd_t *pmd;
-
-#ifdef CONFIG_X86_64
-	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
-#else
-	WARN_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
-#endif
-
-}
-```
-
-#### __pa_symbol
+-------- __pa_symbol --------
 ```
 /* 针对 KASLR， 将 __pa_symbol 涉及的 macro 全部展开分析 */
 /* arch/x86/include/asm/page.h */
@@ -6695,6 +6720,222 @@ void __init early_ioremap_init(void)
  *
  * 这里的窍门是:  VMA - __START_KERNEL_map = LMA, 这一点没有快速的认识到 = =|
  */
+```
+-------- early_ioremap_init --------
+
+Analysing critical code only
+
+```
+void __init early_ioremap_init(void)
+{
+	pmd_t *pmd;
+
+	/* 第一行代码就可以窥到核心设计了，下文详细分析 fix_to_virt */
+#ifdef CONFIG_X86_64
+	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+#else
+	...
+#endif
+	early_ioremap_setup();
+
+	pmd = early_ioremap_pmd(fix_to_virt(FIX_BTMAP_BEGIN));
+	memset(bm_pte, 0, sizeof(bm_pte));
+	pmd_populate_kernel(&init_mm, pmd, bm_pte);
+
+	/*
+	 * The boot-ioremap range spans multiple pmds, for which
+	 * we are not prepared:
+	 */
+#define __FIXADDR_TOP (-PAGE_SIZE)
+	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
+		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
+#undef __FIXADDR_TOP
+
+	if (pmd != early_ioremap_pmd(fix_to_virt(FIX_BTMAP_END))) {
+		WARN_ON(1);
+		/* omit a series of printk */
+	}
+}
+
+#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
+
+/*
+ * 'index to address' translation. If anyone tries to use the idx
+ * directly without translation, we catch the bug with a NULL-deference
+ * kernel oops. Illegal ranges of incoming indices are caught too.
+ */
+static __always_inline unsigned long fix_to_virt(const unsigned int idx)
+{
+	/* 核心内容都在 __end_of_fixed_addresses 所属的 enum 中。需要先 理解 enum 的定义 */
+	/* 看完 enum 定义后，自然 index 不能超过定义的 max value. */
+	BUILD_BUG_ON(idx >= __end_of_fixed_addresses);
+	return __fix_to_virt(idx);
+}
+
+/* enumeration definition 被 numerous #ifdef 包裹，看起来费劲，so, appropriately
+ * simplified code would help analyzing & understanding its core design.
+ * 设计的核心：从特定地址开始，以 4k page size 为单位，用 index number 索引每个 page,
+ * 这些地址用于特定用途的 mapping, 所以是 fixed address.
+ * 当有 CONFIG_X86_VSYSCALL_EMULATION 时，从地址 VSYSCALL_ADDR 开始, 其 index 是 0,
+ * 但此 enum 定义从 FIXADDR_TOP 对应的 index 开始。
+ *  */
+enum fixed_addresses {
+	...
+#ifdef CONFIG_X86_VSYSCALL_EMULATION
+	/* 先去看下文 FIXADDR_TOP, VSYSCALL_ADDR 的分析 */
+	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
+#endif
+
+	FIX_DBGP_BASE,
+	FIX_EARLYCON_MEM_BASE,
+	...
+	/* 看到 APIC, 开始悟到一些 */
+#ifdef CONFIG_X86_LOCAL_APIC
+	FIX_APIC_BASE,	/* local (CPU) APIC) -- required for SMP or not */
+#endif
+
+#ifdef CONFIG_X86_IO_APIC
+	FIX_IO_APIC_BASE_0,
+	FIX_IO_APIC_BASE_END = FIX_IO_APIC_BASE_0 + MAX_IO_APICS - 1,
+#endif
+
+	...
+
+#ifdef CONFIG_ACPI_APEI_GHES
+	/* Used for GHES mapping from assorted contexts */
+	FIX_APEI_GHES_IRQ,
+	FIX_APEI_GHES_NMI,
+#endif
+
+	__end_of_permanent_fixed_addresses,
+
+	/*
+	 * 512 temporary boot-time mappings, used by early_ioremap(),
+	 * before ioremap() is functional.
+	 *
+	 * If necessary we round it up to the next 512 pages boundary so
+	 * that we can have a single pgd entry and a single pte table:
+	 */
+	 /* 下面这个巨长的 expression, 可能只有数学小王子能轻松看懂。笔者只能简化分析。条件：
+	  *    x ^ (x + 0x1FF)
+	  *	   &
+	  *	   0xfffffe00
+	  * 简化后分析方便多了。Expression result：TRUE if x <= 511; FALSE if x > 511.
+	  *
+	  * If TRUE:  FIX_BTMAP_END = x + 512 - (x & 511) = x + 512 - x = 512
+	  * If FALSE: FIX_BTMAP_END = x.
+	  * 这下可以理解原 comment 的含义了： round it up to next 512 pages boundary if
+	  * necessary(if index x <= 511) */
+#define NR_FIX_BTMAPS		64 /* 看起来像 long 的 bit 数 */
+#define FIX_BTMAPS_SLOTS	8  /* 需要 512 个 4k mapping 没*/
+#define TOTAL_FIX_BTMAPS	(NR_FIX_BTMAPS * FIX_BTMAPS_SLOTS)
+	FIX_BTMAP_END =
+	 (__end_of_permanent_fixed_addresses ^
+	  (__end_of_permanent_fixed_addresses + TOTAL_FIX_BTMAPS - 1)) &
+	 -PTRS_PER_PTE
+	 ? __end_of_permanent_fixed_addresses + TOTAL_FIX_BTMAPS -
+	   (__end_of_permanent_fixed_addresses & (TOTAL_FIX_BTMAPS - 1))
+	 : __end_of_permanent_fixed_addresses,
+
+	FIX_BTMAP_BEGIN = FIX_BTMAP_END + TOTAL_FIX_BTMAPS - 1,
+
+	...
+
+	__end_of_fixed_addresses
+};
+
+/* 仅分析 4-level paging 下的正常情况，即 PAGE_SIZE = 4k, PMD_SHIFT = 21. 简单心算
+ * 可知 expression value = VSYSCALL_ADDR + 2M - 4k */
+#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
+			 PAGE_SIZE)
+
+/* 参考 Documentation/x86/x86_64/mm.rst: 地址 ffffffffff600000 起始的 4k 用于 map
+ * legacy vsyscall ABI. 暂时不知其含义也不影响理解这里的代码。而这个表达式转换一下会发现
+ * 就是 ffffffffff600000, 即 -10M. */
+#define VSYSCALL_ADDR (-10UL << 20)
+```
+
+-------- e820__memory_setup() --------
+```
+/*
+ * Calls e820__memory_setup_default() in essence to pick up the firmware/bootloader
+ * E820 map - with an optional platform quirk available for virtual platforms
+ * to override this method of boot environment processing:
+ */
+/* 用意比较明显，特定 platform 可能在这步可能会有特殊处理，可以 override default function */
+void __init e820__memory_setup(void)
+{
+	char *who;
+
+	/* This is a firmware interface ABI - make sure we don't break it: */
+	BUILD_BUG_ON(sizeof(struct boot_e820_entry) != 20);
+
+	/* defined to be e820__memory_setup_default by default. Got sanitized E820
+	 * map info. Then copy it to _kexec and _firmware. */
+	who = x86_init.resources.memory_setup();
+
+	memcpy(e820_table_kexec, e820_table, sizeof(*e820_table_kexec));
+	memcpy(e820_table_firmware, e820_table, sizeof(*e820_table_firmware));
+
+	/* Log can be seen with "console=" kernel parameter */
+	pr_info("BIOS-provided physical RAM map:\n");
+	e820__print_table(who);
+}
+
+/*
+ * Pass the firmware (bootloader) E820 map to the kernel and process it:
+ */
+/* boot_params 中的 E820 信息，在 boot/ 的 real mode 代码中有显式的获取过一次，但 ZO，
+ * 以及目前为止的 VO 代码中未看到有获取，所以推断: 32-bit or 64-bit boot protocol 时，
+ * boot loader 负责获取此信息，the conclusion can also be derived from original
+ * comments above. */
+char *__init e820__memory_setup_default(void)
+{
+	char *who = "BIOS-e820";
+
+	/*
+	 * Try to copy the BIOS-supplied E820-map.
+	 *
+	 * Otherwise fake a memory map; one section from 0k->640k,
+	 * the next section from 1mb->appropriate_mem_k
+	 */
+	if (append_e820_table(boot_params.e820_table, boot_params.e820_entries) < 0) {
+		u64 mem_size;
+
+		/* Compare results from other methods and take the one that gives more RAM: */
+		if (boot_params.alt_mem_k < boot_params.screen_info.ext_mem_k) {
+			mem_size = boot_params.screen_info.ext_mem_k;
+			who = "BIOS-88";
+		} else {
+			mem_size = boot_params.alt_mem_k;
+			who = "BIOS-e801";
+		}
+
+		e820_table->nr_entries = 0;
+		e820__range_add(0, LOWMEMSIZE(), E820_TYPE_RAM);
+		e820__range_add(HIGH_MEMORY, mem_size << 10, E820_TYPE_RAM);
+	}
+
+	/* We just appended a lot of ranges, sanitize the table: */
+	/* BIOS-E820 来的信息可能是不健全的(range overlap), so got to sanitize it.
+	 * Achieve the goal via algorithm, implemented in this function, described
+	 * in the comments above its definition. Just read the comments, no need
+	 * spend time on it for now. */
+	e820__update_table(e820_table);
+
+	return who;
+}
+
+/* Among the call-chain of  E820 processing, I encounter for the 1st time the
+ * branch predication statement:likely(). Interesting topic, let's take a look.
+ * In my configuration, it is defined as following, which is GCC built-in function.
+ *
+ *   Refer: https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html
+ */
+# define likely(x)	__builtin_expect(!!(x), 1)
+# define unlikely(x)	__builtin_expect(!!(x), 0)
+
+/* */
 ```
 
 ## APPENDIX
