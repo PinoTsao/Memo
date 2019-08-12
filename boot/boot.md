@@ -259,15 +259,15 @@ boot.s 开头的代码定义了 DAP:
 
 ### diskboot.img
 
-由 core.img 的图示可知，它的第一个 sector 的内容是 diskboot.img. diskboot.img 对应源代码文件 grub-core/boot/i386/pc/diskboot.S. diskboot.img 的执行环境，也即寄存器，由 boot.img 设置，此时的环境如下：
+由 core.img 的图示可知，其第一个 sector 的内容是 diskboot.img, 对应源代码文件 grub-core/boot/i386/pc/diskboot.S. diskboot.img 的执行环境，也即寄存器，由 boot.img 设置，此时的环境如下：
 
 1. 有可用的堆栈(SS 和 SP 已配置)。
 2. 寄存器 DL 中保存正确的引导驱动器。
 3. 寄存器 SI 保存着 DAP(Disk Address Packet) 的地址，因为还需要使用 INT 13 AH=42h 来继续读取磁盘 sector。
 
-diskboot.img 的工作是将 core.img 中剩余的部分继续加载到内存，并跳转过去执行。diskboot.img 的工作本质上和 boot.img 一样，都是借助 BIOS 的 interrupt service 读取磁盘 sector 到内存，只不过 diskboot.img 需要加载多个 sectors 而已。
+diskboot.img 的工作是将 core.img 中剩余的部分继续加载到内存，并跳转过去执行。其实现本质上和 boot.img 一样，都是借助 BIOS 的 interrupt service 读取磁盘 sector 到内存，只不过 diskboot.img 需要加载多个 sectors 而已。
 
-diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能去读。显然，address 在 grub-install 时才会知道. grub-install 将 core.img 占据的 sector 信息(address & size)写入 diskboot.img，这部分空间定义在 diskboot.S 的尾部：
+diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能去读。显然，address 在 grub-install 时才能确定；而 core.img 的 size 在 grub-mkimage(生成 core.img) 时即可确定. core.img 的地址信息(address & size)定义在 diskboot.S 的尾部：
 
 		.org 0x200 - GRUB_BOOT_MACHINE_LIST_SIZE
 	LOCAL(firstlist):	/* this label has to be before the first list entry!!! */
@@ -275,6 +275,8 @@ diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能�
 	blocklist_default_start:
 		/* this is the sector start parameter, in logical sectors from
 		   the start of the disk, sector 0 */
+		/* core.img 的剩余部分默认从第 2 个 sector 开始，因为 sector 0 是 boot.img,
+		 * sector 1 是 diskboot.img. 又因为 x86 是 little-endian, 所以定义如此。*/
 		.long 2, 0
 
 	blocklist_default_len:
@@ -286,7 +288,7 @@ diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能�
 		/* this is the segment of the starting address to load the data into */
 		.word (GRUB_BOOT_MACHINE_KERNEL_SEG + 0x20)
 
-对应了 grub 中的数据结构：
+对应 grub 中的 C struture：
 
 	struct grub_pc_bios_boot_blocklist
 	{
@@ -295,7 +297,7 @@ diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能�
 	  grub_uint16_t segment;
 	} GRUB_PACKED;
 
-为什么这段空间被标以 label: firstlist 呢? 一个 blocklist 描述一段连续的磁盘区域，而在某些未知情况下，core.img 有可能被分成多块安装在磁盘上，所以可能存在多个 blocklist. 若有多个 blocklist，他们的空间会紧挨着 firstlist, 且向 diskboot.img 头部延伸。 来看代码：
+为什么这段空间被标以 label: firstlist 呢? 一个 blocklist 描述一段连续的磁盘区域，而在某些未知情况下，core.img 有可能被分成多块安装在磁盘上(比如, MBR 到第一个 partition sector 之间的空间不够放下 core.img)，所以可能存在多个 blocklist. 若有多个 blocklist，他们的空间会紧挨着 firstlist, 且向 diskboot.img 头部延伸。 来看代码：
 
 
 		/* this sets up for the first run through "bootloop" */
@@ -486,7 +488,7 @@ diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能�
 
 ### lzma_decompress.img
 
-lzma_decompress.img 对应的源码是 grub-core/boot/i386/pc/startup_raw.S，此文件中又 include 同目录下的  "lzma_decode.S"，这是 lzma 的算法核心。它的工作是解压缩它后面的压缩代码，并跳转过去，由 core.img 的图示可知，跳转到 kernel.img，由名字可知，这是 grub 的核心代码，它对应的代码在 grub-core/kern 目录下。从某种意义上说，kernel.img 的代码才是 grub 真正的开始。对于 lzma_decompress.img 代码的详细分析参考[此文](https://blog.csdn.net/conansonic/article/details/78534950)。本节仅做简单分析。
+lzma_decompress.img 对应源码 grub-core/boot/i386/pc/startup_raw.S，此文件中又 include 同目录下的  "lzma_decode.S"，这是 lzma 的算法核心。它的工作是解压缩它后面的压缩代码，并跳转过去，由 core.img 的图示可知，跳转到 kernel.img，由名字可知，这是 grub 的核心代码，它对应的代码在 grub-core/kern 目录下。从某种意义上说，kernel.img 的代码才是 grub 真正的开始。对于 lzma_decompress.img 代码的详细分析参考[此文](https://blog.csdn.net/conansonic/article/details/78534950)。本节仅做简单分析。
 
 startup_raw.S 的开头部分是一条跳转指令：
 
@@ -534,7 +536,7 @@ startup_raw.S 的开头部分是一条跳转指令：
 		call    EXT_C (grub_reed_solomon_recover)
 		jmp	post_reed_solomon
 
-将紧挨着 lzma_decompress.img 的数据(开始于 decompressor_end)解压缩到临时解压缩区域 *GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR*(0x100000) 处，并跳转过去执行，代码如下：
+将紧挨着 lzma_decompress.img 的数据(开始于 decompressor_end)解压缩到临时解压缩区域 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000) 处，并跳转过去执行，代码如下：
 
 	post_reed_solomon:
 
@@ -562,7 +564,7 @@ startup_raw.S 的开头部分是一条跳转指令：
 		movl	$LOCAL(realidt), %eax
 		jmp	*%esi
 
-edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被 push 到 stack 上保存，调用 _LzmaDcodeA 函数后又 `popl %esi`，最后 `jmp *%esi`，也即 jmp 到 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR。这个跳转指令使用了不常见的 `*%esi` 形式，语法解释在 9.15.7 of `info as`：AT&T absolute (as opposed to PC relative) jump/call operands are prefixed by '*'。这里又引入一个知识点：绝对跳转(absolute jump) vs 相对跳转(relative jump)，参考 intel 指令手册的 JMP 指令。
+edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被 push 到 stack 上保存，调用 _LzmaDcodeA 函数后又 `popl %esi`，最后 `jmp *%esi`, 也即 jmp 到  GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR. 这个跳转指令使用了不常见的 `*%esi` 形式，语法解释在 9.15.7 of `info as`：AT&T absolute (as opposed to PC relative) jump/call operands are prefixed by '*'. 这里又引入一个知识点：绝对跳转(absolute jump) vs 相对跳转(relative jump)，参考 intel 指令手册的 JMP 指令。
 
 ### kernel.img
 
@@ -586,7 +588,7 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 
 可以看出：kernel.img 的入口是 startup.S，其代码起始(虚拟)地址为 0x9000，因为 kernel.img 运行在保护模式下，所以文件开头有 directive `.code32`。
 
-在 kernel.img 之前运行的代码的 CS 的值都是0，切换到保护模式后，CS 的 segment descriptor 基址也是0。由 startup_raw.S 最后几行代码可知，此时 esi 的值是 0x100000(1M)，edi，ecx 保存着两个函数的地址，eax 保存数据 realidt 的地址。在开头 startup.S 的开头，这几个地址被保存到 kernel.img 内部的变量中：
+在 kernel.img 之前运行的代码的 CS 的值都是 0，切换到保护模式后，CS 的 segment descriptor 基址也是 0. 由 startup_raw.S 最后几行代码可知，此时 esi 的值是 0x100000(1M), edi，ecx 分别保存函数 prot_to_real 和 real_to_prot 的地址，eax 保存数据 realidt 的地址。在开头 startup.S 的开头，这几个地址被保存到 kernel.img 内部的变量中：
 
 		movl	%ecx, (LOCAL(real_to_prot_addr) - _start) (%esi)
 		movl	%edi, (LOCAL(prot_to_real_addr) - _start) (%esi)
@@ -599,7 +601,7 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 		movl	$EXT_C(_edata), %ecx
 		subl    $LOCAL(start), %ecx
 	#else
-		/* 二者相减，得到 kernel.img 的 size，存在 ecx，下面的 movsb 指令会用到 */
+		/* 二者相减，得到 kernel.img 的 size，放在 ecx 中，下面 movsb 指令会用到 */
 		movl	$(_edata - _start), %ecx
 	#endif
 		/* _start 位于 kernel.img 的开头，所以它的地址是 0x9000，这是 copy 的目的地址 */
@@ -607,22 +609,24 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 		rep
 		movsb
 
-		/* 窍门：符号 cont 的地址是基于 0x9000，加上当前的 location counter。刚刚已经把
-		 * kernel.img copy 回它应该在的地址，这里通过绝对跳转，跳回符号 cont 的地址继续执行。
-		 * 也就是说，绝对跳转后执行的代码是取自 0x9000 的 kernel.img，不是 0x100000(buffer中)
-		 * kernel.img */
+		/* 窍门：符号 cont 的地址是基于 0x9000，加上当前的 location counter. 刚刚已
+		 * 把 kernel.img copy 回它应该在的地址，这里通过绝对跳转，跳回符号 cont 的地址
+		 * 继续执行。也就是说，绝对跳转后执行的代码是取自 0x9000 的 kernel.img，不是
+		 * buffer 0x100000 中的 kernel.img */
 		movl	$LOCAL (cont), %esi
 		jmp	*%esi
 	LOCAL(cont):
 
-这里有个不常见的符号: _edata，可以通过 `man etext/edata/end/` 来了解，ld 的默认链接脚本会定义了这几个符号。那么如何查看 ld 的 default linker script 呢？ 使用 `ld --verbose` 可以查看默认链接脚本的完整内容。继续看后面的代码
+这里有个不常见的符号: _edata，可以通过 `man etext/edata/end/` 来了解，ld 的 default linker script 中定义了这几个符号。如何查看 ld 的 default linker script? 使用 `ld --verbose`.
+
+继续代码分析:
 
 	LOCAL(cont):
 	...
 
 		/* clean out the bss */
-		/* 跳转回来后第一件事是为 bss section 手动清零，BSS_START_SYMBOL 的值默认是
-		 * __bss_start，END_SYMBOL 默认值是 "end"，都在 ld 的默认链接脚本中定义。*/
+		/* 跳回后第一件事是清零 bss section ，BSS_START_SYMBOL 的值默认是 __bss_start,
+		 * END_SYMBOL 默认值是 "end"，都在 ld 的 default linker script 中定义。*/
 		movl	$BSS_START_SYMBOL, %edi
 
 		/* compute the bss length */
@@ -635,7 +639,7 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 		xorl	%eax, %eax
 		cld
 		rep
-		stosb /* store eax to ES:EDI，每次 1 byte，重复 ecx 次*/
+		stosb /* store eax to ES:EDI，每次 1 byte，重复 ecx 次 */
 
 		movl	%edx, EXT_C(grub_boot_device)
 
@@ -644,9 +648,9 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 		 */
 		call EXT_C(grub_main)
 
-移动完 kernel.img，清零 bss 区域，然后跳到 C 函数 *grum_main*，这才进入 grub 的核心内容。分析到这一步，可以暂停下，先去阅读“安装 GRUB”一节，再回来看 kernel.img 的流程。
+移动完 kernel.img，清零 bss 区域，然后跳到 C 函数 *grum_main*，这是 grub 的核心内容。分析到这一步，可以暂停下，先去阅读“安装 GRUB”一节，再回来看 kernel.img 的流程。
 
-#### grub_main
+#### kernel.img/grub_main
 
 从这个函数开始是 grub 核心内容
 
@@ -686,28 +690,29 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 
 	void grub_machine_init (void)
 	{
-	  /* 针对 VIA 的芯片做 workaround，无需研究 */
+	  /* 对 VIA chipset 做 workaround, 略过 */
 	  grub_via_workaround_init ();
 
-	  /* 上文已说，解压缩的临时 buffer 位于地址 1M(0x100000)处，压缩数据前端是 kernel.img，
-	   * 后面是各 module。bss section 不占据文件空间，所以 _edata - _start 是 kernel.img
-	   * 的有效 size；又因 module 紧挨 kernel.img，所以 modules 的起始地址计算如下 */
+	  /* 解压缩用的的临时 buffer 位于地址 1M(0x100000)处，压缩数据前端是 kernel.img，
+	   * 后面是各 modules. bss section 不占据文件空间，所以 _edata - _start 是
+	   * kernel.img 的 file size； 又因 modules 紧挨 kernel.img，所以 modules 的
+	   * 起始地址 grub_modbase 计算如下 */
 	  grub_modbase = GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR + (_edata - _start);
 	  ...
 
-	  /* 内存的初始化是重点。其实比较简单，函数 grub_machine_mmap_iterate 通过 e820 中断
-	   * 获得内存信息(addr, len, type)，然后将信息交给函数 mmap_iterate_hook 处理，过滤
-	   * 掉地址小于 1M 且大于 4G 的，将类型是 GRUB_MEMORY_AVAILABLE 的内存区域保存到数组
-	   * mem_regions[] 中 */
+	  /* 内存的初始化是重点。其实比较简单，函数 grub_machine_mmap_iterate 通过 e820
+	   * 中断获得内存信息(addr, len, type)，然后将信息交给函数 mmap_iterate_hook 处理，
+	   * 过滤掉地址小于 1M 且大于 4G 的，将类型是 GRUB_MEMORY_AVAILABLE 的内存区域保存
+	   * 到数组 mem_regions[] 中 */
 	  grub_machine_mmap_iterate (mmap_iterate_hook, NULL);
-	  /* 整理数组 mem_regions[]：按地址从小到大排序，如果 2 块内存区域有重叠，则合二为一 */
+	  /* 整理数组 mem_regions[]：按地址从小到大排序，若相邻内存区域有重叠，则合二为一 */
 	  compact_mem_regions ();
 
-	  /* 获得解压缩 buffer 中的 module 的结束地址，通过 grub_mm_init_region 初始化 grub
-	   * 的内存管理功能。要看明白此函数，需要了解 core.img 的打包格式，在“安装 GRUB”一节中有
-	   * 图示。因为不是重点，所以对此函数不做详细。看起来由两级数据结构来管理：grub_mm_region_t
-	   * & grub_mm_header_t。初始化后，grub 中所有的 malloc 类操作都是在操作 grub_mm_base
-	   * 这个数据结构 */
+	  /* 获得解压缩 buffer 中的 module 的结束地址，通过 grub_mm_init_region 初始化
+	   * grub 的内存管理功能。要看明白此函数，需要了解 core.img 的打包格式，在“安装 GRUB”
+	   * 一节中有图示。不是重点，故对此函数不做详细。看起来由两级数据结构来管理：
+	   * grub_mm_region_t & grub_mm_header_t。初始化后，grub 中所有 malloc 类操作
+	   * 都是在操作 grub_mm_base 这个数据结构 */
 	  modend = grub_modules_get_end ();
 	  for (i = 0; i < num_regions; i++)
 	  {
@@ -723,9 +728,7 @@ edi 被赋值为 GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000=1M)，然后被
 
 grub_load_modules 函数比较复杂，核心内容是遍历 buffer 中所有类型为 OBJ_TYPE_ELF 的 module，将其代码和数据加载到一块分配的内存中并进行重定位，然后执行 module 的初始化函数。
 
->grub_load_modules -- 遍历module --> grub_dl_load_core --> **grub_dl_load_core_noinit**
-                                                     \
->                                                     --> grub_dl_init
+![grub load modules](grub_loadmod.png)
 
 重点在函数 grub_dl_load_core_noinit 中:
 
@@ -981,7 +984,7 @@ grub_load_modules 函数比较复杂，核心内容是遍历 buffer 中所有类
 	  grub_dl_head = mod;
 	}
 
-Ok，终于介绍完了 grub_load_modules 函数，至此，我们可以对上述过程用下图做一个总结：
+Ok，终于分析完了 grub_load_modules 函数。对上述过程用下图做一个总结：
 
 ![grub boot process](grub_boot.png)
 
@@ -1007,32 +1010,20 @@ Ok，终于介绍完了 grub_load_modules 函数，至此，我们可以对上�
 	  /* 读取 grub 目录中各种文件。读取 command.lst，fs.lst，crypto.lst，terminal.lst
 	   * 保存到内部数据结构中；读取 grub.cfg 保存到 grub_menu_t 结构中，并执行其中的命令
 	   * (应该是 grub.cfg 上方，menuentry 以外的那些命令)，grub_menu_t 结构包括了显示
-	   * grub menu 所需的数据。显示 menu 菜单，获得用户选择的 menu entry 或 timeout 后的
-	   * default entry，执行这个 entry 中的各命令来启动 OS */
+	   * grub menu 所需的数据。显示 menu 菜单，获得用户选择的 menu entry 或 timeout
+	   * 后的 default entry，执行这个 entry 中的各命令来启动 OS */
 	  grub_normal_execute (config, 0, 0);
-	  /* 正常情况下，下面这个函数不会走到？因为上面的函数已经成功启动 OS 了，只有在无法启动 OS
-	   * 的异常情况下，grub_normal_execute 才返回？ */
+	  /* 正常情况下，下面这个函数不会走到？因为上面的函数已经成功启动 OS 了，只有在无法启动
+	   * OS 的异常情况下，grub_normal_execute 才返回？ */
 	  grub_cmdline_run (0, 1);
 	  ...
 	}
 
 展示 grub menu，获得 menu entry 并执行这个 entry 的 callchain 长这样(待修改为图片)：
 
->grub_normal_execute
-    --> grub_show_menu
-        --> show_menu
-            --> boot_entry = run_menu (menu, nested, &auto_boot);
-            --> e = grub_menu_get_entry (menu, boot_entry);
-            --> grub_menu_execute_with_fallback (menu, e, autobooted, &execution_callback,0);
-            --> grub_menu_execute_entry /* Run a menu entry */
-                --> grub_script_execute_new_scope
-                    /* 看起来像在逐行解析 menu entry 的内容，并执行对应的命令，
-                     * 如 linux16, initrd16 等 */
-                    --> grub_script_execute_sourcecode
-                /* 执行完 entry 中的各种命令，可以启动 OS 了 */
-                --> grub_command_execute ("boot", 0, 0)
+![grub memu](grub_memuboot.png)
 
-上述过程有待详细分析。分析到这一步，我们所关心的 grub 工作流程，就剩下 menu entry 中用于加载 linux kernel 和 initramfs 的两条命令比较重要，将单独作为一节进行分析，因为它涉及 Linux kernel 的内容，将在 “normal 模块加载 linux kernel & initramfs”一节中进行分析。
+上述 callchain 中部分过程下文有详细分析。走到这一步，我们所关心的 grub 工作流程，就剩下 menu entry 中用于加载 linux kernel 和 initramfs 的两条命令比较重要，将单独作为一节进行分析，因为它涉及 Linux kernel 的内容，将在 "normal mod loading linux kernel & initramfs”一节中进行分析。
 
 #### GRUB modules introduction
 
@@ -1215,10 +1206,10 @@ linux kernel 和 initrd image 都加载好了，现在可以回到 normal 模块
 	grub_menu_execute_entry(...)
 	{
 	  ...
-	  /* 执行完 menu entry 中的所有命令，终于可以启动 OS 了。通过执行 "boot" 命令对应的函数
-	   * grub_cmd_boot 来实现，代码在 grub-core/commands/boot.c 中 */
+	  /* 执行完 menu entry 中的所有命令，最后通过执行 "boot" 命令启动 OS, 对应函数
+	   * grub_cmd_boot, 代码在 grub-core/commands/boot.c */
 	  if (grub_errno == GRUB_ERR_NONE && grub_loader_is_loaded ())
-	    /* Implicit execution of boot, only if something is loaded.  */
+	    /* Implicit execution of boot, only if something is loaded. */
 	    grub_command_execute ("boot", 0, 0);
 	}
 
@@ -1260,16 +1251,16 @@ grub_cmd_boot 函数的内容只有一行：调用 grub_loader_boot 函数，继
 
 	  grub_stop_floppy ();
 
-	  /* 重点落到这个函数，下面继续分析*/
+	  /* 重点落到这个函数 */
 	  return grub_relocator16_boot (relocator, state);
 	}
 
 	grub_err_t grub_relocator16_boot (..., struct grub_relocator16_state state)
 	{
 	  /* Put it higher than the byte it checks for A20 check.  */
-	  /* 从[0x8010 ~ 0xa0000- RELOCATOR_SIZEOF (16)- GRUB_RELOCATOR16_STACK_SIZE]中
-	   * 分配一块 size 为 RELOCATOR_SIZEOF (16) + GRUB_RELOCATOR16_STACK_SIZE 的内存，
-	   * 保存在变量 ch 中。在此上下文中，用 A1 表示这块内存的起始地址。RELOCATOR_SIZEOF (16)
+	  /* 从 [0x8010 ~ 0xa0000- RELOCATOR_SIZEOF (16)- GRUB_RELOCATOR16_STACK_SIZE]
+	   * 中分配一块 size 为 RELOCATOR_SIZEOF (16) + GRUB_RELOCATOR16_STACK_SIZE 的
+	   * 空间，保存在变量 ch 中。在此上下文中，用 A1 表示这块内存的起始地址。RELOCATOR_SIZEOF (16)
 	   * 表示 relocator16.S 中 grub_relocator16_end - grub_relocator16_start 的大小。*/
 	  err = grub_relocator_alloc_chunk_align (rel, &ch, 0x8010,
 					  0xa0000 - RELOCATOR_SIZEOF (16)
@@ -1834,7 +1825,7 @@ man 手册中说：
 
 而无需指定额外参数，grub 会自动配置好其他参数。grub-install 的工作主要是将 grub 的文件从 image directory 拷贝到 boot directory，然后调用 grub-mkimage 生成 core.img，调用 grub-bios-setup 来安装 boot.img 和 core.img。我们仍选择关键代码分析，以理解其过程。
 
-	/* 首先是一堆准备工作，各种读取文件*/
+	/* 首先是一堆准备工作，各种读取文件 */
 	/* grub_install_source_directory 便是上文说的 image directory，target 在我们的
 	 * 例子中是 "i386-pc" */
 	if (!grub_install_source_directory)
@@ -3671,7 +3662,7 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 			 * 个内核时，会建立一个 identity mapped page table, 毕竟 kexec 可以看作
 			 * 一个特殊的 boot loader. 从代码可以找到证据: machine_kexec_prepare ->
 			 * init_pgtable, 可以猜想，kexec 建立的页表会满足此刻的所有需求。
-			 * 
+			 *
 			 * __native_read_cr3() 本就是返回 unsigned long，这里转换的逻辑是：
 			 * 以整数形式读出 top page table 的地址，转为指针后再使用 dereference
 			 * operator (*) 可以取该地址处相应指针类型的整数，即 PML5 中第一个 entry
@@ -6723,40 +6714,77 @@ void __init setup_arch(char **cmdline_p)
 ```
 -------- early_ioremap_init --------
 
-Analysing critical code only
+fixmap 的设计有一些 tricky，需要先有一个 general idea, 才容易理解下面的代码。我们以 4-level paging 为例进行描述，即假设 PAGE_SIZE 是 4k, 1 个 PMD entry 映射 2M 空间。
 
+fixmap, 顾名思义，部分虚拟地址空间用于特定用途的mapping. 既然是 **fix**, 那么在编译时就可以确定这部分地址，或者说可以 hardcode。用于 fixmap 的初始空间不超过 4M，但初始时固定给他分配 4M, 即 2 个 PMD 的 mapping range, 参考 FIXMAP_PMD_NUM 的定义; 从 early page table 的构建也可以看出这一点：level2_fixmap_pgt 和 level1_fixmap_pgt 处的代码。fixmap 的空间范围由 [FIXADDR_START - FIXADDR_TOP + PAGE_SIZE] 表示，这段空间以 PAGE_SIZE 为单位划分，使用 index number 索引 page. index 定义在 enum fixed_addresses 中。重点是，使用 index 索引 fixmap 空间时，是**逆向**的, 也就是说 index 0 索引的地址是 FIXADDR_TOP, 而 max index 索引 FIXADDR_START. 从 FIXMAP_PMD_TOP 定义的 comment 可以看出**逆向**这一点: downwards.
+
+不同情况下，enum fixed_addresses 中的 index 数不同，也即需要的 fixmap 空间 size 不同，所以 FIXADDR_START 的值根据它的定义计算而来。
+
+With the general idea, 来看代码:
 ```
+static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
+...
+
 void __init early_ioremap_init(void)
 {
 	pmd_t *pmd;
 
-	/* 第一行代码就可以窥到核心设计了，下文详细分析 fix_to_virt */
+	/* 这里引出核心设计。需要先阅读下文 fix_to_virt & 其他的详细分析。
+	 * 看完了下面的分析，也就可以理解 BUILD_BUG_ON 中的 condition 不可以为 TRUE. */
 #ifdef CONFIG_X86_64
 	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
 #else
 	...
 #endif
+	/* 完全理解第一行代码后，此函数的内容就容易理解了。FIX_BTMAP_BEGIN 到 FIX_BTMAP_END
+	 * 中的所有 pages 又被划分为 slot per 64 pages. 将 slot address 记在 slot_virt[]
+	 * 中，现在尚不知用途，let's wait to see. */
 	early_ioremap_setup();
 
+	/* 找到 FIX_BTMAP_BEGIN 对应的 virtual address, 再找到对应的 pmd entry. */
 	pmd = early_ioremap_pmd(fix_to_virt(FIX_BTMAP_BEGIN));
+	/* bm_pte 是一个 4k size 的 page table. 刚找到的 pmd entry *pmd* 将指向它 */
 	memset(bm_pte, 0, sizeof(bm_pte));
 	pmd_populate_kernel(&init_mm, pmd, bm_pte);
+
+	/* Tips: head_64.S 中构建 early page table 时，已对 fixmap 空间作了部分初始化，见:
+	 * level2_fixmap_pgt 处代码，那里的代码初始化了 506, 507 两个 pmd entry. 以正常
+	 * 情况(w/ CONFIG_X86_VSYSCALL_EMULATION)为例： 507 号 pmd entry 用于 vsyscall
+	 * emulation mapping; 506 号 pmd entry 用于 [FIX_DBGP_BASE - FIX_BTMAP_END)
+	 * 的 mapping.
+	 * 而地址 [FIX_BTMAP_END - FIX_BTMAP_BEGIN] 没有在 head_64 中初始化，显然，它需要
+	 * 505 号 pmd entry, 上面的代码就是相应的页表初始化。*/
 
 	/*
 	 * The boot-ioremap range spans multiple pmds, for which
 	 * we are not prepared:
 	 */
+	/* 宏 __FIXADDR_TOP 仅在 CONFIG_X86_32 时有效，它的存在仅仅是因为 BUILD_BUG_ON 中
+	 * 需要它的值做 if 判断。变量 __FIXADDR_TOP 定义在别的文件中，仅编译当前文件时无法
+	 * 知道该变量的值，链接时才能知道。而 attribute __error__() 的使用，需要在编译时知道
+	 * if(__FIXADDR_TOP) 中的值，所以这里定义的宏，与它同名变量的值一样。
+	 * 另外，这也暗示了一个 tip: 同名的 variable 和 macro, 编译时，优先使用 macro.
+	 * 下方的 demo 程序模仿了 CONFIG_X86_32 环境，可用于验证测试上述结论。
+	 *
+	 * FIX_BTMAP_BEGIN 和 FIX_BTMAP_END 索引的虚拟地址必须在同一个 PMD entry 中.
+	 * 详细分析在 FIX_BTMAP_BEGIN 的定义处，共 3 种情况。 */
 #define __FIXADDR_TOP (-PAGE_SIZE)
 	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
 		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
 #undef __FIXADDR_TOP
 
+	/* 如果 FIX_BTMAP_BEGIN 和 FIX_BTMAP_END 不在同一个 PMD 中，就一堆 printk.
+	 * 上面已有 BUILD_BUG_ON 作 enforcement, 这里需要吗? 还以为可以发 patch 删掉，研究
+	 * 了一大圈，发现并不是完全没有意义，因为 BUILD_BUG_ON 仅是使用 GCC 的 attribute
+	 * __error__, 而现在 kernel 还要支持 clang, clang 中并没有这个功能，即它在 clang
+	 * 下没用，这时如果发生了这个错误，下面的 printk 可以提供一些有用信息 */
 	if (pmd != early_ioremap_pmd(fix_to_virt(FIX_BTMAP_END))) {
 		WARN_ON(1);
-		/* omit a series of printk */
+		/* 一堆 printk，略过 */
 	}
 }
 
+/* As general idea said, 逆向的映射, index 0 => FIXADDR_TOP */
 #define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
 
 /*
@@ -6774,22 +6802,27 @@ static __always_inline unsigned long fix_to_virt(const unsigned int idx)
 
 /* enumeration definition 被 numerous #ifdef 包裹，看起来费劲，so, appropriately
  * simplified code would help analyzing & understanding its core design.
- * 设计的核心：从特定地址开始，以 4k page size 为单位，用 index number 索引每个 page,
- * 这些地址用于特定用途的 mapping, 所以是 fixed address.
- * 当有 CONFIG_X86_VSYSCALL_EMULATION 时，从地址 VSYSCALL_ADDR 开始, 其 index 是 0,
- * 但此 enum 定义从 FIXADDR_TOP 对应的 index 开始。
- *  */
+ *
+ * 配置 CONFIG_X86_VSYSCALL_EMULATION 时，表明部分 fixmap 地址空间用于 vsyscall.
+ * 目前不理解 vsyscall 不影响对本段代码的理解。需要先看下文 FIXADDR_TOP, VSYSCALL_ADDR
+ * 的分析。      计算可知, VSYSCALL_PAGE = 511.
+ *
+ * (看完下面其他代码分析后，再来看下面这段的总结)
+ * 可以看出，w/ CONFIG_X86_VSYSCALL_EMULATION 时，2 个 PMD entry(2M) 中，后者(高地址)
+ * 用于 vsyscall 映射，前者(低地址)作其他用途；w/o CONFIG_X86_VSYSCALL_EMULATION 时，
+ * 后者(高地址)直接作其他用途。*/
 enum fixed_addresses {
 	...
 #ifdef CONFIG_X86_VSYSCALL_EMULATION
-	/* 先去看下文 FIXADDR_TOP, VSYSCALL_ADDR 的分析 */
 	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
 #endif
 
+	/* 一般情况下，CONFIG_X86_VSYSCALL_EMULATION 默认 y, 所以 FIX_DBGP_BASE = 512,
+	 * 指向 PMD entry(2M) 中的最末 page. */
 	FIX_DBGP_BASE,
 	FIX_EARLYCON_MEM_BASE,
 	...
-	/* 看到 APIC, 开始悟到一些 */
+	/* 看到 APIC, 开始悟到一些： APIC 有很多寄存器 */
 #ifdef CONFIG_X86_LOCAL_APIC
 	FIX_APIC_BASE,	/* local (CPU) APIC) -- required for SMP or not */
 #endif
@@ -6812,22 +6845,33 @@ enum fixed_addresses {
 	/*
 	 * 512 temporary boot-time mappings, used by early_ioremap(),
 	 * before ioremap() is functional.
-	 *
+	 * (为什么是 a single pgd? WHY not pmd?)
 	 * If necessary we round it up to the next 512 pages boundary so
 	 * that we can have a single pgd entry and a single pte table:
 	 */
-	 /* 下面这个巨长的 expression, 可能只有数学小王子能轻松看懂。笔者只能简化分析。条件：
+	 /* 下面这个巨长的 expression, 可能只有数学小王子能轻松看懂，笔者只能简化分析。
+	  * PTRS_PER_PTE = 1024 only in CONFIG_X86_32 w/o PAE, 其他情况下都 = 512.
+	  * 条件：
 	  *    x ^ (x + 0x1FF)
 	  *	   &
-	  *	   0xfffffe00
-	  * 简化后分析方便多了。Expression result：TRUE if x <= 511; FALSE if x > 511.
+	  *	   0xfffffc00(PTRS_PER_PTE=1024) 或 0xfffffe00(PTRS_PER_PTE=512)
 	  *
-	  * If TRUE:  FIX_BTMAP_END = x + 512 - (x & 511) = x + 512 - x = 512
-	  * If FALSE: FIX_BTMAP_END = x.
-	  * 这下可以理解原 comment 的含义了： round it up to next 512 pages boundary if
-	  * necessary(if index x <= 511) */
+	  * PTRS_PER_PTE = 1024, 即 -PTRS_PER_PTE = 0xfffffc00 时:
+	  * Condition Expression result = TRUE (if x > 511); FALSE (if x <= 511).
+	  * If TRUE(x > 511):   FIX_BTMAP_END 向上对齐到 TOTAL_FIX_BTMAPS, 这时，
+	  *                     FIX_BTMAP_END 要么 index 下一个(逆向) PMD entry(4M) 中
+	  *                     最末 page, 要么 index 当前 PMD entry(4M) 中 512 号 entry.
+	  * If FALSE(x <= 511): FIX_BTMAP_END = x.
+	  *
+	  * PTRS_PER_PTE = 512, 即 -PTRS_PER_PTE = 0xfffffe00 时:
+	  * Condition Expression result *always* = TRUE.
+	  * FIX_BTMAP_END 向上对齐到 TOTAL_FIX_BTMAPS, 即 FIX_BTMAP_END index
+	  * 下一个(逆向) PMD entry(2M) 中的最末 page.
+	  *
+	  * "round it up to next 512 pages boundary if necessary" finally make
+	  * sense: if index x > 511 */
 #define NR_FIX_BTMAPS		64 /* 看起来像 long 的 bit 数 */
-#define FIX_BTMAPS_SLOTS	8  /* 需要 512 个 4k mapping 没*/
+#define FIX_BTMAPS_SLOTS	8  /* 需要 512 个 4k mapping */
 #define TOTAL_FIX_BTMAPS	(NR_FIX_BTMAPS * FIX_BTMAPS_SLOTS)
 	FIX_BTMAP_END =
 	 (__end_of_permanent_fixed_addresses ^
@@ -6837,6 +6881,20 @@ enum fixed_addresses {
 	   (__end_of_permanent_fixed_addresses & (TOTAL_FIX_BTMAPS - 1))
 	 : __end_of_permanent_fixed_addresses,
 
+	/* 了解了 fixmap 空间是逆向索引，就明白为何 enum 中 FIX_BTMAP_END 定义在前，而
+	 * FIX_BTMAP_BEGIN 在后面，END, BEGIN 是虚拟地址的角度。
+	 *
+	 * [Tip] 由上面表达式的分析可知，有 3 种情况:
+	 *   1. (PTRS_PER_PTE = 1024 && FIX_BTMAP_END <= 511), then FIX_BTMAP_BEGIN
+	 *      < 1023, so FIX_BTMAP_END & FIX_BTMAP_BEGIN 在同一个 PMD entry(4M) 中。
+	 *   2. (PTRS_PER_PTE = 1024 && FIX_BTMAP_END > 511), FIX_BTMAP_END 对齐 512,
+	 *      意味着它要么 index 当前 PMD entry(4M) 中的 512 号 entry, 要么下一个(逆向)
+	 *      PMD entry 中的最末 page, 总之 FIX_BTMAP_BEGIN 还是和它在同一个 PMD entry 中
+	 *   3. (PTRS_PER_PTE = 512), FIX_BTMAP_END 总是 512 aligned(TOTAL_FIX_BTMAPS),
+	 *      即总是 index 下一个(逆向) PMD entry(2M) 中最末 page, 所以 FIX_BTMAP_BEGIN
+	 *      也总是 index 下一个(逆向) PMD entry(2M) 中第一个 page, i.e., 这两个 page
+	 *      _END, _BEGIN index 的 page 在同一个 pmd entry 中。
+	 *      函数中会 enforce 这一条件。*/
 	FIX_BTMAP_BEGIN = FIX_BTMAP_END + TOTAL_FIX_BTMAPS - 1,
 
 	...
@@ -6844,16 +6902,37 @@ enum fixed_addresses {
 	__end_of_fixed_addresses
 };
 
-/* 仅分析 4-level paging 下的正常情况，即 PAGE_SIZE = 4k, PMD_SHIFT = 21. 简单心算
- * 可知 expression value = VSYSCALL_ADDR + 2M - 4k */
+/* 若无上文 general idea 的背景知识，很理解此定义。
+ *
+ * 以 4-level paging 为例，即 PAGE_SIZE = 4k, PMD_SHIFT = 21. 简单心算可知
+ * expression value = VSYSCALL_ADDR + 2M - 4k, 大约是地址 -8M 减去 4k 的位置。目地
+ * 是 index 0 => FIXADDR_TOP */
 #define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
 			 PAGE_SIZE)
 
 /* 参考 Documentation/x86/x86_64/mm.rst: 地址 ffffffffff600000 起始的 4k 用于 map
- * legacy vsyscall ABI. 暂时不知其含义也不影响理解这里的代码。而这个表达式转换一下会发现
- * 就是 ffffffffff600000, 即 -10M. */
+ * legacy vsyscall ABI. 而这个表达式转换后就是 ffffffffff600000, 即 -10M. */
 #define VSYSCALL_ADDR (-10UL << 20)
 ```
+用于验证 __FIXADDR_TOP 相关结论的 demo program(仅编译: `gcc -c xx.c -o x.o`):
+```
+extern unsigned long __FIXADDR_TOP;
+#define FIXADDR_TOP     ((unsigned long)__FIXADDR_TOP)
+//int __FIXADDR_TOP = 1;
+
+extern void nocompiling(void) __attribute__((__error__("NO compile on purpose")));
+
+int main()
+{
+//#define __FIXADDR_TOP 0
+    if (FIXADDR_TOP)
+        nocompiling();
+//#undef __FIXADDR_TOP
+
+    return 0;
+}
+```
+注意：自己调整代码细节进行验证。
 
 -------- e820__memory_setup() --------
 ```

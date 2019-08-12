@@ -1,0 +1,25 @@
+
+
+    grub_load_modules
+	(for each module traversed by grub_modbase)
+	grub_dl_load_core
+	    grub_dl_load_core_noinit
+	    grub_dl_init
+
+
+    grub_normal_execute
+	grub_show_menu
+	    show_menu
+		boot_entry = run_menu (menu, nested, &auto_boot);
+		e = grub_menu_get_entry (menu, boot_entry);
+		if (auto_boot)
+		    grub_menu_execute_with_fallback (menu, e, autobooted, &execution_callback,0)
+			grub_menu_execute_entry
+		else
+		    grub_menu_execute_entry /* Run a menu entry */
+			grub_script_execute_new_scope
+			    /* 逐行解析 menu entry 的内容，并执行相应
+			     * 命令，如 linux16, initrd16 等 */
+			     grub_script_execute_sourcecode
+			 /* 最后执行 boot 命令，启动 OS */
+			 grub_command_execute ("boot", 0, 0)
