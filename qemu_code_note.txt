@@ -1,8 +1,10 @@
-QEMU code note
+# QEMU code memo
 
-QMP: QEMU Machine Protocol
+Code/design analysis started from the end of 2015, probably out of date.
 
-【ram_block_add】
+(QMP: QEMU Machine Protocol)
+
+#### ram_block_add
 不是预先分配好的地址空间的情况下，调用关系：qemu_ram_alloc_internal --> ram_block_add --> phys_mem_alloc(=qemu_anon_ram_alloc, 此函数就是分配空间) --> qemu_ram_mmap
 qemu_ram_alloc_internal 函数结构略有点乱，做的事情是malloc 一个 RAMBlock 结构，并初始化一部分 field (RAMBlock 的 used_length，max_length 都是经过host page size 对齐的)，然后将其加入 ram_list 列表
 qemu_anon_ram_alloc 函数为了使分配得内存的起始地址和长度都是对齐的，煞费苦心的做了2次 mmap。
@@ -28,7 +30,7 @@ ram_list 中的RamBlock是按block size大小，从大到小排列。两个QLIST
 之所以qemu_ram_alloc_internal有size, max_size两个参数，看起来是为了resizeable ram准备的，其他情况二者是相等的。
 
 
-【bitmap_set】
+#### bitmap_set
 void bitmap_set(unsigned long *map, long start, long nr)
 
 map 是一个long类型的指针数组。假设包含4个元素，则是4个long 指针，假设在32bit机器上，则是 4 x 4 x 8=128bit，从start bit开始的nr个bit，set为1。 这里面有个小trick，一个long元素中，bit set的顺序是从最低bit到最高bit。
@@ -39,7 +41,8 @@ map 是一个long类型的指针数组。假设包含4个元素，则是4个long
 (31)|__|__|__|__|(0) ,(31)|__|__|__|_F|(0) ,(31)|__|__|__|__|(0) ,(31)|__|__|__|__|(0)  --注意这个F，就是我们set的4个bit，是从第二个long的最低bit开始的！这就解释了关于之前对bitmap设置的疑惑，就是因为整个128bit，并不是从0-127，从左到右的简单排列！
 
 
-【时钟类型】
+#### Clock Type
+
 QEMU_CLOCK_REALTIME：最终调用 #if CLOCK_MONOTONIC clock_gettime(CLOCK_MONOTONIC) #else gettimeofday() 。
 
     CLOCK_MONOTONIC   这个时间表示自epoch以来的时间，以秒和纳秒为单位，这个时间值不会被人为设置系统时间的操作而影响
@@ -55,17 +58,17 @@ QEMU_CLOCK_VIRTUAL: 最终调用 clock_gettime, 返回值是加上一个offset�
 
 
 
-【qemu module /object 架构】：(module包含device，machine，还有qapi等)
+#### Module/object (module means:device, machine, qapi, etc)
 
 MODULE_INIT_BLOCK/MACHINE/QAPI/QOM，对应4个TAILQ队列，主要是MACHINE和QOM(设备)。所有的MACHINE/QOM都是TypeInfo数据结构，且有继承关系，每个TypeInfo对应一个class和instance数据结构，class和instance也是有继承关系。main函数执行之前，执行constructor，将所有 TypeInfo 的初始化函数保存各自的TAILQ队列里。main函数通过module_call_init(type) 执行对应TAILQ队列中 TypeInfo 初始化函数，所有这些初始化函数都是通过type_register函数，用TypeInfo数据初始化相应的TypeImpl(惟独未初始化其中的TypeImpl *parent_type 和 ObjectClass *class)，然后保存在全局的 HashTable 中，其 Key/Value 是 TypeImpl name/TypeImpl指针。object_class_get_list(TYPE_MACHINE, false)，此函数将遍历出 HashTable 中所有item(TypeImpl结构)，调用 type_initialize 继续初始化其之前未初始化的两个成员: parent_type & class，然后找出(class对应的)TypeImpl的祖先是TYPE_MACHINE，且该Type是非抽象的那些class，将这些class放入一个GSList单链表中待用。
 
 在main函数执行之前执行constructor函数，通过machine_init/type_init等函数将各类module(4种，MODULE_INIT_BLOCK/MACHINE/QAPI/QOM，每一个对应一个TAILQ数据结构)的实例的初始化函数存储在对应module type的TAILQ数据结构中，在main函数中通过调用module_call_init(type)，执行之前存好的初始化函数，初始化对应type的module的所有实例，所有的实例的该初始化函数的主要工作都是通过type_register函数，将该module实例的TypeInfo结构转为TypeImpl，并保存在 HashTable 中(key/value是 TypeImpl->name/TypeImpl指针本身)。函数type_new完成数据结构typeinfo到TypeImpl的转换，此函数中有两个TypeImpl的成员变量没有初始化： TypeImpl *parent_type 和 ObjectClass *class，此二者在type_initialize中被初始化，该函数主要负责初始化该Type对应的class。
 
-Interface也是一个TypeInfo结构，初始化为TypeImpl。假设有如下继承关系 A<--B<--C<--D，C的TypeInfo结构里指明的interface类型是 TYPE_HOTPLUG_HANDLER，注意！这个只是指明了C的interface的类型！实际的interface的初始化（在 type_initialize_interface） 中，是现场创建了一个新类型的TypeInfo，其name是interface对应的device的名字和interface type 名字组合在一起，比如TYPE_PC_MACHINE有TYPE_HOTPLUG_HANDLER的interface，初始化时候创建的新类型interface的TypeInfo名字是TYPE_PC_MACHINE:: TYPE_HOTPLUG_HANDLER，新类型interface的TypeImpl的class是TYPE_HOTPLUG_HANDLER对应的class，其interface基类InterfaceClass的成员：concrete_class指的是该interface所依附的设备TypeImpl，interface_type则顾名思义(本例中是TYPE_HOTPLUG_HANDLER对应的TypeImpl)
+Interface也是一个TypeInfo结构，初始化为TypeImpl。假设有如下继承关系 A<--B<--C<--D，C 的 TypeInfo 结构里指明的 interface 类型是 TYPE_HOTPLUG_HANDLER，注意！这个只是指明了C的interface的类型！实际的interface的初始化（在 type_initialize_interface） 中，是现场创建了一个新类型的TypeInfo，其name是interface对应的device的名字和interface type 名字组合在一起，比如TYPE_PC_MACHINE有TYPE_HOTPLUG_HANDLER的interface，初始化时候创建的新类型interface的TypeInfo名字是TYPE_PC_MACHINE:: TYPE_HOTPLUG_HANDLER，新类型interface的TypeImpl的class是TYPE_HOTPLUG_HANDLER对应的class，其interface基类InterfaceClass的成员：concrete_class指的是该interface所依附的设备TypeImpl，interface_type则顾名思义(本例中是TYPE_HOTPLUG_HANDLER对应的TypeImpl)
 
 2015-12-21: 每个TypeInfo(TypeImpl) 对应一个class 和 instance. class 和 instance各自的继承关系和TypeInfo一致。初始化class时，每个class独占一份内存数据结构(type_initialize如何处都会g_malloc)，并copy其parent class到自己。TypeImpl.class_base_init函数，如其描述，初始化某class之前，用来修改其copy parent class来的内容。正因为每一个class都是一个独立(指内存)的数据结构，所以在type_initialize中，需要parent = type_get_parent(parent);意思是对每一个class都要修改一遍，才能保证一致。
 
-在QOM模型中看起来每一个object都会作为一个child property，attach到i某个parent object上。通过-device/device_add 添加的设备（入口是qdev_device_add()），根据是否有id分别attach到 container object: peripheral/peripheral-anon。
+在QOM模型中看起来每一个object都会作为一个child property，attach到某个parent object上。通过-device/device_add 添加的设备（入口是qdev_device_add()），根据是否有id分别attach到 container object: peripheral/peripheral-anon。
 
 [QOM-tree] 是一个child property的关系链。Tips：一个property有若干meta data：name, type, value. 一个Object的property存储在Object,properties中，以hash table形式，其key/value 是 name/ObjectProperty *prop
 

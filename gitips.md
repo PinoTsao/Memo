@@ -53,5 +53,18 @@ git blame 92417df076f75^ arch/x86_64/kernel/head.S
 参考:
 
 1. "Revision Selection" of [progit2](https://github.com/progit/progit2)
-2. `man 7 gitrevisions`: 如何为 git 命令指定某个 commit 或者 commit range 
+2. `man 7 gitrevisions`: 如何为 git 命令指定某个 commit 或者 commit range
 3. `git help blame`: blame 时如何指定 revision range
+
+#### X86 patch style
+
+和 git 使用没关系，但混 x86 社区，这是重要的 tips.
+
+标题的要求：
+>Subject needs to have a verb and start with a capital letter after the subsystem/path prefix.
+
+引用 commit 时的 style:
+
+>1e61f78baf89 ("x86/cpufeature: Make sure DISABLED/REQUIRED macros are updated")
+
+尽量不加 bonus changes, 尤其是那些八杆子打不着的 change.
