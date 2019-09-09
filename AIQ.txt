@@ -1,0 +1,4 @@
+1. "volatile" in C
+2. spinlock
+3. virtual memory
+4. hardware components involved in MM.

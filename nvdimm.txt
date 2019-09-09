@@ -1,0 +1,93 @@
+Official Doc
+------------
+https://github.com/pmem/docs
+https://nvdimm.wiki.kernel.org/
+https://software.intel.com/en-us/persistent-memory
+
+Note
+----
+NVDIMM spec 定义了 2 种 namespace: persistent memory namespace & block mode namespace.
+Namespace 可看作从 NVDIMM 物理设备上划分出来的逻辑设备，从 OS 角度看 NVDIMM 时，看到的是 namespace(逻辑设备)。
+spec 定义的这两种 namespace 是逻辑上的，是从 OS 软件角度看到的 namespace; 下面会讲到 DIMM 设备上的 namespace，
+即 DIMM 上的一块存储空间，是物理上的，所以下文会使用 "逻辑 namespace" 和 "物理 namespace" 来区分。
+
+Persistent memory namespace: 与一个 interleave set[1] 关联, interleave 可以发生在一个或多个 DIMM 上,
+也就是说这块逻辑上的连续空间，实际上可能位于不同物理 DIMM 上的“物理 namespace”。
+block mode namespace： 仅位于一个 DIMM 上，但也可以是一个 DIMM 上的不连续的几个区域(物理 namespace)构成.
+[1].https://en.wikipedia.org/wiki/Interleaved_memory
+
+一个 DIMM 上可划分多个 "物理 namespace"(存储空间), 由 namespace label 定义. DIMM 上有专门用于存储 namespace label 的区域，
+叫做 Label storage area, 它与普通 data area 物理上是隔离的。从 OS 角度看到的一个“逻辑 namespace“ 可能由多个"物理 namespace"组成，
+因为:
+  1. pmem "逻辑 namespace" 的 interleave set 可能跨多个 DIMM;
+  2. block "逻辑 namespace" 可能在一个 DIMM 上不连续，即由一个 DIMM 上的多个不相邻"物理 namespace"组成.
+label 的格式在 spec[2] 的 chapter 2 中有定义。
+[2].https://pmem.io/documents/NVDIMM_Namespace_Spec.pdf
+
+Label storage area layout 的简单描述：
+  +-------------------+
+  |Index block        |: header，至少 256 bytes. 其中有 bitmap 指示 label slot 是否使用。
+  |Index block        |: 备份用 header, powerfail-safe.
+  |label description  |: 128 bytes per label slot
+  |label description  |
+  |  ...              |
+  |                   |
+  |                   |
+  |                   |
+Label storage area 的 size 是 verdor-define 的, 遵循规范的话，至少是 128kb,大约可容纳 1000 label.
+
+Block Translation Table	(BTT)
+-----------------------------
+
+block mode namespace 可能包含一个 BTT。使用 BTT 的 namespace 将空间分为 arena, 每个 arena 包含一系列数据结构，
+arena 中的这些管理数据结构被统称为 BTT. 一个 arena 最大管理 512G namespace 空间。*读/写单位是 block size*.
+
+block mode namespace 有时被叫做 DIMM-local namespace，表明这个 namespace 不能跨多个 DIMM.
+
+  +----------------------+ <--- 高地址
+  |BTT arena infoblock   |: backup, 4k size
+  |BTT arena flog        |: 
+  |BTT arena map         |: pre-map LBA -> post-map LBA. 软件定义的LBA，映射到物理设备上定义的LBA
+  |BTT arena data area	 |
+  |  ...                 |
+  |  ...                 |
+  |                      |
+  |                      |
+  |                    ^ |
+  |BTT arena data area | |: data area 的 size 以 block 为单位，整个 arena size - 其他数据size，除以 block size.
+  |BTT arena infoblock | |: 4k size 
+  +----------------------+ <--- 低地址
+
+Misc
+----
+NVDIMM region 是 Linux kernel 中的术语，描述映射到 system-physical-address-range 中的所有 pmem namespace，所以可能包括一个或多个 pmem namespace.
+
+namespace 可能工作在 4 种模式下： fsdax, devdax, sector, raw.[3]
+[3].https://pmem.io/ndctl/ndctl-create-namespace.html
+
+一个全新的 NVDIMM 设备在开机后会自动创建一个名为 "namespace0.0" 的 raw mode 的 namespace.
+
+ACPI NFIT
+---------
+
+ACPI 子系统的初始化分为几个入口函数：
+  start_kernel
+  --> acpi_early_init
+  --> acpi_subsystem_init
+  --> arch_call_rest_init
+     --> ..
+        --> ..
+           --> ..
+              --> subsys_initcall(acpi_init);
+
+
+XFS
+---
+
+XFS 官方文档：https://www.kernel.org/pub/linux/utils/fs/xfs/docs/xfs_filesystem_structure.pdf
+
+Q1： xfs_db Sparse Inode AGI Example 一节中可能有错误：
+    This means that the first *sixteen* inodes in this chunk record do not actually map to inode blocks;
+    应该是 first 32 个 inodes 没用被 allocate to inode
+
+Q2: agi_root 指示的 block 中，xfs_btree_sblock.bb_blkno 和 agi_root 为什么不相等？

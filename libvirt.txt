@@ -1,0 +1,22 @@
+# Libvirt Memo
+
+## Storage management
+
+[libvirt storage management](https://libvirt.org/storage.html)
+Terms: storage pool, volumn. A storage pool is a quantity of storage set aside by an administrator.
+Storage pools are divided into storage volumes, and the volumes are assigned to VMs as block devices.
+
+举例来说，一个准备给VM使用的 NFS server 的路径：nfs.example.com:/path/to/share 就是一个 pool.
+Once the pool is started, the files in the NFS share are reported as volumes.
+
+Storage pools and volumes 并不是必须的，they provide a way for libvirt to ensure that a particular
+piece of storage will be available for a VM. On systems that do not use pools, system administrators
+must ensure the availability of the VMs' storage using whatever tools they prefer, for example, 
+adding the NFS share to the host's fstab so that the share is mounted at boot time.
+
+## xml 与 qemu 命令行之间的转换
+
+domxml-to-native
+例：domxml-to-native --format qemu-argv fedora27server
+
+domxml-from-native
