@@ -1932,8 +1932,8 @@ man 手册中说：
 
 linux kernel 编译出来的 bzImage 中包括如下两部分：
 
- 1. 运行在 real mode 下的 arch/x86/boot/setup.bin，在 boot loader 使用 16-bit boot protocol 时才会执行，下文统称之为 **setup**
- 2. 运行在 protect mode 或 long mode 下的 arch/x86/boot/vmlinux.bin, 它包含了压缩后的 kernel(vmlinux) 和 relocs（定位信息的), 它的最主要作用是解压缩，所以下文统称之为 **decompressor**
+ 1. 运行在 real mode 下的 arch/x86/boot/setup.bin，在 boot loader 使用 16-bit boot protocol 时才会执行，常称之为 **setup**
+ 2. 运行在 protect mode 或 long mode 下的 arch/x86/boot/vmlinux.bin, 它包含了压缩后的 kernel(vmlinux) 和 relocs（定位信息的), 它最重要的作用是解压缩，常称之为 **decompressor**
 
 上文中所说 linux kernel 的 real mode 部分即是 setup.bin，位于 linux kernel 的 arch/x86/boot/ 目录。由 grub 的 linux16 命令加载启动的内核将首先执行 setup.bin 的代码 所以，首先来看 setup.bin 的流程.
 
@@ -2539,6 +2539,8 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
  2. ZO: 上面的图示清楚的标记了它的范围，它的内容是 boot/compressed/vmlinux, 有时也被叫做 ZO image 或 decompressor(因为最重要的功能是解压缩 kernel);
  3. compressed kernel: 压缩的数据实际上包括 compressed/vmlinux.bin 和 compressed/vmlinux.relocs, 但通常简称为 compressed kernel.
 
+VO/ZO 的唯一权威解释在 [patch](https://lore.kernel.org/patchwork/patch/674100/), 下文还有专门一节介绍。
+
 以 x86-64 为例分析这部分代码。首先看下 arch/x86/boot/compressed/vmlinux 的代码布局，定义在 arch/x86/boot/compressed/vmlinux.lds：
 
 	...
@@ -2597,8 +2599,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 		 * setup 代码最后一个函数 protected_mode_jump 的入参之一是 setup 的数据结构
 		 * boot_params 的线性地址，保存在 esi 中。以 grub 为例，它没有设置 KEEP_SEGMENTS
 		 * bit，所以代码不会跳转到 1f，而是执行下面几行代码重新加载各 segment register。
-		 * BP_loadflags 的实现待分析，但顾名思义，BP = Boot Protocol
-		 */
+		 * BP_loadflags 的实现待分析，但顾名思义，BP = Boot Protocol */
 		testb $KEEP_SEGMENTS, BP_loadflags(%esi)
 		jnz 1f
 
@@ -2624,19 +2625,21 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 	 * data at 0x1e4 (defined as a scratch field) are used as the stack
 	 * for this calculation. Only 4 bytes are needed.
 	 */
-	/* ZO(protect mode kernel) 被加载到内存的地址，由 boot protocol(header.S) 中的
-	 * code32_start(0x100000/1M) 表示, 即 boot loader 应将加载地址写入这个 field.
+
+	/* ZO 的加载地址，由 boot protocol(header.S) 中的 code32_start 表示, 它默认 1M，
+	 * 是加载 ZO 的标准地址；若 boot loader 想加载 ZO 到 nonstandard address(boot
+	 * protocol document 用词), boot loader 会将实际加载地址写入此 field.
 	 *
-	 * 16-bit boot protocol 的 grub 代码直接使用 GRUB_LINUX_BZIMAGE_ADDR 作为加载
-	 * ZO 的地址, 且 setup 中使用 code32_start 跳转到 protect mode kernel.
-	 * 32-bit boot-protocol 时 grub 代码在不同情况下分别使用 GRUB_LINUX_BZIMAGE_ADDR
-	 * 或字段 pref_address 作为 ZO 的加载地址。
+	 * 16-bit boot protocol: grub 使用 GRUB_LINUX_BZIMAGE_ADDR(1M) 作为 ZO 的加载
+	 * 地址，没有修改 code32_start.
+	 * 32-bit boot-protocol: grub 根据 kernel 是否 relocatable 分别使用 pref_address
+	 * 或 GRUB_LINUX_BZIMAGE_ADDR(1M) 作为 ZO 的加载地址，并写入 code32_start.
 	 *
-	 * call 指令将下一条指令地址(label 1 的运行地址)压栈; 再弹出到 ebp，再和 label 1
-	 * 的链接地址相减，差值放 ebp 中。这个差值(delta)即是符号 startup_32 的运行地址，
-	 * 因为 startup_32 的链接地址是 0. (16-bit boot protocol 下它的运行地址是 0x100000)
-	 * setup 中有设置 esp，这里再设置应该也是 32-bit boot protocol 的情况。
-	 */
+	 * call 指令将下一条指令地址(label 1 的运行地址)压栈，再弹出到 ebp，再和 label 1 的
+	 * 编译地址相减，差值(delta)即是符号 startup_32 的运行地址，因 startup_32 的编译地址
+	 * 是 0, 放 ebp 中.    (16-bit boot protocol 下它的运行地址是 0x100000)
+	 * setup 中有设置 esp, 这里再设置应该也是 32-bit boot protocol 的情况。 */
+
 		leal	(BP_scratch+4)(%esi), %esp
 		call	1f
 	1:	popl	%ebp
@@ -2652,8 +2655,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 	 * discover CPU feature。此刻只需看 verify_cpu.S 的文件头描述，了解其返回值:
 	 *     verify_cpu, returns the status of longmode and SSE in register %eax,
 	 *     0: Success, 1: Failure
-	 * 有需求时再来详细分析
-	 */
+	 * 有需求时再来详细分析 */
 		call	verify_cpu
 		testl	%eax, %eax
 		jnz	no_longmode  /* 根据常识，一般不会执行这条指令 */
@@ -2666,31 +2668,38 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 	 * contains the address where we should move the kernel image temporarily
 	 * for safe in-place decompression.
 	 */
+
 	/* kernel_alignment 在 header.S(boot protocol) 中定义为: CONFIG_PHYSICAL_ALIGN,
 	 * x86_64 下，其范围是 0x200000(2M) - 0x1000000(16M)，且必须是 2M 的倍数，可能因为
 	 * early boot page table 使用 2M 的 page. 16-bit boot protocol 的 grub 没有
-	 * 修改它. 重要 tip: CONFIG_PHYSICAL_ALIGN 的注释说必须是 2M(x86_64) 的倍数，但
-	 * 实际上必须是 2,4,8,16 只一，所以其实原注释不够严谨，虽然没错，因为在 arch/x86/
-	 * include/asm/boot.h 中有代码对它做检查：
+	 * 修改它.
+	 * 重要 tip: CONFIG_PHYSICAL_ALIGN 的注释(arch/x86/Kconfig 中)说：On x86_64,
+	 * this value must be a multiple of 0x200000. 实际只能是 2,4,8,16 之一，因为
+	 * arch/x86/include/asm/boot.h 中有：
 	 *
 	 *     #if (CONFIG_PHYSICAL_ALIGN & (CONFIG_PHYSICAL_ALIGN-1)) || \
 	 *         (CONFIG_PHYSICAL_ALIGN < MIN_KERNEL_ALIGN)
 	 *	       # error "Invalid value for CONFIG_PHYSICAL_ALIGN"
 	 *	   #endif
 	 *
-	 * ebp 是 ZO 的加载地址(0x100000). CONFIG_RELOCATABLE 下，代码将该地址向上对齐到
-	 * kernel_alignment，对齐后的值放 ebx. 比较 LOAD_PHYSICAL_ADDR 和 ebx，若
-	 * ebx < LOAD_PHYSICAL_ADDR， 则给 ebx 赋值 LOAD_PHYSICAL_ADDR. 说明即使 ZO 是
-	 * relocatable, 其最小加载地址也不能小于 LOAD_PHYSICAL_ADDR. arch/x86/Kconfig
-	 * 中的符号 “RELOCATABLE” 有描述此行为。
+	 * 所以，虽然原注释没错，但明显不够严谨。
+	 *
+	 * ebp 是 ZO 的加载地址, CONFIG_RELOCATABLE 将其向上对齐到
+	 *     kernel_alignment(CONFIG_PHYSICAL_ALIGN)
+	 * 对齐后的值放 ebx. 这是预防 bad-behaved boot loader 没有将 ZO 加载满足对齐需求的
+	 * 地址, grub behaves good. 若实际加载地址小于编译时指定的加载地址，即 ebx <
+	 * LOAD_PHYSICAL_ADDR, 则给 ebx 赋值 LOAD_PHYSICAL_ADDR. 说明即使 ZO 是
+	 * relocatable, 其最小加载地址也不能小于 LOAD_PHYSICAL_ADDR, arch/x86/Kconfig
+	 * 中符号 “RELOCATABLE” 的注释有描述此逻辑。 所以，正常情况下, ebx = ebp >
+	 * LOAD_PHYSICAL_ADDR, 且满足 alignment requirement.
 	 *
 	 * 所以 ebx 是解压缩 buffer 的地址，也即 VO 的起始地址？
-	 * 2019/12/29 update：上述推论正确！ LOAD_PHYSICAL_ADDR 在代码中被定义为:
+	 * 2018/12/29 update：上述推论正确！ LOAD_PHYSICAL_ADDR 在代码中被定义为:
 	 * CONFIG_PHYSICAL_START 对齐到 CONFIG_PHYSICAL_ALIGN。阅读 arch/x86/Kconfig
-	 * 中 PHYSICAL_START 和 PHYSICAL_ALIGN 的定义，会发现上面的推论正确！！！
-	 */
+	 * 中 PHYSICAL_START 和 PHYSICAL_ALIGN 的定义，会发现上面的推论正确！！！ */
+
 	#ifdef CONFIG_RELOCATABLE
-		movl	%ebp, %ebx
+		movl    %ebp, %ebx
 		movl	BP_kernel_alignment(%esi), %eax
 		decl	%eax
 		addl	%eax, %ebx
@@ -2704,7 +2713,7 @@ bzImage 中的另一部分: arch/x86/boot/vmlinux.bin，包含了压缩后的 ke
 
 	/* Target address to relocate to for decompression */
 	/* _end 定义在 linker script，表示 arch/x86/boot/compressed/vmlinux 的链接结束
-	 * 地址，因链接起始地址是 0, 它也表示 ZO 的 memory image size, 比文件size 大，
+	 * 地址，因链接起始地址是 0, 它也表示 ZO 的 memory image size, 比 file size 大，
 	 * 因为 SHT_NOBITS 类型的 section(.bss, .pgtable) 不占据文件空间;
 	 *
 	 * init_size 在 header.S 中的定义比较复杂，在 “VO/ZO” 一节中有详细描述。它表示可
@@ -3677,32 +3686,36 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		return paging_config;
 	}
 
-	/* 给 trampoline 函数找合适的空间摆放。看起来是在第 1M 空间內，为啥呢？推测：第 1M 内
-	 * 是 BIOS、部分 bootloader(grub boot.img) 的运行空间，走入 long mode linux 后，
-	 * 已不在需要他们(BIOS 的中断服务？)，而后面的空间是未来使用的，所以在第 1M 空间内找个空比较合理。
+	/* 给 trampoline 函数在第 1M 空间內找合适的空间摆放，WHY? 分析：第 1M 空间用于 map
+	 * conventional memory(640kb RAM), firmware, video RAM, I/O device. 进入
+	 * long mode linux 后，conventional memory 中的闲置部分不太会被使用，相比现代 PC
+	 * 上的 RAM size，它太小了。1M 后的空间是未来使用的，所以在第 1M 内的 conventional
+	 * memroy 中内找个空比较合理。
 	 */
 	/* 此函数参照 reserve_bios_regions() 实现，需阅读理解原函数注释，但仅阅读注释恐怕也
 	 * 无法完全理解，还需要一些古老的背景知识：现代 PC 架构源自1981年的 IBM PC，BIOS 的
-	 * 概念也源自该产品。IBM PC 只有 1M 地址空间，除了映射 RAM，还有显卡，ROM 中的 BIOS
-	 * 等。参考：
+	 * 概念也源自该产品。IBM PC 只有 1M 地址空间。参考：
 	 *     https://en.wikipedia.org/wiki/IBM_Personal_Computer (随意阅读，干货不多)
 	 * 这又引出 Conventional memory 的概念，参考：
 	 *     https://en.wikipedia.org/wiki/Conventional_memory
 	 *     https://ancientelectronics.wordpress.com/tag/conventional-memory
-	 * Simply speaking: real mode 只能寻址 1M 地址空间，其中只有前 640kb 映射 RAM，
-	 * 这 640kb 叫 conventional memory；后面 384kb(也叫 upper memory area)作它用，
-	 * 比如映射显卡，ROM BIOS 等。BIOS 的数据会放在 Conventional memory 中，比如第 1k
-	 * 中的 Interrupt Vector Table(IVT), 1k 到 1k + 256byte 的 BIOS Data Area(BDA),
-	 * 紧贴 conventional memory 顶端放置的 Extended BIOS Data Area(EBDA)。
-	 * 因 EBDA 被放在 conventional memory 的顶部，且 EBDA 在未来仍可能被用到，这会减少
+	 *
+	 * Simply speaking: real mode CPU 只能寻址 1M 地址空间，前 640k 地址映射为 RAM,
+	 * 称为 conventional memory；后面 384k 称为 upper memory area(UMA), 作它用，如
+	 * 映射 video memory，firmware(BIOS) 等。(BTW： conventional memory 的 first
+	 * 64k 也被称作 "lower memory” or “low memory area”.) BIOS 会产生数据会放在
+	 * Conventional memory 中，如第 1k 空间中的 Interrupt Vector Table(IVT), 1k 到
+	 * 1k + 256byte 的 BIOS Data Area(BDA), 紧贴 conventional memory 顶部的
+	 * Extended BIOS Data Area(EBDA).
+	 *
+	 * 因 EBDA 被放在 conventional memory 顶部，且 EBDA 在未来仍可能被用到，这会减少
 	 * conventional memory 的 reported amount(INT 0x12)。参考：
 	 *     1. http://www.ctyme.com/intr/rb-0598.htm (INT 0x12)
 	 *     2. https://wiki.osdev.org/Memory_Map (很好！必看！)
 	 *     3. http://stanislavs.org/helppc/bios_data_area.html (最后一节展示了
 	 *        640k - 1M 空间映射的例子)
-	 * 链接 2. 中说：SMM also seems to use the EBDA. So the EBDA memory area
-	 * should never be overwritten. 所以函数的计算中，考虑到了这一点。
-	 */
+	 * 2. 中说：SMM also seems to use the EBDA. So the EBDA memory area should
+	 * never be overwritten. 所以函数的计算中，考虑到了这一点。*/
 	static unsigned long find_trampoline_placement(void)
 	{
 		unsigned long bios_start, ebda_start;
@@ -3715,56 +3728,48 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 		 * This code is based on reserve_bios_regions().
 		 */
 
-		 * 总的意思：在第 1M 地址空间里找一段合适的空间放 trampoline 函数，对这块空间有
-		 * 什么要求？首先类型(当然)必须是 E820_TYPE_RAM，那就是 conventional memory；
-		 * 其次不能碰 conventional memory 中 BIOS 相关的区域(代码，数据)，因为不知道
-		 * 未来谁还会用到他们。
-		 * 第 1M 中，除 conventional memory 映射为 RAM，后面的地址空间会映射为 BIOS
-		 * firmare(由变量bios_start表示) 及显卡等，这部分空间不在 RAM 中。本函数尽可能
-		 * 保守的推测可用的 RAM 空间，这就是为什么对齐时使用 round_down，而不是 round_up。
-		 */
-		/* 两个 magic number： 0x40e，0x413 需要解释。这两个值表示线性地址，由链接：
+		 * 在第 1M 地址空间里找合适的空间放 trampoline 函数，对这块空间有什么要求？首先，
+		 * 类型(当然)必须是 E820_TYPE_RAM，那就是 conventional memory; 其次，不能
+		 * 碰 conventional memory 中 BIOS 相关区域(代码，数据)，因为未来可能会用。
+		 * conventional memory 表示 RAM，本函数尽可能保守的推测可用 RAM 空间，所以对齐
+		 * 时使用 round_down，而不是 round_up。*/
+
+		/* magic number: 0x40e, 0x413 表示线性地址，由链接：
 		 *     http://stanislavs.org/helppc/bios_data_area.html
 		 *     https://wiki.osdev.org/EBDA#Overview
-		 * 可知，BIOS data area(BDA) 中的逻辑地址 40:0E 处的 word 保存着 EBDA 的
-		 * segment base address；逻辑地址 40:13 处的 word 保存着 Memory size in
+		 * 可知，BIOS data area(BDA) 中的逻辑地址 40:0E 处的 word 表示 EBDA 的
+		 * segment base address; 逻辑地址 40:13 处的 word 表示 Memory size in
 		 * Kbytes(kilobytes of contiguous memory starting at absolute address
 		 * 00000h，或叫 conventional memory size，但减去 EBDA 的空间)。变量名终于
 		 * make sense：conventional memory 以上，1M 以下的部分是 BIOS related area，
-		 * 所以叫 bios_start。但某种角度看，这两个值其实也是一个东西？
-		 */
+		 * 所以叫 bios_start。但某种角度看，这两个值其实也是一个东西？ */
 		ebda_start = *(unsigned short *)0x40e << 4;
 		bios_start = *(unsigned short *)0x413 << 10;
 
 		/* MIN(128K) 不知道如何确定的，MAX 是 636K，但注释中写 640K，这 4k 是 quirk?
 		 * 考虑 Dell 可能在 RAM size 中没有预留 EBDA 的空间？ 通过 git blame ebda.c
 		 * 发现引入 ebda.c 的 commit: 0c51a965ed3c4, 证明推测正确。但现在似乎不再需要
-		 * 这 4k quirk？因为下面有 if(xxx && ebda_start < bios_start)，待确认
-		 */
+		 * 这 4k quirk？因为下面有 if(xxx && ebda_start < bios_start)，待确认 */
 		if (bios_start < BIOS_START_MIN || bios_start > BIOS_START_MAX)
 			bios_start = BIOS_START_MAX;
 
-		/* conventional memory 中的 EBDA 是 BIOS related memory，不可以 overwritten，
-		 * 理论上，正常情况下，我认为 ebda_start 应该等于 bios_start，但正因为一些奇葩
-		 * 情况，如 Dell 老系统中 "RAM size" value 没有考虑 EBDA，会导致 bios_start
-		 * 大于 ebda_start，这种情况当然要按实际情况来，即 EBDA memory 也要被 reserve.
-		 * 因为原函数 reserve_bios_regions 的终极目标是，bios_start 至 1M 之间都要被
-		 * reserve.
-		 */
+		/* EBDA 在 RAM 中，不可以 overwritten. 理论上，正常情况下，我认为 ebda_start
+		 * 应等于 bios_start，但一些奇葩情况，如 Dell 老系统中 "RAM size" value 没有考虑
+		 * EBDA，导致 bios_start 大于 ebda_start，这时当然要按真实情况来。
+		 * 所有不可用 RAM 都被 reserve，原函数 reserve_bios_regions 的终极目标是，
+		 * bios_start 至 1M 之间都要被 reserve. */
 		if (ebda_start > BIOS_START_MIN && ebda_start < bios_start)
 			bios_start = ebda_start;
 
-		/* 可能是因为怕下面 for 循环中找不到合适的，而 bios_start 又需要始终保持页对齐，
-		 * 所以先做页对齐。round up 可能就跑到 BIOS related area 中了，所以宁愿浪费
-		 * 一点也要 round down。
-		 */
+		/* 可能是怕下面 for 循环中找不到合适的，而 bios_start 又需要始终保持页对齐，所以
+		 * 先做页对齐。round up 可能就跑到 BIOS related area 中了，所以宁愿浪费
+		 * 一点也要 round down */
 		bios_start = round_down(bios_start, PAGE_SIZE);
 
 		/* Find the first usable memory region under bios_start. */
-		/* 0 - bios_start 是 conventional memory，bios_start 以上至 1M 的空间是被
-		 * reserve 的，不能被 kernel 用作 available RAM。注意!这里是从低地址往上找
-		 * 1st usable memory region under bios_start
-		 */
+		/* 这时的 boot_params->e820_table[] 还是原始的数据，即 BIOS E820 中断的输出，
+		 * 未经任何处理(如，排序)。如 comments 所说，找到第一个可用的 region。因为没什么
+		 * 特殊要求，只要可用。*/
 		for (i = boot_params->e820_entries - 1; i >= 0; i--) {
 			entry = &boot_params->e820_table[i];
 
@@ -3777,6 +3782,9 @@ pgtable_64.c 的函数分析(以他们的出现顺序排列，所以和文件中
 				continue;
 
 			/* Adjust bios_start to the end of the entry if needed. */
+			/* 如果 region 完全在 bios_start 之下，那么 region 和 bios_start 之间的
+			 * gap 理论上可能不是可用 RAM，所以需要这样调整，保证我们找到的空间完全落在
+			 * 这段 E820_TYPE_RAM 空间中。*/
 			if (bios_start > entry->addr + entry->size)
 				bios_start = entry->addr + entry->size;
 
@@ -4660,7 +4668,7 @@ Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是
 
 #### string operation under x86/boot
 
-此 topic 的引入，源自研究 x86/boot/string.{c,h} 时的发现。x86/boot/ 下的 string.{c.h} 不仅在所在目录中使用，而且在 x86/boot/compressed，x86/purgatory 目录下使用。本来意图很简单，一些通用的字符操作，无需多次定义。但在实际使用中，发现了一些有趣的小现象。
+此 topic 源自研究 x86/boot/string.{c,h} 时的发现。x86/boot/ 下的 string.{c.h} 不仅在所在目录中使用，也在 x86/boot/compressed，x86/purgatory 目录下使用。本来意图很简单，一些通用的字符串操作，无需多次定义。但在实际使用中，发现了一些有趣的小现象。
 
 对于 memcpy/memset/memcmp，x86/boot/string.h 做了声明，同时定义了 macro：
 
@@ -4672,7 +4680,7 @@ Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是
 	#define memset(d,c,l) __builtin_memset(d,c,l)
 	#define memcmp	__builtin_memcmp
 
-x86/boot/string.c 中 #undef 了上述宏，同时定义了 memcmp(没定义 memset, memcpy)；而 x86/boot/copy.S 以汇编代码定义了 memset 和 memcpy。同时要注意，编译 x86/boot/ 下 setup 文件时，使用了选项 `-ffreestanding`，它在 [GCC 文档](https://gcc.gnu.org/onlinedocs/gcc/C-Dialect-Options.html#C-Dialect-Options)中的定义如下：
+x86/boot/string.c 中 #undef 了上述宏，并定义了 memcmp, 但 memset & memcpy 定义在 x86/boot/copy.S. 同时要注意，编译 x86/boot/ 下 setup 文件时，使用了选项 `-ffreestanding`，它在 [GCC 文档](https://gcc.gnu.org/onlinedocs/gcc/C-Dialect-Options.html#C-Dialect-Options)中的定义如下：
 
 >Assert that compilation targets a freestanding environment. This implies
 ‘-fno-builtin’. bluhbluh...
@@ -4689,7 +4697,7 @@ Simply speaking，标准 C 库中的很多函数都有其 GCC builtin 版本，�
 
 实际使用中，x86/boot/ 下的 .c 文件会 #include "string.h"，也就是说会使用 memxxx() 的 GCC builtin 版本。这么说来，x86/boot 下定义的 memxxx() 不会被用到？这要 case by case 的看：
 
-  * memcmp() 定义在 string.c，被同文件中的 strstr()使用；
+  * memcmp() 定义在 string.c，被同文件中的 strstr()使用，且 string.c 有 #undef 这三个 memxxx()；
   * memcmp() 定义在 copy.S，被同文件中的 copy_from_fs/copy_to_fs 使用；
   * memset() 定义在 copy.S，但看起来没有被特别的使用，因为凡使用 memset 的文件头部都有 #include "string.h"，所以看起来 copy.S 中定义的 memset() 没有被使用，从 setup 的 `objdump -d` 输出中也可以确认这一点。
 
@@ -6835,10 +6843,53 @@ void __init setup_arch(char **cmdline_p)
 	/* 在 head_64.S 的 comments 第一次看到，下面详细分析。*/
 	cleanup_highmap();
 
+    /* 分配内存限制在 1M 内， WHY??? */
 	memblock_set_current_limit(ISA_END_ADDRESS);
+	/* memblock 的 general introduction 参考： head comments of memblock.c. 看过后
+	 * 才对 setup_arch 中大量出现 memblock 操作开始理解。
+	 * e820 info 中的可用空间： E820_TYPE_RAM & E820_TYPE_RESERVED_KERN，也要交给
+	 * memblock 管理。memblock_add_range 时会做 merge if necessary； memblock 表示
+	 * 的空间的 addr & size 都要对齐到 PAGE_SIZE*/
 	e820__memblock_setup();
 
+    /* 熟悉的面孔，背景知识参考上文：find_trampoline_placement() 的分析。将 BIOS region
+     * 加到 memblock.reserved 中 */
 	reserve_bios_regions();
+
+    if (efi_enabled(EFI_MEMMAP)) {
+        /* Skip efi related code for now... */
+    }
+
+	/* preallocate 4k for mptable mpc */
+	/* mpc = multi-processor configuration. mptable 被 BIOS 放在某个地址，这里通过
+	 * memblock 预分配 4k 空间，后续将 mptable 挪过去。 Purpose? 上面设置了 limit 为 1M,
+	 * 这里分配的空间应在 1M 内，待确认。*/
+	e820__memblock_alloc_reserved_mpc_new();
+
+#ifdef CONFIG_X86_CHECK_BIOS_CORRUPTION
+    /* 函数中进一步依赖 CONFIG_X86_BOOTPARAM_MEMORY_CORRUPTION_CHECK, 在我的 Fedora
+     * 30 上没有看到配置，故没有看到相应 dmesg 输出*/
+	setup_bios_corruption_check();
+#endif
+
+    /* 又为我打开了一个新世界之门：real mode trampoline, source code at arch/x86/realmode
+     * (也称作 x86 trampoline), 作用是在 SMP 系统中，BSP 唤醒其他 AP，使他们进入正常工作
+     * 模式。这里有一个 brief 的介绍：http://lastweek.io/lego/kernel/trampoline/.
+     * Simply speaking: 为 real mode 的 blob 在 real mode 的地址空间(1M 内)分配空间，
+     * 以把它放进来。这里先把分配的空间 memblock_reserve. But for term "x86
+     * trampoline", TO BE Analysed! */
+	reserve_real_mode();
+
+    /* 为特定平台做 workaround: 某些 range 不为被 kernel 使用，将它们 memblock_reserve.
+     * 目前只有 Intel SandyBridge. Skip for now. */
+	trim_platform_memory_ranges();
+	/* 被称为 low memory 的 first 64k, 也被 memblock_reserve 掉 */
+	trim_low_memory_range();
+
+    /* 下文详细分析 */
+	init_mem_mapping();
+
+	idt_setup_early_pf();
 
 }
 ```
@@ -7840,6 +7891,70 @@ void __init cleanup_highmap(void)
 	}
 }
 ```
+
+------------ init_mem_mapping ------------
+
+```
+void __init init_mem_mapping(void)
+{
+	unsigned long end;
+
+	pti_check_boottime_disable(); /* 暂略过 */
+	probe_page_size_mask();
+	setup_pcid();
+
+#ifdef CONFIG_X86_64
+	end = max_pfn << PAGE_SHIFT;
+#else
+	end = max_low_pfn << PAGE_SHIFT;
+#endif
+
+	/* the ISA range is always mapped regardless of memory holes */
+	init_memory_mapping(0, ISA_END_ADDRESS);
+
+	/* Init the trampoline, possibly with KASLR memory offset */
+	init_trampoline();
+
+	/*
+	 * If the allocation is in bottom-up direction, we setup direct mapping
+	 * in bottom-up, otherwise we setup direct mapping in top-down.
+	 */
+	if (memblock_bottom_up()) {
+		unsigned long kernel_end = __pa_symbol(_end);
+
+		/*
+		 * we need two separate calls here. This is because we want to
+		 * allocate page tables above the kernel. So we first map
+		 * [kernel_end, end) to make memory above the kernel be mapped
+		 * as soon as possible. And then use page tables allocated above
+		 * the kernel to map [ISA_END_ADDRESS, kernel_end).
+		 */
+		memory_map_bottom_up(kernel_end, end);
+		memory_map_bottom_up(ISA_END_ADDRESS, kernel_end);
+	} else {
+		memory_map_top_down(ISA_END_ADDRESS, end);
+	}
+
+#ifdef CONFIG_X86_64
+	if (max_pfn > max_low_pfn) {
+		/* can we preseve max_low_pfn ?*/
+		max_low_pfn = max_pfn;
+	}
+#else
+	early_ioremap_page_table_range_init();
+#endif
+
+	load_cr3(swapper_pg_dir);
+	__flush_tlb_all();
+
+	x86_init.hyper.init_mem_mapping();
+
+	early_memtest(0, max_pfn_mapped << PAGE_SHIFT);
+}
+
+```
+
+
 ## APPENDIX
 
 ### 常见汇编指令快速参考
