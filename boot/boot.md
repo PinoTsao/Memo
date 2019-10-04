@@ -6755,6 +6755,8 @@ void __init setup_arch(char **cmdline_p)
 	 *   [    0.000000] SMBIOS 2.8 present.
 	 *   [    0.000000] DMI: QEMU Standard PC (i440FX + PIIX, 1996), BIOS \
 	 *                  rel-1.12.1-0-ga5cab58e9a3f-prebuilt.qemu.org 04/01/2014
+	 *
+ 	 * 有多处 brk space allocation, brk 的详细介绍在下文。
 	 */
 	dmi_setup();
 
@@ -6835,8 +6837,9 @@ void __init setup_arch(char **cmdline_p)
 	/* iSCSI, skip. */
 	reserve_ibft_region();
 
+	/* 两个函数的详细分析在下文 */
 	early_alloc_pgt_buf();
-	/* Need to conclude brk, before e820__memblock_setup() it could use
+	/* Need to conclude brk, before e820__memblock_setup(), it could use
 	 * memblock_find_in_range, could overlap with brk area. */
 	reserve_brk();
 
@@ -7741,6 +7744,7 @@ void  __init early_alloc_pgt_buf(void)
 	unsigned long tables = INIT_PGT_BUF_SIZE;
 	phys_addr_t base;
 
+	/* __pa() 在上文中已分析过 */
 	base = __pa(extend_brk(tables, PAGE_SIZE));
 
 	/* 可以看出，pgt_buf_* 几个变量的单位是 pfn. */
@@ -7749,21 +7753,22 @@ void  __init early_alloc_pgt_buf(void)
 	pgt_buf_top = pgt_buf_start + (tables >> PAGE_SHIFT);
 }
 
-/* 关于 brk section, linker script 中定义了 symbol: __brk_base & __brk_limit, 用来
- * mark 该 section 的界限。在实际使用这段 section 空间时，则使用：_brk_start & _brk_end.
- * 入参表明在这段空间申请的 size & 起始地址对齐要求。 所以，规划的空间究竟使用多少，要看此
- * 函数被调用了多少次，简单搜索发现，dmi & xen 是 dominant user. */
+/* linker script 中定义了 symbol: __brk_base & __brk_limit, 用来 mark brk section
+ * 的 boundary. 实际使用这段 section 空间时，则使用：_brk_start & _brk_end 来标记.
+ * 所以，规划的空间实际使用多少，要看此函数被调用多少次。简单搜索发现，dmi & xen 是 dominant
+ * user.
+ * 入参 align 表示申请空间的起始地址对齐要求 */
 void * __init extend_brk(size_t size, size_t align)
 {
 	size_t mask = align - 1;
 	void *ret;
 
-	/* _brk_start 在别处被赋值为 0，表明不再接受新的 brk space request. */
+	/* 若 _brk_start 为 0，表示 brk section 不再接受新的 allocation request. */
 	BUG_ON(_brk_start == 0);
-	/* 对齐必须是 power of 2, 比如 2, 4, 8 这种，而 6 则不行。*/
+	/* 必须对齐到 power of 2, 如 2, 4, 8，而 6 则不行。*/
 	BUG_ON(align & mask);
 
-	/* _brk_end 是上次 brk space request 后的结束地址，其 alignment 可能和现在不同。*/
+	/* _brk_end 是上次 allocation 后的结束地址，其 alignment 可能和现在不同。*/
 	_brk_end = (_brk_end + mask) & ~mask;
 	BUG_ON((char *)(_brk_end + size) > __brk_limit);
 
@@ -7776,17 +7781,17 @@ void * __init extend_brk(size_t size, size_t align)
 	return ret;
 }
 ```
-__pa() 在上文中已分析过； extend_brk() 中使用了几个 linker script 定义的 brk 符号，所以，先围观下 lds 文件中的内容：
+extend_brk() 只是 allocate brk 空间，而理解 brk section 的设计需从 linker script 开始：
 ```
 	. = ALIGN(PAGE_SIZE);
 	.brk : AT(ADDR(.brk) - LOAD_OFFSET) {
 		__brk_base = .;
-		. += 64 * 1024;		/* 64k alignment slop space */
+		. += 64 * 1024;		/* 64k alignment slop space */ /* typo? slope : slop */
 		*(.brk_reservation)	/* areas brk users have reserved */
 		__brk_limit = .;
 	}
 ```
-script 中的内容也很简单: 定义 output section ".brk", input section 须是 ".brk.reservation", 且虚拟地址空间额外留出 64k(why? Seem like guardian); 搜索 input section 名字可发现其 usage:
+内容很简单: 定义 output section ".brk", input section 是 *.brk.reservation, 且虚拟地址空间额外留出 64k(why? Seem like guardian); 搜索 input section 名字可发现其 usage:
 ```
 /* Reserve space in the brk section.  The name must be unique within
  * the file, and somewhat descriptive.  The size is in bytes.  Must be
@@ -7809,11 +7814,11 @@ script 中的内容也很简单: 定义 output section ".brk", input section 须
 			: : "i" (sz));					\
 	}
 ```
-恰好，early_alloc_pgt_buf 函数上面使用了这个 macro.
+恰好，early_alloc_pgt_buf 函数上面出现了这个 macro.
 
-借这个机会，终于理解了看过多次的 assembly directive: `.pushsection`, `.popsection`. Background: Assembly 中，每一行可执行代码和数据都必属于某一个 section. Imagine a scenario: 你正在写 assembly, 并且正在写 .text 中的代码，突然下面一段代码想放在另一个 section 中，这段代码后就恢复到 .text, 这时就需要`.pushsection` & `.popsection`. 以此 macro 中的 assembly 为例：push 当前 section 到 section stack 暂存，后面的 code 放入 .brk_reservation section, 然后 pop 暂出的 section, 恢复。
+借此机会，终于理解见过多次的 assembly directive: `.pushsection`, `.popsection`.  Background: Assembly 中，每一行可执行代码和数据必属于某一个 section. Imagine a scenario: 你正在写 assembly, 并且正在写 .text 中的代码，突然下面一段代码想放在另一个 section 中，这段代码后就恢复到 .text, 这时就需要`.pushsection` & `.popsection`. 以此 macro 中的 assembly 为例：push 当前 section 到 section stack 暂存，后面的 code 放入 .brk_reservation section； 使用完毕，pop 暂存的 section, 恢复。
 
-看着代码，恍惚中又冒出一个问题：RESERVE_BRK 定义了一个 static 函数，函数中都是 inline assembly，这个函数好像没有被 reference, 其中的 assembly 怎么执行到的? 分析后发现是一个非常基础的问题。Strictly speaking, 编译的过程是：preprocess, compile, assemble, link. compile 后得到 assembly 文件，然后 assembler 会 parse 到这段代码，生成的 .o 文件中自然会有 .brk_reservation section; link 时按照 script 指导，将所有 .o 中的 brk section 输出到 vmlinux 的 .brk section.
+看着代码，恍惚中又冒出一个问题：RESERVE_BRK 定义了 static 函数，其中都是 inline assembly, 这个函数好像没有被 reference, 其中的 assembly 怎么执行到的? 分析后发现是一个非常基础的问题。Strictly speaking, 编译的过程是：pre-process, compile, assemble, link. compile 得到 assembly 文件，然后 assembler 会 parse 到这段代码，生成的 .o 文件中自然会有 .brk_reservation section; link 时按照 script 指导，将所有 .o 中的 .brk_reservation section 输出到 vmlinux 的 .brk section.
 
 但这里仍有一个 trick: "__used" 帮助实现目的：
 
@@ -7822,12 +7827,11 @@ script 中的内容也很简单: 定义 output section ".brk", input section 须
 参考 [GCC 文档](https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-used-function-attribute)的解释:
 >code must be emitted for the function even if it appears that the function is not referenced
 
-内核使用 "-O2" 优化，RESERVE_BRK 定义的 static 函数没人调用，所以可想而知它可能会 GCC 优化掉，attribute `__used__` 使其免于被优化掉。
+内核使用 "-O2" 优化，RESERVE_BRK 定义的 static 函数又没人调用，可想而知它可能会 GCC 优化掉，attribute `__used__` 使其免于被优化掉。
 
-另外，再来看这段汇编代码，并没有真正的 code, 仅是 label &directive: label 定义 symbol, 在符号表中可见； `.skip` 开辟入参 sz 指定的空间并填充 0; `.size` 将刚定义的 symbol 的 size 设置为 sz. 但注意：RESERVE_BRK 的作用只是在编译时在 image 中 reserve 指定大小的空间，这个设计的优点是，通过 macro 预留 brk 空间变得很灵活。但这并不意味着所有 reserve 的空间都会使用，这里只是“规划/plan”一下。使用的事情要回头看 extend_brk().
+另外，再来看这段汇编代码，并没有真正的 code, 仅是 label & directive: label 定义 symbol, 在符号表中可见； `.skip` 开辟入参 sz 指定的空间并填充 0; `.size` 将刚定义的 symbol 的 size 设置为 sz, 这体现在 ELF symbol table 中的 size field. 但注意：RESERVE_BRK 的作用只是在 image 中 reserve 指定 size 的空间，容易看出优点是，通过 macro 预留 brk 空间变得很灵活。但这并不意味着所有 reserve 的空间都会使用，这里只是“规划/plan”一下。使用的事情要回头看 extend_brk().
 
-
-如 reserve_brk 调用处的 comments 所说：need to conclude brk. 代码足够 self-documented, 就不分析了。
+如 reserve_brk 调用处的 comments 所说：need to conclude brk. 代码足够 self-documented:
 ```
 static void __init reserve_brk(void)
 {
@@ -7843,7 +7847,7 @@ static void __init reserve_brk(void)
 
 ------------ cleanup_highmap ------------
 
-To be honest, 这个 comments 对于 non-native speaker, for me at least, is not friendly. OK, I am going to 拆文解字： cleanup 什么? highmap 又是什么?
+To be honest, 这个函数的 comments 对于 non-native speaker, for me at least, is not friendly. OK, I am going to 拆文解字： cleanup 什么? highmap 又是什么?
 
 highmap: take X86_64 for example, 其 kernel 起始虚拟地址被安排为 __START_KERNEL_map = 0xffffffff80000000, 这个地址在 64 bit mode 下算是比较高的地址，所以称为 highmap.
 
@@ -7852,11 +7856,11 @@ cleanup: 很远的上文中曾说过，kernel 的虚拟地址空间被安排 [__
 NEXT_PAGE(level2_kernel_pgt)
 	PMDS(0, __PAGE_KERNEL_LARGE_EXEC, KERNEL_IMAGE_SIZE/PMD_SIZE)
 ```
-(代码详细分析回看上文，这里只给 conclusion)依然从 __START_KERNEL_map <--> 0 开始 mapping. Obviously, 由于 ALIGN 导致前面 n 个 pmds 其实是无效 mapping，即他们是 invalid pmds.
+(代码详细分析回看上文，这里只给 conclusion)依然从 __START_KERNEL_map <--> 0 开始 mapping. Obviously, 由于 ALIGN 导致前面 n 个 pmds 其实是无效 mapping，即 invalid pmds.
 
-In the meanwhile, 虽然 kernel 的实际 memory image size 是 (_end-_text), 但尾部的 .brk section 却是很可能完全使用，_brk_end 表示 read end virtual address of kernel, 所以，已 mapping 的 range [_brk_end, _end] 也是无意义的。 这两个 range 的 pmds 都是 cleanup 的对象。
+In the meanwhile, 虽然 kernel 的实际 memory image size 是 (_end-_text), 但尾部的 .brk section 却是很可能**未完全使用**，_brk_end 表示真正的 end virtual address of kernel, 所以，已 mapping 的 range [_brk_end, _end] 也是无意义的。 这两个 range 的 pmds 都是 cleanup 的对象。
 
-理解了上面的分析，主要代码就好理解了，不赘述。
+理解这个背景知识，主要代码就好理解了，不赘述。
 
 ```
 /* The head.S code sets up the kernel high mapping:
@@ -7900,6 +7904,9 @@ void __init init_mem_mapping(void)
 	unsigned long end;
 
 	pti_check_boottime_disable(); /* 暂略过 */
+	/* 探测支持的 page size. X86_64 (我认为)都支持 2M & 1G, 4K 是默认，不用 probe.
+	 * direct_gbpages 初始值由 CONFIG_X86_DIRECT_GBPAGES 确定。
+	 * 上述 conclusion 也是加打印后发现，被自己笨哭TAT. */
 	probe_page_size_mask();
 	setup_pcid();
 
@@ -7910,6 +7917,11 @@ void __init init_mem_mapping(void)
 #endif
 
 	/* the ISA range is always mapped regardless of memory holes */
+	/* 虚拟地址 PAGE_OFFSET 起的 64TB(4-level paging) 空间用于 direct mapping cpu
+	 * 的寻址空间，即物理地址空间。1st 1M 内，conventional memory(640k) 后的地址用于
+	 * 映射 rom 等非 RAM 空间, 这即 comments 中的所说的 memory holes.
+	 * 其中有调用一个难读的函数: split_mem_range，甚至 maintainer 也认为它是 garbage(
+	 * https://lkml.org/lkml/2019/3/24/332)。也是浪费了我许多时间，后面详述。*/
 	init_memory_mapping(0, ISA_END_ADDRESS);
 
 	/* Init the trampoline, possibly with KASLR memory offset */
@@ -7952,7 +7964,308 @@ void __init init_mem_mapping(void)
 	early_memtest(0, max_pfn_mapped << PAGE_SHIFT);
 }
 
+/*
+ * Setup the direct mapping of the physical memory at PAGE_OFFSET.
+ * This runs before bootmem is initialized and gets pages directly from
+ * the physical memory. To access them they are temporarily mapped.
+ */
+/*
+ * Tip：物理地址按 4k 划分 page frame, 意味着在内存管理时，看到的物理 range 的起始地址 &
+ * size 都是 4k 对齐的。所以现在可以大胆相信，入参是 4k 对齐的。
+ *
+ * 此函数目的是 direct page mapping 入参的 RAM physical address range. Range 可大
+ * 可小，怎么 mapping? Strategy: 尽可能使用 big page size(X86_64 支持 4k, 2M, 1G).
+ * 所以第一步 split_mem_range 将入参 RAM range 分为几段，然后 mapping，然后 xxx?
+ *
+ * 初看 split_mem_range 几遍仍不懂，遂 google 函数名，有所得，但仍不懂。可见 importance
+ * of narrative ability. 下有详细分析其分段机制。 */
+unsigned long __ref init_memory_mapping(unsigned long start,
+					       unsigned long end)
+{
+	/* NR_RANGE_MR =5 under x86_64, why? Details at analysis of split_mem_range */
+	struct map_range mr[NR_RANGE_MR];
+	unsigned long ret = 0;
+	int nr_range, i;
+
+	/* pr_debug 的内容正常情况下不出现 dmesg 中，想看这个打印的 prerequisites:
+	 *   1. CONFIG_DYNAMIC_DEBUG=y, &
+	 *   2. file compiled with -DDEBUG: CFLAGS_[filename].o := -DDEBUG
+	 *      (https://www.kernel.org/doc/local/pr_debug.txt)
+	 */
+	pr_debug("init_memory_mapping: [mem %#010lx-%#010lx]\n",
+	       start, end - 1);
+
+	memset(mr, 0, sizeof(mr));
+	/* 之前理解的困惑点：不知道 init_memory_mapping 会被多次调用，函数中加打印后才知道。
+	 * 费了好大劲儿，终于看懂了这个函数TAT，见下文。*/
+	nr_range = split_mem_range(mr, 0, start, end);
+
+	/* 拿到 split ranges, 可以 page table mapping 了。mapping code 太复杂，下文只能
+	 * 先简略分析。 */
+	for (i = 0; i < nr_range; i++)
+		ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
+						   mr[i].page_size_mask);
+
+	/* 记录已 mapped pfn*/
+	add_pfn_range_mapped(start >> PAGE_SHIFT, ret >> PAGE_SHIFT);
+
+	return ret >> PAGE_SHIFT;
+}
+
+/* 上面提到，本函数将 split 入参 RAM 的 physical address range 为几段. Simply:
+ *   1. [0  - 2M] 以 4k page 映射
+ *   2. [2M - 1G] 以 2M page 映射
+ *   3. [1G - end]以 1G page 映射
+ * 这也是 google 可知的 conclusion. BUT, 这太粗糙，笔者作为 newbie 很难理解。So, here
+ * is the details.
+ *
+ * Tips:
+ *   1. 代码以 pfn 表示 range 的起始地址 & 结束地址, page frame = 4k.
+ *   2. 下面分析中的[range] 中的数字表示地址
+ *   3. (最重要!!!)RAM 在 cpu 物理地址空间中不是连续的。知识点可能知道，但，比如我，通常并
+ *      没有意识到，此处强调这点。
+ *
+ * 我们以实际数字举例进行代码分析 split 过程，目的是覆盖所有 split 代码。
+ *
+ * 假设 start = 1M, range(size) = 2G + 2M + 4K, 即 end = 0x100000 + 0x80000000 +
+ * 0x200000 + 0x4000 = 2G + 3M + 4K, 根据上述 conclusion 可知:
+ *   - [1M - 2M] 以 4K page 映射
+ *   - [2M - 1G] 以 2M page 映射
+ *   - [1G - 2G] 以 1G page 映射
+ * 但 range 中还剩下零头的 2M + 4K 呢?
+ *   - [2G - 2G+2M] 以 2M page 映射
+ *   - [2G+2M - 2G+3M+4K] 以 4K page 映射
+ * 这是覆盖所有 split 代码的示例, 共 5 个 memory range, 即 NR_RANGE_MR 的值。
+ *
+ * Time for the code, see if match my conclusion */
+static int __meminit split_mem_range(struct map_range *mr, int nr_range,
+				     unsigned long start,
+				     unsigned long end)
+{
+	unsigned long start_pfn, end_pfn, limit_pfn;
+	unsigned long pfn;
+	int i;
+
+	/* 简单计算知, limit_pfn = 0x80304. 这么多 pfn 变量，初看很容易迷惑，limit 表示入参
+	 * 整个 range 的上限，下面常拿来做判断用；start & end 用来 mark split 出的 range;
+	 * 最朴实的 "pfn" 用来保存各种计算结果用。*/
+	limit_pfn = PFN_DOWN(end);
+
+	/* head if not big page alignment ? */
+	pfn = start_pfn = PFN_DOWN(start); // 0x100
+#ifdef CONFIG_X86_32
+	/* SKIP */
+#else /* CONFIG_X86_64 */
+	end_pfn = round_up(pfn, PFN_DOWN(PMD_SIZE));//0x200
+#endif
+	if (end_pfn > limit_pfn)
+		end_pfn = limit_pfn;
+	if (start_pfn < end_pfn) {
+		/* 地址 [1M - 2M] 的 page_size_mask 为 0, 表示 4k page size? */
+		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn, 0);
+		pfn = end_pfn;//0x200
+	}
+
+	/* big page (2M) range */
+	start_pfn = round_up(pfn, PFN_DOWN(PMD_SIZE));//0x200, 2M
+#ifdef CONFIG_X86_32
+	/* SKIP */
+#else /* CONFIG_X86_64 */
+	end_pfn = round_up(pfn, PFN_DOWN(PUD_SIZE));//0x40000, 1G
+	if (end_pfn > round_down(limit_pfn, PFN_DOWN(PMD_SIZE)))
+		end_pfn = round_down(limit_pfn, PFN_DOWN(PMD_SIZE));
+#endif
+
+	if (start_pfn < end_pfn) {
+		/* 地址 [2M - 1G] 使用 2M page 映射. */
+		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn,
+				page_size_mask & (1<<PG_LEVEL_2M));
+		pfn = end_pfn; //0x40000, 1G
+	}
+
+#ifdef CONFIG_X86_64
+	/* big page (1G) range */
+	start_pfn = round_up(pfn, PFN_DOWN(PUD_SIZE));//0x40000, 1G
+	end_pfn = round_down(limit_pfn, PFN_DOWN(PUD_SIZE));//0x80000, 2G
+	if (start_pfn < end_pfn) {
+		/* 地址 [1G - 2G] 可用 2M 或 1G page size 映射. */
+		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn,
+				page_size_mask &
+				 ((1<<PG_LEVEL_2M)|(1<<PG_LEVEL_1G)));
+		pfn = end_pfn;//0x80000, 2G
+	}
+
+	/* tail is not big page (1G) alignment */
+	/* 下面是零头 2M + 4K 的处理 */
+	start_pfn = round_up(pfn, PFN_DOWN(PMD_SIZE));//0x80000, 2G
+	end_pfn = round_down(limit_pfn, PFN_DOWN(PMD_SIZE));//0x80200, 2G + 2M
+	if (start_pfn < end_pfn) {
+		/* 地址 [2G - 2G+2M] 使用 2M page size 映射*/
+		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn,
+				page_size_mask & (1<<PG_LEVEL_2M));
+		pfn = end_pfn;
+	}
+#endif
+
+	/* tail is not big page (2M) alignment */
+	/* 零头中的 2M 处理完了，只剩下 4K */
+	start_pfn = pfn;//0x80200, 2G + 2M
+	end_pfn = limit_pfn;//0x80304, 2G + 3M + 4K
+	nr_range = save_mr(mr, nr_range, start_pfn, end_pfn, 0);
+
+	/* 所以，split range 的 style 是  page */
+
+	/* 此函数 comments 也不 friendly.
+	 * split 出的 memory ranges，判断相邻 range 是否可合并 & 使用更大 page size, if
+	 * yes, then just do it. 合并的 style 是向中心更大 page size shrink， 即
+	 * (4K --> 2M --> 1G <-- 2M <-- 4K)
+	 *
+	 * 判断 split range 是否支持更高 page size(2M 和 1G), 将结果标记在 page_size_mask.
+	 * 判断方式：将 range 扩展到更高 page size 的边界，若 expanded physical address
+	 * range 还在 memblock.memory 中, 说明支持该 page size, 因为 memblock.memory
+	 * 表示系统可用的 RAM 空间。
+	 *
+	 * 上面分析 split process 时以 [1M - 2G+3M+4k] 为例，不适用于此 adjust 函数的分析。
+	 * 假设入参 range 是 [0 - 2G], 则 split 为 [0 - 2M](4k page), [2M - 1G](2M page),
+	 * [1G - 2G](1G page), 前 2 个 range 自然可合并为 [0 - 1G](1G page).	 */
+	if (!after_bootmem)
+		adjust_range_page_size_mask(mr, nr_range);
+
+	/* try to merge same page size and continuous */
+	/* 若相邻 range 有相同的 page_size_mask, 则可合并 */
+	for (i = 0; nr_range > 1 && i < nr_range - 1; i++) {
+		unsigned long old_start;
+		if (mr[i].end != mr[i+1].start ||
+		    mr[i].page_size_mask != mr[i+1].page_size_mask)
+			continue;
+		/* move it */
+		old_start = mr[i].start;
+		memmove(&mr[i], &mr[i+1],
+			(nr_range - 1 - i) * sizeof(struct map_range));
+		mr[i--].start = old_start;
+		nr_range--;
+	}
+
+	/* 终于分析完了 split, 好复杂精巧阿阿阿 = =|*/
+
+	for (i = 0; i < nr_range; i++)
+		pr_debug(" [mem %#010lx-%#010lx] page %s\n",
+				mr[i].start, mr[i].end - 1,
+				page_size_string(&mr[i]));
+
+	return nr_range;
+}
+
+/*
+ * Create page table mapping for the physical memory for specific physical
+ * addresses. Note that it can only be used to populate non-present entries.
+ * The virtual and physical addresses have to be aligned on PMD level
+ * down. It returns the last physical address mapped.
+ */
+unsigned long __meminit
+kernel_physical_mapping_init(unsigned long paddr_start,
+			     unsigned long paddr_end,
+			     unsigned long page_size_mask)
+{
+	return __kernel_physical_mapping_init(paddr_start, paddr_end,
+					      page_size_mask, true);
+}
+
+static unsigned long __meminit
+__kernel_physical_mapping_init(unsigned long paddr_start,
+			       unsigned long paddr_end,
+			       unsigned long page_size_mask,
+			       bool init)
+{
+	bool pgd_changed = false;
+	unsigned long vaddr, vaddr_start, vaddr_end, vaddr_next, paddr_last;
+
+	/* 这些变量名乍看和 split 函数中的 pfn 变量的 style 很像。 __va() 上文已分析。*/
+	paddr_last = paddr_end;
+	vaddr = (unsigned long)__va(paddr_start);
+	vaddr_end = (unsigned long)__va(paddr_end);
+	vaddr_start = vaddr;
+
+	for (; vaddr < vaddr_end; vaddr = vaddr_next) {
+		/* physical address -> virtual address -> PGD entry. PGD entry maps 512G. */
+		pgd_t *pgd = pgd_offset_k(vaddr);
+		p4d_t *p4d;
+
+		/* 下一个 PGD entry 对应的 virtual address. */
+		vaddr_next = (vaddr & PGDIR_MASK) + PGDIR_SIZE;
+
+		/* recursive 的进行 page table mapping 比较繁琐，暂不分析，知道它做什么即可。*/
+
+		if (pgd_val(*pgd)) {
+			/* 若 PGD entry 已 mapping, 找到它指向下一级 page table 的虚拟地址(p4d).
+			 * 进入下一级 page table(p4d) 的处理 */
+			p4d = (p4d_t *)pgd_page_vaddr(*pgd);
+			paddr_last = phys_p4d_init(p4d, __pa(vaddr),
+						   __pa(vaddr_end),
+						   page_size_mask,
+						   init);
+			continue;
+		}
+
+		/* 若 PGD entry 未 mapping, 分配 4k 用于它的下级 page directory table, 同样
+		 * 进行 recursive mapping 的动作。
+		 * brk 又出场了。Simply speaking, 若 early_alloc_pgt_buf() 中预留给 page
+		 * table 的 brk buffer 用尽了，则通过 memblock 分配； or else, 使用 brk 的
+		 * 预留空间分配。分配的 buffer 清零后返回其 virtual address. */
+		p4d = alloc_low_page();
+		paddr_last = phys_p4d_init(p4d, __pa(vaddr), __pa(vaddr_end),
+					   page_size_mask, init);
+
+		/* *_populate_init() 在本文件头部以 macro: DEFINE_POPULATE 的方式定义，难怪
+		 * grep 不到。我们分析的条件下(init && !l5)，实际函数 = p4d_populate_safe, 将
+		 * PGD entry 填充一下。*/
+		spin_lock(&init_mm.page_table_lock);
+		if (pgtable_l5_enabled())
+			pgd_populate_init(&init_mm, pgd, p4d, init);
+		else
+			p4d_populate_init(&init_mm, p4d_offset(pgd, vaddr),
+					  (pud_t *) p4d, init);
+
+		spin_unlock(&init_mm.page_table_lock);
+		pgd_changed = true;
+	}
+
+	if (pgd_changed)
+		sync_global_pgds(vaddr_start, vaddr_end - 1);
+
+	return paddr_last;
+}
+
+struct range pfn_mapped[E820_MAX_ENTRIES];
+int nr_pfn_mapped;
+
+/* 已 page mapped 的 pfn 要记录在 pfn_mapped[] */
+static void add_pfn_range_mapped(unsigned long start_pfn, unsigned long end_pfn)
+{
+	/* 将 Newly page mapped pfn range 加到 pfn_mapped[]. 先要判断 new pfn range
+	 * 是否 overlap with pfn ranges in pfn_mapped[], merge them if yes. 注意，
+	 * add/merge 过程中没有 sort. Range 中竟有 end 为 0 的可能???
+	 * 判断重叠用的变量 common_start & common_end 较巧妙，start > end 说明两个 pfn
+	 * ranges 不重叠. BTW, 最后特意将 pfn_mapped[nr_pfn_mapped] 抹零表示结束。*/
+	nr_pfn_mapped = add_range_with_merge(pfn_mapped, E820_MAX_ENTRIES,
+					     nr_pfn_mapped, start_pfn, end_pfn);
+
+	/* 数组有效元素中可能有 end 为 0 的 range, 便是 clean/sort 存在的意义。clean 掉
+	 * end = 0 的 range(of course invalid)。目标: ranges, 从小到大，no overlapping.
+	 * clean 算法：从前找到第一个 end = 0 range, 从后找到第一个 end != 0 range， 交换，
+	 * 并将 invalid range(end = 0) 的 start 也抹零。返回值是 valid range 数。*/
+	nr_pfn_mapped = clean_sort_range(pfn_mapped, E820_MAX_ENTRIES);
+
+	/* 也终于见到这两个 max mapped pfn 变量的赋值。*/
+	max_pfn_mapped = max(max_pfn_mapped, end_pfn);
+
+	if (start_pfn < (1UL<<(32-PAGE_SHIFT)))
+		max_low_pfn_mapped = max(max_low_pfn_mapped,
+					 min(end_pfn, 1UL<<(32-PAGE_SHIFT)));
+}
+
 ```
+init_memory_mapping 终于算 concluded.个
 
 
 ## APPENDIX
