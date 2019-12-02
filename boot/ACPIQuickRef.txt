@@ -1,0 +1,62 @@
+RSDP
+----
+RSDP can only be found at 2 possible physical memory ranges
+on 16-byte boundary:
+  1. The first 1 KB of Extended BIOS Data Area(EBDA).
+  2. The BIOS area [0E0000h and 0FFFFFh)
+
+RSDT address & XSDT address: kernel prefer XSDT address if both are present.
+
+RSDT/XSDT
+---------
+FADT(Fixed ACPI Description Table) is always **the 1st** entry in XSDT.
+
+FADT
+----
+Signiture is "FACP", it predates ACPI 1.0, explaining the mismatch with
+this table's name.
+
+Fields DSDT & X_DSDT, cannot exist both. So does FIRMWARE_CTRL
+&X_FIRMWARE_CTRL, the pointer to FACS(Firmware ACPI Control Structure).
+
+MADT
+----
+Buggy ACPI may have 2 MADT.
+
+SRAT & SLIT
+-----------
+NUMA info is stored in these 2 tables.
+
+Illustration
+------------
+
+                                                  +------>+-----------+
+                                                  |       |FACP       |
+                                                  |       |   Table   |
+                                                  |       |   Header  |
+                                                  |       +-----------+
+                                                  |       |           |
+                                                  |       |           |
+                                                  |       |           |
+                                                  |       |           |
+                                                  |       +-----------+
++-----------+         +------->+-----------+      |       |DSDT       |
+|RSD PTR    |         |        |XSDT       |      |       +-----------+      +----->+-----------+     +-->+-----------+
++-----------+         |        |   Table   |      |       +-----------+      |      |DSDT       |     |   |SSDT       |
+|           |         |        |   Header  |      |       |XDSDT      +------+      |   Table   |     |   |   Table   |
+|           |         |        +-----------+      |       +-----------+             |   Header  |     |   |   Header  |
+|           |         |        |FADT ENTRY +------+       |           |             +-----------+     |   +-----------+
+|           |         |        +-----------+              |           |             |           |     |   |           |
+|           |         |        |.... ENTRY |              +-----------+             |           |     |   |           |
+|           |         |        +-----------+                                        |           |     |   |           |
++-----------+         |        |MADT ENTRY |                                        |Definition |     |   |Definition |
+|RsdtAddress|         |        +-----------+                                        |Blocks     |     |   |Blocks     |
++-----------+         |        |SRAT ENTRY |                                        |           |     |   |           |
++-----------+         |        +-----------+                                        |           |     |   |           |
+|XsdtAddress+---------+        |SLIT ENTRY |                                        |           |     |   |           |
++-----------+                  +-----------+                                        +-----------+     |   +-----------+
+|           |                  |...  ENTRY |                                                          |
+|           |                  +-----------+                                                          |
++-----------+                  |SSDT ENTRY +----------------------------------------------------------+
+                               +-----------+
+
