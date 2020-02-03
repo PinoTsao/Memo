@@ -117,8 +117,8 @@ void __init setup_arch(char **cmdline_p)
 	 * 只有 128 个, 远远不够。
 	 *
 	 * 此处将 boot_params.e820_table 转存到 main table: e820_table, 并由函数
-	 * e820__update_table 对其 sanitize: sort; remove overlap (type 一样则直接
-	 * merge; 不一样则需决定 overlap range 的 type: 取大数值的 type，保守的做法).
+	 * e820__update_table 对其 sanitize: sort; remove overlap (type 相同则 merge;
+	 * 不同则需决定 overlap range 的 type: 取数值大的 type，保守的做法).
 	 * 然后 copy 到另两个 table 中。 */
 	e820__memory_setup();
 
@@ -204,7 +204,7 @@ void __init setup_arch(char **cmdline_p)
 
 	/* partially used pages are not usable - thus we are rounding upwards */
 	/* X86 架构中，memory 被划分为 4Kb 的 page frame 进行管理，pfn = page frame number.
-	 * Note: Generally speaking, memory 并不单指 RAM. 但本文中提到 pfn 时，都是指
+	 * Note: Generally speaking, memory 并不单指 RAM. 但此上下文中提到 pfn 时，都是指
 	 * RAM 这种 memory 的 pfn.
 	 *
 	 * 扩展知识：CPU 的 max pfn 自然和最大的物理地址有关，即 physical-address width of

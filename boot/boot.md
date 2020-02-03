@@ -4549,7 +4549,7 @@ relocs 的大部分代码比较普通，分析一下部分比较 tricky 的代�
 		return 0;
 	}
 
-Simply speaking: relocs 工具把 vmlinux 中出现的几种 relocation type 是 (S + A) 的 relocation entry 的 r_offset(relocation 发生的地址) 字段保存到 vmlinux.relocs 文件. 可想而知，若虚拟地址被 KASLR 随机化，原来 relocation 位置中的符号地址，要根据随机化后的新地址相应的更新，这就是 handle_relocations 函数要做的事情。理解这个函数的细节，需要了解一个**很重要的逻辑**: 不管是从 vmlinux 的加载(物理)地址，还是链接的虚拟地址，还是 vmlinux 文件内的偏移看，relocation 的位置相对起始点的 offset 是不变的，即: relocation 的 file offset = relocation 的物理地址 - vmlinux 物理起始地址 = relocation 的虚拟地址 - vmlinux 的虚拟起始地址。
+Simply speaking: relocs 工具把 vmlinux 中的绝对地址寻址(S + A)的几种 relocation type 的 relocation entry 的 r_offset(relocation 发生的地址) 字段保存到 vmlinux.relocs 文件. 可想而知，若虚拟地址被 KASLR 随机化，原来 relocation 位置中的符号地址，要根据随机化后的新地址相应的更新，这就是 handle_relocations 函数要做的事情。理解这个函数的细节，需要了解一个**很重要的逻辑**: 不管是从 vmlinux 的加载(物理)地址，还是链接的虚拟地址，还是 vmlinux 文件内的偏移看，relocation 的位置相对起始点的 offset 是不变的，即: relocation 的 file offset = relocation 的物理地址 - vmlinux 物理起始地址 = relocation 的虚拟地址 - vmlinux 的虚拟起始地址。
 
 理解了上述逻辑，就容易理解 *handle_relocations* 了：
 
@@ -5098,9 +5098,8 @@ Q: 若乱序映射 segment 时会怎样？
 #### percpu sections & variables
 
 linker script 中 output percpu section 的定义是：
-
 ```
-PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)
+	PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)
 ```
 代码展开，列出所有相关 macro:
 ```
@@ -5153,18 +5152,18 @@ __per_cpu_load = .;
 } :percpu
 . = __per_cpu_load + SIZEOF(.data..percpu);
 ```
-搜索代码发现实际 percpu variable 定义的情况是：
+搜索代码发现(截至2019年底) percpu variable 定义的实际情况是：
 
-  1. .data..percpu..first section 中只有：`union irq_stack_union irq_stack_union`;
-  2. .data..percpu..page_aligned section 中有少数变量定义: `struct gdt_page gdt_page` 和 `struct tss_struct cpu_tss_rw`;
-  3. .data..percpu..read_mostly section 中有很多变量定义;
-  4. .data..percpu section 中有大量变量定义;
+  1. .data..percpu..first section 中只有：`struct fixed_percpu_data fixed_percpu_data`;
+  2. .data..percpu..page_aligned section 中有 5 处定义, 如: `struct gdt_page gdt_page` 和 `struct tss_struct cpu_tss_rw`;
+  3. .data..percpu..read_mostly section 中有 10+ 定义;
+  4. .data..percpu section 中有大量定义;
   5. .data..percpu..shared_aligned section 不存在, 因为有 #define MODULE;
-  6. .data..percpu..decrypted section 只有 AMD SME 时才有，此处视为不存在.
+  6. .data..percpu..decrypted section 只有 AMD SME 时才存在，忽略.
 
-可以看出，percpu section 的定义有几个有趣的地方:
+percpu section 的定义有几个有趣的地方:
 
-  1. 所有 percpu 符号的虚拟地址从 0 开始;
+  1. section 虚拟地址从 0 开始，i.e., percpu symbol 虚拟地址从 0 开始;
   2. 作为 VO image 的一部分数据，他们的 LMA(物理地址)(自然应该)与其他部分一致；
   3. 变量 __per_cpu_load 记下 percpu section 原本应有的 VMA(虚拟起始地址)，会用到。
 
@@ -5174,8 +5173,9 @@ __per_cpu_load = .;
 	/*
 	 * percpu offsets are zero-based on SMP.  PERCPU_VADDR() changes the
 	 * output PHDR, so the next output section - .init.text - should
-	 * start another segment - init. 这段 comments 是 linker script PHDR 的范畴：
-	 * 若上一个 output section 指定了 PHDR, 则下一个 output section 默认放在此 PHDR.
+	 * start another segment - init.
+	 * Comments 是 linker script PHDR 的知识：
+	 * 若上一 output section 指定了 PHDR, 则下一个 output section 默认放在此 PHDR.
 	 */
 	PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)
 	/* 限制 percpu section 的 size。通过 readelf -s vmlinux 检查 __per_cpu_start
@@ -5190,37 +5190,34 @@ __per_cpu_load = .;
 #ifdef CONFIG_X86_32
 	/* SKIP */
 #else
-/*
- * Per-cpu symbols which need to be offset from __per_cpu_load
- * for the boot processor.
- */
+/* Per-cpu symbols which need to be offset from __per_cpu_load
+ * for the boot processor. */
 /*
  * output percpu section 的 VMA 被刻意安排起始于 0, LMA(物理地址) 与其他 section 一致。
  * 看过下面 head_64.S 的分析后可知: VO 的 VMA 通过 paging 映射到实际物理地址, percpu
  * section 的虚拟地址 [0 - SIZEOF(.data..percpu)] 没有被映射, 但它原本应占据的虚拟地址
  * 空间作为 VO image 的一部分已被映射到它的实际物理地址。所以此时无法直接使用 percpu 变量，
- * 也就是说，无法通过 percpu 符号的变量名找到它的值(变量名字表示其 symbol value, 即虚拟地址).
+ * 也就是说，无法通过 percpu 符号的变量名找到它的值(变量名表示其 symbol value, 即虚拟地址).
  *
- * 这里的 trick: 为现阶段使用的 percpu variable(gdt_page, irq_stack_union) 起一个
- * 新名字, 且新名字的 symbol value 等于该 percpu variable 原本在 VO 虚拟地址空间的地址，
- * 这样就可以通过 paging 找到其实际存储位置(物理地址).
- * 在 head_64.S 中，会看到使用这两个变量的地方. Wait to see. */
-#define INIT_PER_CPU(x) init_per_cpu__##x = x + __per_cpu_load
+ * Trick: 为现阶段使用的 percpu variable 起一个新名字, 且新名字的 symbol value 等于
+ * 该 percpu variable 原本在 VO 虚拟地址空间的地址，这样就可通过 paging 找到其实际物理地址.
+ * 在 head_64.S 中，会看到使用这两个变量的地方. Wait to see.
+ * lds builtin function ABSOLUTE 被 d071ae09a4a14 引入，make llvm happy. */
+#define INIT_PER_CPU(x) init_per_cpu__##x = ABSOLUTE(x) + __per_cpu_load
 INIT_PER_CPU(gdt_page);
-INIT_PER_CPU(irq_stack_union);
+INIT_PER_CPU(fixed_percpu_data);
+INIT_PER_CPU(irq_stack_backing_store);
 
-/*
- * Build-time check on the image size:
- */
+/* Build-time check on the image size: */
 . = ASSERT((_end - _text <= KERNEL_IMAGE_SIZE),
 	   "kernel image bigger than KERNEL_IMAGE_SIZE");
 
 #ifdef CONFIG_SMP
 /* output percpu section 中第一个 input section 是 .data..percpu..first section,
- * 其中只定义了 union irq_stack_union irq_stack_union; 又因为 output percpu section
- * 起始虚拟地址是 0, 所以有如下判断. */
-. = ASSERT((irq_stack_union == 0),
-           "irq_stack_union is not at start of per-cpu area");
+ * 其中只定义了 struct fixed_percpu_data fixed_percpu_data; 又因 output percpu
+ * section 的 VMA 是 0, 所以有如下判断. */
+. = ASSERT((fixed_percpu_data == 0),
+           "fixed_percpu_data is not at start of per-cpu area");
 #endif
 
 #endif /* CONFIG_X86_32 */
@@ -5964,7 +5961,7 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 *            = physaddr - (_text - __START_KERNEL_map) - v_delta ;
 	 *            = p_delta - v_delta
 	 *
-	 * 这个结果乍一看，对我来说是无法理解的. But, take it easy, 看完完整分析后会理解的。
+	 * 这个结果乍一看，对我来说是无法理解的. But, take it easy, 完整分析后会理解的。
 	 * kaslr 下的 p_delta, 等于无 kaslr 时的 load_delta */
 	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
 
@@ -6004,8 +6001,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	pud[511] += load_delta;
 
 ...
-	/* 这里 fix kenrel 自身的 mapping. 虚拟地址随机化的范围很小，只能在__START_KERNEL_map
-	 * 开始的 1G 范围内，也就是说不会超出 Page middle directory 的范围；物理地址随机化的
+	/* 这里 fix kernel 自身的 mapping. 虚拟地址随机化的范围很小，只能在__START_KERNEL_map
+	 * 开始的 1G 范围内，i.e., 不会超出 Page middle directory 的范围；物理地址随机化的
 	 * 范围远远大于虚拟地址(64TB in 4-level paging, 4PB in 5-level paging)。 等式展开：
 	 *
 	 *     pmd[i] = pmd[i] + p_delta -v_delta
@@ -6025,9 +6022,9 @@ unsigned long __head __startup_64(unsigned long physaddr,
 
 ![VOFixKASLR](fixkaslr.png)
 
-来看这幅图:
+来解读此图:
 
-  1. 背景，VO 原始的映射关系定义在 linker script 中，即在图中水平映射，如第一条横线所示。图中的 **start** 表示 VO(vmlinux) 的起始虚拟地址，物理地址。
+  1. 背景知识：VO 的原始映射关系定义在 linker script 中，如图中第一条水平横线所示。 **start** 表示 VO(vmlinux) 的**起始**虚拟地址，物理地址。VO 的 image size 被限制在 KERNEL_IMAGE_SIZE, KASLR 下是 1G; 这 1G 虚拟地址在代码中静态完整映射到物理地址。
   2. 若只有物理地址发生变化，则只需在 PMD 的 entry 中加上 p_delta
   3. 若虚拟地址和物理地址都发生变化(under KASLR), 即如图所示: original VMA -> new VMA, original LMA -> new LMA. 原映射关系下，new VMA 本来 map 到物理地址 X, KASLR 后要 map 到 new LMA, 即 new VMA -> X + (p_delta - v_delta),so, 上面分析中难理解的地方恍然大悟了。
 
@@ -6629,18 +6626,42 @@ asmlinkage __visible void __init start_kernel(void)
 	smp_setup_processor_id();
 	...
 
-	/* 下面最终调用的 printk, 稍微深挖它的代码会发现也很复杂, to be analysed. 一点 tip:
-	 * 当打开 console= 的命令行参数时，这是第一条 log. */
+	/* 下面最终调用的 printk, 稍微深挖它的代码会发现也很复杂, to be analysed.
+	 * Tip: with kernel parameter "console="，这是第一条 log. */
 	pr_notice("%s", linux_banner);
-	/* 这也是一个 Giant Function, 包含所有 x86 架构相关的 setup, 单独一节分析. */
+	/* 也是 Giant Function, X86 架构相关的 setup, 单独一节分析. 入参 command_line
+	 * 将指向 arch-specific cmd line buffer. boot_command_line 是原始的，入口代码从
+	 * boot_param 将其初始化。这也暗示了 arch 可能会改动自己的 buffer? */
 	setup_arch(&command_line);
+
+	/* 这么多 command line buffer, 各有用处，参考定义处 comments.
+	 * Initialization direction(比较乱):
+	 *   - boot_command_line -> saved_command_line -> initcall_command_line.
+	 *   - 前2者不可 touch
+	 *   - arch cmdline buffer -> static_command_line: 均可 touch */
+	setup_command_line(command_line);
+
+	/* 数一下 __cpu_possible_mask 的 1, 得出 nr_cpu_ids, 应该表示系统支持的 cpu 数目。*/
+	setup_nr_cpu_ids();
+
+	/* PERCPU 的部分背景知识在上文 "percpu sections & variables" 一节。然后上面函数中
+	 * 确认了当前系统实际支持的 CPU 数: nr_cpu_ids.*/
+	setup_per_cpu_areas();
+	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+	boot_cpu_hotplug_init();
+
+	build_all_zonelists(NULL);
+	page_alloc_init();
+
+	pr_notice("Kernel command line: %s\n", boot_command_line);
+	...
 
 }
 ```
 
 ### setup_arch
 
-这是个可以和 start_kernel 媲美的巨大函数，暂且随性分析：
+这是可以和 start_kernel 媲美的巨大函数，虽然他们是调用关系，但在目录层次结构上，暂且让他们同一 level. 暂且随性分析：
 
 ```
 /*
@@ -6715,7 +6736,11 @@ void __init setup_arch(char **cmdline_p)
 
 	/* Bunch of initialization of global variables, check it out when needed. */
 
-	/* 暂时不知为何 2 个 command line buffer. */
+	/* 为何需要 2 个 command line buffer??? boot_command_line 的注释给出一点 hint,
+	 * 它是 kernel common 的 cmd buffer, 入口代码从 boot_param 将其初始化，不可改动。
+	 * Arch-specific 代码会 copy 它到自己的 buffer, *看起来*可改动。 For X86, 这
+	 * 看起来似乎没必要？ grep arch/ 可以发现，有些 arch 就是没有定义 arch-specific
+	 * command line buffer. */
 	strlcpy(command_line, boot_command_line, COMMAND_LINE_SIZE);
 	*cmdline_p = command_line;
 	...
@@ -6813,7 +6838,7 @@ void __init setup_arch(char **cmdline_p)
 	 *
 	 * 在 kernel 的 E820 数据中找到 E820_TYPE_RAM 类型的最大 pfn, 也即:
 	 *     max_pfn = kernel 可用 RAM 空间的最大 pfn.
-	 * 表示作为可用 RAM 物理空间的上边界。
+	 * 表示作为可用 RAM 物理空间的上边界。注意：至此，kernel's E820 数据包括 NUMA node.
 	 */
 	max_pfn = e820__end_of_ram_pfn();
 
@@ -6970,14 +6995,14 @@ void __init setup_arch(char **cmdline_p)
 	/* Parse the ACPI tables for possible boot-time SMP configuration. */
 	/* 有数个名字带 "acpi", "init" 的函数，初看会困惑，待分析后来解惑。
 	/* 解惑: Booting 阶段的 acpi table 初始化。函数名字面意思可理解为：acpi 在 boot
-	 * 阶段的 table 初始化*/
+	 * 阶段的 table 初始化 */
 	acpi_boot_table_init();
 
 	/* 函数名字与其他同类函数不匹配，acpi_boot_early_init 可能比较合适。因为下方还有
 	 * acpi_boot_init. 函数字面意思可理解为： acpi 在 boot 阶段的预(early)初始化。*/
 	early_acpi_boot_init();
 
-	/* NUMA concept emerges. 见下文详细分析。 */
+	/* NUMA, 详见下文。*/
 	initmem_init();
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
 
@@ -6997,21 +7022,23 @@ void __init setup_arch(char **cmdline_p)
 
 	kasan_init();
 
-	/*
-	 * Sync back kernel address range.
+	/* Sync back kernel address range.
 	 *
 	 * FIXME: Can the later sync in setup_cpu_entry_areas() replace
-	 * this call?
-	 */
+	 * this call?	X86_32 限定，可略过。 */
 	sync_initial_page_table();
 
+	/* Intel's Trusted Execution Technology(TXT), Spec 篇幅不小，但此处初始化比较
+	 * 简单: TXT 相关数据通过 boot_params.tboot_addr 传给 kernel, kernel 将其 fixmap
+	 * 到预留的 FIX_TBOOT_BASE, then, 检查数据。*/
 	tboot_probe();
 
+	/* fixmap 预留给 vsyscall 的虚拟地址空间也 map 起来：__vsyscall_page */
 	map_vsyscall();
 
 	early_quirks();
 
-	/* Read APIC and some other early information from ACPI tables.*/
+	/* Read APIC and some other early information from ACPI tables. 下文详细分析。*/
 	acpi_boot_init();
 
 	/* Intel's Simple Firmware Interface, as a lightweight method for firmware
@@ -7022,9 +7049,57 @@ void __init setup_arch(char **cmdline_p)
 	 * 用于 non-x86 platform. 看起来现在也可以用在 x86 上了。 NOT interested. */
 	x86_dtb_init();
 
+	/* get boot-time SMP configuration. 之前已 find 过，若有 MPTable, 则 remap
+	 * 访问 table(细节略). 使用结束则 unmap. */
+	get_smp_config();
 
+	/* Systems w/o ACPI and mptables might not have it mapped the local
+	 * APIC yet, but prefill_possible_map() might need to access it. */
+	/* 看起来只是确认拿到 APIC 地址，并确认 BSP's APIC ID & version. 拿到 APIC 的地址
+	 * 就可以 remap 到 fixmap 虚拟地址空间访问。
+	 * Tip Again: APIC 地址最终是记录在 mp_lapic_addr 中； APIC ID 是 firmware
+	 * report, 可能是不连续的！一个有趣的 macro: MAX_LOCAL_APIC, 实际指的是 ID, 不是
+	 * 数量。关于它的讨论：
+	 * http://lkml.iu.edu/hypermail/linux/kernel/1509.3/01126.html */
+	init_apic_mappings();
+
+	/* 其中的逻辑也是看起来很复杂。不支持 CPU hotplug 时，possible CPU 就是 ACPI MADT
+	 * 中所有 enabled CPU; 支持 CPU hotplug 时，那些 hot-pluggable CPU 的 slot 在
+	 * ACPI 中已被 mark as disabled CPU, 这时所有的 slot 数量表示 possible CPU. 再
+	 * 加上 kernel 自身对 CPU 数的限制(CONFIG & kernel parameter), 经过复杂逻辑，才
+	 * 得到真正 possible CPU, set into cpu mask. 待详细分析。*/
+	prefill_possible_map();
+
+	/* 涉及 NUMA, percpu, 待需要时再来分析。*/
+	init_cpu_to_node();
+
+	/* 科普 again: I/O APIC 有 2 - 3 个 "memory mapped" 32-bit register, 以及一堆
+	 * memory indexed register. 前者是 index(仅使用8-bit表示 index), data, EOI(仅在
+	 * level-trigger 模式下生效). 后者是 I/O APIC ID & version register, 以及 24 个
+	 * interrupt redirection register. I/O APIC 位于南桥 chipset.
+	 * 在 acpi_process_madt -..-> mp_register_ioapic 中已解析 I/O APIC entry 并
+	 * fixmap 其物理地址，为何这里 memblock 分配一个 page, 重新 fixmap??? 待分析～ */
+	io_apic_init_mappings();
+
+	x86_init.hyper.guest_late_init();
+
+	/* Resource tree 相关，待分析。*/
+	e820__reserve_resources();
+	e820__register_nosave_regions(max_pfn);
+
+	x86_init.resources.reserve_resources();
+
+	/* Background: 分配给 main memory: RAM 的 CPU 地址空间并不是连续的。
+	 * Non-RAM 的 range 被称为 memory hole 或者这里的 gap. 在低 4G 空间中找一块 4M
+	 * 的 gap, 用作 PCI MMIO, 记在 pci_mem_start 中。 */
+	e820__setup_pci_gap();
+
+	/* 剩下几个函数暂时目测无关紧要，略过。*/
 }
 ```
+
+终于可以回到 start_kernel 了，吁～.
+
 
 -------- __pa_symbol --------
 ```
@@ -8688,7 +8763,6 @@ void __init register_lapic_address(unsigned long address)
 		boot_cpu_apic_version = GET_APIC_VERSION(apic_read(APIC_LVR));
 	}
 }
-
 ```
 ----------- initmem_init -----------
 
@@ -8859,7 +8933,7 @@ int __init acpi_numa_init(void)
 		srat_proc[2].id = ACPI_SRAT_TYPE_GICC_AFFINITY;
 		srat_proc[2].handler = acpi_parse_gicc_affinity;
 
-			acpi_table_parse_entries_array(ACPI_SIG_SRAT,
+		acpi_table_parse_entries_array(ACPI_SIG_SRAT,
 					sizeof(struct acpi_table_srat),
 					srat_proc, ARRAY_SIZE(srat_proc), 0);
 
@@ -9138,30 +9212,31 @@ int generic_processor_info(int apicid, int version)
 	/* nr_cpu_ids 初始化自 CONFIG_NR_CPUS, 也可被修改 via parameter "nr_cpus".
 	 * 表示 kernel 支持的最大 CPU 数。 */
 	int cpu, max = nr_cpu_ids;
-	/* boot_cpu_physical_apicid 在 early_acpi_parse_madt_lapic_addr_ovr 已由
-	 * APIC ID register 初始化。在本分析前提下(X86_64 & SMP), it is not set in
-	 * phys_cpu_present_map.
-	 * start_kernel 的 time_init 在 UniProcessor 情况下会 set. */
+
+	/* boot_cpu_physical_apicid (之前)在 early_acpi_parse_madt_lapic_addr_ovr --
+	 * --> register_lapic_address 已由 APIC ID register 初始化。在本文分析条件下
+	 * (X86_64 & SMP), it is not set in phys_cpu_present_map.
+	 * (之后的start_kernel 的 time_init 在 UniProcessor 情况下会 set.) */
 	bool boot_cpu_detected = physid_isset(boot_cpu_physical_apicid,
 				phys_cpu_present_map);
 
 	/* Skip 无关紧要 codes. */
 
-	/* If boot cpu has not been detected yet, then only allow upto
+	/* If boot cpu has not been detected yet, then only allow up to
 	 * nr_cpu_ids - 1 processors and keep one slot free for boot cpu.
-	 * 逻辑：进入此函数注册 apicid 时，若发现:
-	 * 1. boot_cpu_physical_apicid is not set in phys_cpu_present_map, and
-	 * 2. 已注册的 num_processors > max config value, and
-	 * 3. 入参 apicid 也并是 boot_cpu_physical_apicid
-	 * 则需要在 phys_cpu_present_map 给 boot cpu 留个位置。disabled_cpus, 数目, 表示
-	 * MADT 中有其 entry, but is not enabled in entry's flags. 留个位置就是不处理
+	 * 进入此函数注册 apicid 时，若发现:
+	 *   1. boot_cpu_physical_apicid is not set in phys_cpu_present_map, AND
+	 *   2. 已注册的 num_processors > max config value, AND
+	 *   3. 入参 apicid 也不是 boot_cpu_physical_apicid
+	 * 则需在 phys_cpu_present_map 给 boot cpu 留个位置。disabled_cpus, 数目, 表示
+	 * MADT 中有 entry, but is not enabled in entry's flags. "留个位置"就是不处理
 	 * 入参 apicid, 把它当作 disabled_cpu, 然后返回。
 	 */
 	if (!boot_cpu_detected && num_processors >= nr_cpu_ids - 1 &&
 	    apicid != boot_cpu_physical_apicid) {
 	    /* 要知道：CONFIG_NR_CPUS 和 ACPI MADT 中 APIC entry 数很可能不同，若 ACPI
 	     * MADT 中 entry 数 > kernel 支持的数目，则不支持多余 CPUs, 将他们计入
-	     * disabled_cpus. 所以 thiscpu is evaluated like this. 本函数中多处定义了
+	     * disabled_cpus. 所以 "thiscpu" is evaluated like this. 本函数中多处定义
 	     * thiscpu, 看起来实在冗余，仅是 debug 用。*/
 		int thiscpu = max + disabled_cpus - 1;
 
@@ -9186,15 +9261,14 @@ int generic_processor_info(int apicid, int version)
 		return -EINVAL;
 	}
 
-	/* 代码很明显, BSP 要作为 kernel 定义的 logical CPU IDs 中的第一个，其他的随缘。
+	/* 代码很明显, BSP 要作为 kernel 定义的 logical CPU ID 中的第一个，其他的随缘。
 	 * NOTE: "logical cpuid" 是 kernel 定义的 CPU 编号(纯软件视角)，要 map 到 ACPI
 	 * 提供的 APIC ID(硬件拓扑来的 CPU ID) via cpuid_to_apicid[]. */
 	if (apicid == boot_cpu_physical_apicid) {
 		/* x86_bios_cpu_apicid is required to have processors listed
 		 * in same order as logical cpu numbers. Hence the first
 		 * entry is BSP, and so on.
-		 * boot_cpu_init() already hold bit 0 in cpu_present_mask
-		 * for BSP. */
+		 * boot_cpu_init() already hold bit 0 in cpu_present_mask for BSP. */
 		/* 上面注释暂时不懂，TBD. */
 		cpu = 0;
 
@@ -9409,6 +9483,219 @@ void __init kernel_randomize_memory(void)
 ### spinlock
 
 ### PERCPU variable
+
+percpu area 的初始化在 start_kernel -> setup_per_cpu_areas. 但这之前已有几处使用，如 initmem_init -> x86_numa_init -> numa_init -> early_cpu_to_node：
+
+	early_per_cpu_ptr(x86_cpu_to_node_map)
+
+再如 generic_processor_info:
+
+	early_per_cpu(x86_cpu_to_apicid, cpu) = apicid;
+	early_per_cpu(x86_bios_cpu_apicid, cpu) = apicid;
+
+I.e, 在 percpu area 初始化前，也有使用 percpu variable 的需求(暂时不知是啥)，这些使用被 mark as  macro: EARLY_PER_CPU. 以上面 2 个例子分析 early percpu 的使用。
+
+Early percpu variable 的定义代码展开如下：
+```
+/* numa.c。 Kernel 代码只有一处使用这个 macro, 就是本例 = =| */
+DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
+
+/* percpu.h */
+/* Early percpu variable 的定义原来是数组[NR_CPUS]，同时定义指针 reference 它。这样的话，
+ * 目测使用它的确不需要什么初始化。 The peer macro DEFINE_EARLY_PER_CPU_READ_MOSTLY
+ * 除放入不同的 percpu sub-section 外，其他完全相同。*/
+#define	DEFINE_EARLY_PER_CPU(_type, _name, _initvalue)			\
+	DEFINE_PER_CPU(_type, _name) = _initvalue;			\
+	__typeof__(_type) _name##_early_map[NR_CPUS] __initdata =	\
+				{ [0 ... NR_CPUS-1] = _initvalue };	\
+	__typeof__(_type) *_name##_early_ptr __refdata = _name##_early_map
+
+/* percpu-defs.h */
+#define DEFINE_PER_CPU(type, name)					\
+	DEFINE_PER_CPU_SECTION(type, name, "")
+
+/* __typeof__ 是 GCC 对 C 语言的扩展 keyword. */
+#define DEFINE_PER_CPU_SECTION(type, name, sec)				\
+	__PCPU_ATTRS(sec) __typeof__(type) name
+
+/* PER_CPU_ATTRIBUTES 在 x86 下为空，但别的 arch 未必。grep arch/ 发现只有 IA64 有。*/
+#define __PCPU_ATTRS(sec)						\
+	__percpu __attribute__((section(PER_CPU_BASE_SECTION sec)))	\
+	PER_CPU_ATTRIBUTES
+
+/* percpu.h */
+#define PER_CPU_BASE_SECTION ".data..percpu"
+```
+
+Early percpu variable 的使用如下：
+```
+/* reference 数组的 pointer. */
+#define	early_per_cpu_ptr(_name) (_name##_early_ptr)
+/* 第 _idx 个数组元素的值。目测只用在 setup_per_cpu_areas 中？ */
+#define	early_per_cpu_map(_name, _idx) (_name##_early_map[_idx])
+/* 第 _cpu 个数组元素的值。功能看起来和上面这位一样，但，是代码内日常使用，如第二个示例。 Why?
+ * http://lkml.iu.edu/hypermail/linux/kernel/0804.1/3269.html 中有一点线索，看起来
+ * 某些 percpu variable 会在 percpu area 初始化前后都要使用。 Wait to see. */
+#define	early_per_cpu(_name, _cpu) 				\
+	*(early_per_cpu_ptr(_name) ?				\
+		&early_per_cpu_ptr(_name)[_cpu] :		\
+		&per_cpu(_name, _cpu))
+
+```
+Early PERCPU variable 的定义&使用就是这样简单。
+
+Then, time for the real percpu initialization: **setup_per_cpu_areas**. 函数入口的 log 引出另一个 tiny topic: kernel 关于 CPU number 的诸多 variable & macro 之间的区别?
+
+	/* threads.h */
+	#define NR_CPUS		CONFIG_NR_CPUS
+
+CONFIG_NR_CPUS 定义在 autoconf.h, (明显 autoconf.h 不用作直接 `#include`) **NR_CPUS** 是它的替身，表示 kernel 配置支持的最大 CPU 数量； **nr_cpu_ids** 是变量，对应 kernel parameter "nr_cpus=", 初始化后期根据系统实际情况被修改为系统(hardware)支持的实际 CPU 数量； **nr_cpumask_bits** 因 CONFIG_CPUMASK_OFFSTACK 而存在， cpumask_t 变量的 size 太大(NR_CPUS)，用作局部变量时，占用 stack 太多，所以 `typedef struct cpumask *cpumask_var_t;` 可节约 stack, 这也许就是 "off stack" 的含义。
+
+```
+#ifdef CONFIG_CPUMASK_OFFSTACK
+	/* Assuming NR_CPUS is huge, a runtime limit is more efficient.  Also,
+	 * not all bits may be allocated. */
+	#define nr_cpumask_bits	nr_cpu_ids
+#else
+	#define nr_cpumask_bits	((unsigned int)NR_CPUS)
+#endif
+```
+CONFIG_CPUMASK_OFFSTACK 实现细节待分析。
+
+```
+void __init setup_per_cpu_areas(void)
+{
+	unsigned int cpu;
+	unsigned long delta;
+	int rc;
+
+	pr_info("NR_CPUS:%d nr_cpumask_bits:%d nr_cpu_ids:%u nr_node_ids:%u\n",
+		NR_CPUS, nr_cpumask_bits, nr_cpu_ids, nr_node_ids);
+
+	/*
+	 * Allocate percpu area.  Embedding allocator is our favorite;
+	 * however, on NUMA configurations, it can result in very
+	 * sparse unit mapping and vmalloc area isn't spacious enough
+	 * on 32bit.  Use page in that case.
+	 */
+#ifdef CONFIG_X86_32
+	if (pcpu_chosen_fc == PCPU_FC_AUTO && pcpu_need_numa())
+		pcpu_chosen_fc = PCPU_FC_PAGE;
+#endif
+	rc = -EINVAL;
+	if (pcpu_chosen_fc != PCPU_FC_PAGE) {
+		const size_t dyn_size = PERCPU_MODULE_RESERVE +
+			PERCPU_DYNAMIC_RESERVE - PERCPU_FIRST_CHUNK_RESERVE;
+		size_t atom_size;
+
+		/*
+		 * On 64bit, use PMD_SIZE for atom_size so that embedded
+		 * percpu areas are aligned to PMD.  This, in the future,
+		 * can also allow using PMD mappings in vmalloc area.  Use
+		 * PAGE_SIZE on 32bit as vmalloc space is highly contended
+		 * and large vmalloc area allocs can easily fail.
+		 */
+#ifdef CONFIG_X86_64
+		atom_size = PMD_SIZE;
+#else
+		atom_size = PAGE_SIZE;
+#endif
+		rc = pcpu_embed_first_chunk(PERCPU_FIRST_CHUNK_RESERVE,
+					    dyn_size, atom_size,
+					    pcpu_cpu_distance,
+					    pcpu_fc_alloc, pcpu_fc_free);
+		if (rc < 0)
+			pr_warning("%s allocator failed (%d), falling back to page size\n",
+				   pcpu_fc_names[pcpu_chosen_fc], rc);
+	}
+	if (rc < 0)
+		rc = pcpu_page_first_chunk(PERCPU_FIRST_CHUNK_RESERVE,
+					   pcpu_fc_alloc, pcpu_fc_free,
+					   pcpup_populate_pte);
+	if (rc < 0)
+		panic("cannot initialize percpu area (err=%d)", rc);
+
+	/* alrighty, percpu areas up and running */
+	delta = (unsigned long)pcpu_base_addr - (unsigned long)__per_cpu_start;
+	for_each_possible_cpu(cpu) {
+		per_cpu_offset(cpu) = delta + pcpu_unit_offsets[cpu];
+		per_cpu(this_cpu_off, cpu) = per_cpu_offset(cpu);
+		per_cpu(cpu_number, cpu) = cpu;
+		setup_percpu_segment(cpu);
+		setup_stack_canary_segment(cpu);
+		/*
+		 * Copy data used in early init routines from the
+		 * initial arrays to the per cpu data areas.  These
+		 * arrays then become expendable and the *_early_ptr's
+		 * are zeroed indicating that the static arrays are
+		 * gone.
+		 */
+#ifdef CONFIG_X86_LOCAL_APIC
+		per_cpu(x86_cpu_to_apicid, cpu) =
+			early_per_cpu_map(x86_cpu_to_apicid, cpu);
+		per_cpu(x86_bios_cpu_apicid, cpu) =
+			early_per_cpu_map(x86_bios_cpu_apicid, cpu);
+		per_cpu(x86_cpu_to_acpiid, cpu) =
+			early_per_cpu_map(x86_cpu_to_acpiid, cpu);
+#endif
+#ifdef CONFIG_X86_32
+		per_cpu(x86_cpu_to_logical_apicid, cpu) =
+			early_per_cpu_map(x86_cpu_to_logical_apicid, cpu);
+#endif
+#ifdef CONFIG_NUMA
+		per_cpu(x86_cpu_to_node_map, cpu) =
+			early_per_cpu_map(x86_cpu_to_node_map, cpu);
+		/*
+		 * Ensure that the boot cpu numa_node is correct when the boot
+		 * cpu is on a node that doesn't have memory installed.
+		 * Also cpu_up() will call cpu_to_node() for APs when
+		 * MEMORY_HOTPLUG is defined, before per_cpu(numa_node) is set
+		 * up later with c_init aka intel_init/amd_init.
+		 * So set them all (boot cpu and all APs).
+		 */
+		set_cpu_numa_node(cpu, early_cpu_to_node(cpu));
+#endif
+		/*
+		 * Up to this point, the boot CPU has been using .init.data
+		 * area.  Reload any changed state for the boot CPU.
+		 */
+		if (!cpu)
+			switch_to_new_gdt(cpu);
+	}
+
+	/* indicate the early static arrays will soon be gone */
+#ifdef CONFIG_X86_LOCAL_APIC
+	early_per_cpu_ptr(x86_cpu_to_apicid) = NULL;
+	early_per_cpu_ptr(x86_bios_cpu_apicid) = NULL;
+	early_per_cpu_ptr(x86_cpu_to_acpiid) = NULL;
+#endif
+#ifdef CONFIG_X86_32
+	early_per_cpu_ptr(x86_cpu_to_logical_apicid) = NULL;
+#endif
+#ifdef CONFIG_NUMA
+	early_per_cpu_ptr(x86_cpu_to_node_map) = NULL;
+#endif
+
+	/* Setup node to cpumask map */
+	setup_node_to_cpumask_map();
+
+	/* Setup cpu initialized, callin, callout masks */
+	setup_cpu_local_masks();
+
+	/*
+	 * Sync back kernel address range again.  We already did this in
+	 * setup_arch(), but percpu data also needs to be available in
+	 * the smpboot asm.  We can't reliably pick up percpu mappings
+	 * using vmalloc_fault(), because exception dispatch needs
+	 * percpu data.
+	 *
+	 * FIXME: Can the later sync in setup_cpu_entry_areas() replace
+	 * this call?
+	 */
+	sync_initial_page_table();
+}
+
+```
 
 ## APPENDIX
 

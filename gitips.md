@@ -12,11 +12,11 @@ Git has three main states that your files can reside in: modified, staged, and c
   - The **staging area is a file**, generally contained in your Git directory, that stores information about what will go into your next commit. Its technical name in Git parlance is the **index**, but the phrase “staging area” works just as well.
   - The Git directory is where Git stores the metadata and object database for your project. This is the most important part of Git, and it is what is copied when you clone a repository from another computer.
 
-Git populates **index** with a list of all the file contents that were last checked out into your working directory and what they looked like when they were originally checked out. You then replace some of those files with new versions of them by `git add`, and `git commit` converts that into the **tree object** for a new commit.
+Git populates **index** with a list of all the file contents that were last checked out into your working directory and what they looked like when they were originally checked out. You then replace some of those files with new versions of them by `git add`, and `git commit` converts that into the **tree object** for a new commit. Here is a quick [knowledge reference](https://shafiul.github.io//gitbook/7_the_git_index.html) for **index** file.
 
-HEAD is the pointer to the current branch, which is in turn a pointer to the last commit made on that branch.
+**HEAD** is the pointer to the current branch, which is in turn a pointer to the last commit made on that branch.
 
-Best Reference for the fundamentals: **chapter "Git internals"** of [pro git](https://git-scm.com/book/en/v2)
+Best Reference for the fundamentals: chapter **"Git internals"** of [pro git](https://git-scm.com/book/en/v2)
 
 #### How Git store its data?
 
@@ -127,6 +127,12 @@ You can use this format to push a local branch into a remote branch that is name
 
 Very useful tricks, dedicated to real problems.
 
+## Reset
+
+  1. Move HEAD to specified commit
+  2. Updating the Index (--mixed)
+  3. Updating the Working Directory (--hard)
+
 #### git blame 查找"元凶"
 
 `blame` Show what revision and author last modified each line of a file.
@@ -181,15 +187,27 @@ git blame 92417df076f75^ arch/x86_64/kernel/head.S
 2. `man 7 gitrevisions`: 如何为 git 命令指定某个 commit 或者 commit range
 3. `git help blame`: blame 时如何指定 revision range
 
-#### X86 patch style
+### Tips for activities in X86 community
 
-和 git 使用没关系，但混 x86 社区，这是重要的 tips.
+和 git 使用没关系，但混 x86 社区，这些是重要的 tips.
+
+#### patch style
 
 标题的要求：
 >Subject needs to have a verb and start with a capital letter after the subsystem/path prefix.
 
-引用 commit 时的 style:
+Commit reference style:
 
 >1e61f78baf89 ("x86/cpufeature: Make sure DISABLED/REQUIRED macros are updated")
 
 尽量不加 bonus changes, 尤其是那些八杆子打不着的 change.
+
+#### Good mailing practices
+
+From Boris Petkov's mail's footnote:
+
+>Good mailing practices for 400: avoid top-posting and trim the reply.
+
+#### netiquette(网络礼仪)
+
+[https://people.kernel.org/tglx/notes-about-netiquette](https://people.kernel.org/tglx/notes-about-netiquette)
