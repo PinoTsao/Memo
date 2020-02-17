@@ -9228,16 +9228,15 @@ int generic_processor_info(int apicid, int version)
 	 *   1. boot_cpu_physical_apicid is not set in phys_cpu_present_map, AND
 	 *   2. 已注册的 num_processors > max config value, AND
 	 *   3. 入参 apicid 也不是 boot_cpu_physical_apicid
-	 * 则需在 phys_cpu_present_map 给 boot cpu 留个位置。disabled_cpus, 数目, 表示
-	 * MADT 中有 entry, but is not enabled in entry's flags. "留个位置"就是不处理
-	 * 入参 apicid, 把它当作 disabled_cpu, 然后返回。
+	 * 则需在 phys_cpu_present_map 给 boot cpu 留个位置。disabled_cpus 表示 kernel
+	 * 不能使用的 CPU 数目. "留个位置"就是不处理入参 apicid, 把它当作 disabled_cpu.
 	 */
 	if (!boot_cpu_detected && num_processors >= nr_cpu_ids - 1 &&
 	    apicid != boot_cpu_physical_apicid) {
-	    /* 要知道：CONFIG_NR_CPUS 和 ACPI MADT 中 APIC entry 数很可能不同，若 ACPI
-	     * MADT 中 entry 数 > kernel 支持的数目，则不支持多余 CPUs, 将他们计入
-	     * disabled_cpus. 所以 "thiscpu" is evaluated like this. 本函数中多处定义
-	     * thiscpu, 看起来实在冗余，仅是 debug 用。*/
+	    /* nr_cpu_ids 的值和 ACPI MADT 中 local APIC entry 数可能不同，若 ACPI MADT
+	     * 中 entry 数 > kernel 支持的数目，则不支持多余 CPUs, 将他们计入 disabled_cpus.
+	     * 所以 "thiscpu" is evaluated like this, 表示 CPU index.
+	     * 本函数中多处定义 thiscpu, 看起来冗余，仅 debug 用。*/
 		int thiscpu = max + disabled_cpus - 1;
 
 		pr_warning(
@@ -9261,9 +9260,10 @@ int generic_processor_info(int apicid, int version)
 		return -EINVAL;
 	}
 
-	/* 代码很明显, BSP 要作为 kernel 定义的 logical CPU ID 中的第一个，其他的随缘。
-	 * NOTE: "logical cpuid" 是 kernel 定义的 CPU 编号(纯软件视角)，要 map 到 ACPI
-	 * 提供的 APIC ID(硬件拓扑来的 CPU ID) via cpuid_to_apicid[]. */
+	/* 逻辑很明显, BSP 要作为第一个 kernel logical CPU ID: 0, 其他的依次递增。
+	 * NOTE: "logical cpuid" 是 kernel 定义的 CPU 编号(纯软件视角)，与 APIC ID 有
+	 * 1:1 映射关系 via cpuid_to_apicid[].
+	 */
 	if (apicid == boot_cpu_physical_apicid) {
 		/* x86_bios_cpu_apicid is required to have processors listed
 		 * in same order as logical cpu numbers. Hence the first
@@ -9284,9 +9284,6 @@ int generic_processor_info(int apicid, int version)
 
 	/* SKIP Validate version code */
 
-	/* 悟：APIC ID 是硬件的 ID, 它即存在于寄存器中，也存在于 ACPI 的 table 中，正常情况
-	 * 下，这二者应完全一致。 But what if not??? */
-
 	if (apicid > max_physical_apicid)
 		max_physical_apicid = apicid;
 
@@ -9294,16 +9291,17 @@ int generic_processor_info(int apicid, int version)
 	 *   1. First, 它在硬件拓扑上有 APIC ID;
 	 *   2. Then, 它在 ACPI namespace 中有 ACPI processor ID;
 	 *   3. At last, 它在 Linux kernel 中有 logical CPU ID.
-	 * Kernel 使用自己定义的 logical CPU ID, 但其他的 ID 都会映射过来，比如这里，还有
-	 * caller acpi_register_lapic 处理返回值的操作。    PERCPU, TBD. */
+	 * ID 之间互相映射，比如这里，还有 caller: acpi_register_lapic 处理返回值的操作。
+	 * PERCPU, TBD.
+	 */
 #if defined(CONFIG_SMP) || defined(CONFIG_X86_64)
 	early_per_cpu(x86_cpu_to_apicid, cpu) = apicid;
 	early_per_cpu(x86_bios_cpu_apicid, cpu) = apicid;
 #endif
 	/* Skip X86_32 code. */
 
-	/* 至此，已确定一个 APIC ID 在 kernel 中的 logical CPU ID. 可以开始应用了。
-	 * 初次看到这几个 cpu mask 的 assignment. */
+	/* 至此，已确定一个 APIC ID 在 kernel 中的 logical CPU ID.
+	 * 首次看到 cpu mask 的 assignment, 所以 cpu mask 其实是 logical CPU ID mask */
 	set_cpu_possible(cpu, true);
 	physid_set(apicid, phys_cpu_present_map);
 	set_cpu_present(cpu, true);
