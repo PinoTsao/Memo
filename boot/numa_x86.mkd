@@ -591,16 +591,17 @@ NUMA 初始化中常遇到 CPU ID 的概念，这是完全理解 NUMA code 的 p
 >1. https://patents.google.com/patent/US7502803B2/en: Abstract
 2. Intel SDM 3a, 8.4.3 MP Initialization Protocol Algorithm for MP Systems: 5. As part of the boot-strap code, the **BSP creates an ACPI table** and/or an MP table and adds its initial APIC ID to these tables as appropriate
 
-setup_arch() 中，CPU & NUMA 相关的初始化的出现顺序是：
+setup_arch() 中，CPU & NUMA 相关的初始化函数的出现顺序是：
 
   - acpi_boot_table_init
   - early_acpi_boot_init
-  - initmem_init
+  - initmem_init: NUMA 初始化
   - ...
   - acpi_boot_init
-  - 	init_apic_mappings()
-  - 	prefill_possible_map()
-  - 	init_cpu_to_node()
+  - get_smp_config
+  - init_apic_mappings()
+  - prefill_possible_map()
+  - init_cpu_to_node()
 
 可见 ACPI 的初始化散落在 3 个函数(按出现顺序):
 
@@ -751,7 +752,13 @@ int __init acpi_table_init(void)
 	return 0;
 }
 ```
-从软件视角看 APIC 就是 a bunch of registers, 其中只有一个是 MSR: IA32_APIC_BASE, 其他的是 memory mapped registers, 即映射在 CPU 物理地址空间，这些 memory mapped registers 有一个 base address, 由 Intel SDM 3a, 10.4.1 可知， it defaults to 32-bit APIC_DEFAULT_PHYS_BASE. 第二个初始化函数 early_acpi_boot_init 的重点内容是解析 MADT, 找到 memory mapped APIC 寄存器的 base address.
+从软件视角看， APIC is a bunch of registers, 其中只有一个是 MSR: IA32_APIC_BASE, 其他都是 memory mapped registers, 即映射在 CPU 物理地址空间，这些 memory mapped registers 有一个 base address, 由 Intel SDM 3a, 10.4.1 知: it defaults to 32-bit APIC_DEFAULT_PHYS_BASE.
+
+>**NOTE**： x2APIC archetecture 既可以工作在  x2APIC mode, 也可以工作在 APIC(xAPIC) mode. x2APIC mode 时，其 APIC registers 都是 MSR.
+
+所以可推断：若是 x2APIC arch, 其 MADT header 中依然有 APIC base address, 在其工作在 APIC mode 时用。
+
+第二个 ACPI 初始化函数 early_acpi_boot_init 的重点内容是解析 MADT header, 找到 memory mapped APIC 寄存器的 base address.
 
 ```
 int __init early_acpi_boot_init(void)
@@ -761,9 +768,8 @@ int __init early_acpi_boot_init(void)
 		return 1;
 
 	/* Process the Multiple APIC Description Table (MADT), if present */
-	/* 此函数做的事情：找到 APIC register 的 base address, 并映射到 fixmap 中预留的
-	 * 虚拟地址空间，如果是 memory mapped register(!x2apic); 拿到 boot CPU's ID &
-	 * version 信息。*/
+	/* 找到 APIC register 的 base address, 若是 !x2apic 则映射到 fixmap area 中预留
+	 * 的虚拟地址空间; 拿到 boot CPU's APIC ID & APIC version. 详见下文。*/
 	early_acpi_process_madt();
 
 	/* Hardware-reduced ACPI mode initialization: */
@@ -788,7 +794,7 @@ int __init early_acpi_boot_init(void)
 #endif
 
 /* Early process MADT 的主要工作是找到 memory mapped APIC registers 的基地址。
- * 方式： MADT header 中的 32-bit 物理地址；或者 MADT sub-table “Local APIC Address
+ * 方式： MADT header 中的 32-bit 物理地址； 或 MADT sub-table “Local APIC Address
  * Override” 中的 64-bit 物理地址，如果有的话。
  *
  * Besides, APIC driver 的架构值的一看。(暂不知根据什么分类) APIC 的物理实现有多种， 每种
@@ -807,15 +813,15 @@ static void __init early_acpi_process_madt(void)
 	if (!acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)) {
 
 		/* Parse MADT LAPIC entries */
-		/* 返回值的处理 confusing, 有三种情况：负值 on 错误; 0 on 没有相应 entry; 正数
-		 * 表示处理的 entry 数。*/
+		/* 返回值的处理 confusing, 有三种情况: < 0 表示错误; 0 表示没有相应 entry;
+		 * > 0 表示处理的 entry 数。*/
 		error = early_acpi_parse_madt_lapic_addr_ovr();
 		if (!error) {
-			/* 函数执行成功，说明拿到 APIC 寄存器 base address, ID, version 等信息，
-			 * so, ACPI 中有正确的 lapic 信息。*/
+			/* 函数执行成功，说明拿到 APIC register base address, ID, version 等信息，
+			 * so, ACPI MADT 中有 local APIC info. */
 			acpi_lapic = 1;
-			/* find_smp_config -> xx -> smp_scan_config 已 set, if present.
-			 * I.e., 如果 MP Spec 定义的 configuration table 存在，即 set. */
+			/* 若系统存在 MP table, 则 find_smp_config -> xx -> smp_scan_config 时
+			 * 已 set. 正常的 SMP 系统，MP table, ACPI table 只存在一个*/
 			smp_found_config = 1;
 		}
 		if (error == -EINVAL) {
@@ -833,7 +839,10 @@ static void __init early_acpi_process_madt(void)
  * 得到 APIC ID； ACPI's MADT 中有 APIC ID, 三者是什么关系？
  * 已确认: MP INITIALIZATION 时得到的叫做 *initial APIC ID*, 生成后写入 APIC ID 寄存器，
  * 某些 CPU 允许更改此寄存器的内容； cpuid 指令得到的是始终是不变的 *initial APIC ID*;
- * ACPI MADT 中的 APIC ID = 初始化得到的 *initial* ID.  Refer:
+ *
+ * 而 ACPI MADT 中的 APIC ID 呢？目前推测，BIOS 生成 ACPI table 时从寄存器拿到 ID 写入。
+ * 
+ * Refer:
  *   1. Intel SDM 3a, 8.4.5 Identifying Logical Processors in an MP System
  *   2. Intel SDM 3a, 10.4.6 Local APIC ID
  */
@@ -847,13 +856,13 @@ void __init register_lapic_address(unsigned long address)
 
 	/* x2apic_mode 在 setup_arch --> check_x2apic 中已初始化。
 	 *
-	 * 根据 APIC 是否支持 x2apic mode, 有 2 个情况：
-	 *   - 不支持 x2apic： APIC registers are accessed via mapped to physical
+	 * 根据 x2apic mode 是否 enable , 有 2 个情况：
+	 *   - !x2apic mode： APIC registers are accessed via mapped to physical
 	 *     address; then, registers are accessed in code via virtual address
 	 *     of page-mapping.
 	 *     fixmap 区域已为 APIC 预留 virtual address range: FIX_APIC_BASE.
 	 *
-	 *   - 支持 x2apic: APIC registers 都是 MSR. 通过指令 wrmsr/rdmsr 访问，不需
+	 *   - x2apic mode: APIC registers 都是 MSR. 通过指令 wrmsr/rdmsr 访问，不需
 	 *     memory map.
 	 *
 	 *  Refer: Intel SDM 3a, 10.12.1.2 x2APIC Register Address Space
@@ -954,7 +963,7 @@ int __init acpi_boot_init(void)
 	return 0;
 }
 
-/* early_acpi_process_madt() 只从 MADT header 中读取了 APIC register base address,
+/* early_acpi_process_madt() 从 MADT header 中读取 APIC register base address,
  * 这里 parse 每一个 sub-table.
  * 已发 cleanup patch: https://patchwork.kernel.org/patch/11346677/, 等待回应 */
 static void __init acpi_process_madt(void)
@@ -1001,6 +1010,8 @@ static void __init acpi_process_madt(void)
  		 * In the event an MPS table was found, forget it.
  		 * Boot with "acpi=off" to use MPS on such a system.
  		 */
+ 		/* 若 ACPI 中没有 MADT，kernel 将认为该系统使用 UP PIC, 即使有 MP table, 也
+ 		 * forget it.*/
 		if (smp_found_config) {
 			printk(KERN_WARNING PREFIX
 				"No APIC-table, disabling MPS\n");
@@ -1012,6 +1023,8 @@ static void __init acpi_process_madt(void)
 	 * ACPI supports both logical (e.g. Hyper-Threading) and physical
 	 * processors, where MPS only supports physical.
 	 */
+	/* 看起来存在一种 case: ACPI & MP table 都存在，但 ACPI MADT 提供 local APIC info,
+	 * MP table 提供 I/O APIC info? */
 	if (acpi_lapic && acpi_ioapic)
 		printk(KERN_INFO "Using ACPI (MADT) for SMP configuration "
 		       "information\n");
@@ -1167,22 +1180,22 @@ static int acpi_register_lapic(int id, u32 acpiid, u8 enabled)
 	if (boot_cpu_physical_apicid != -1U)
 		ver = boot_cpu_apic_version;
 
-	/* x86_cpu_to_acpiid 似乎没有实际用处？ TBD */
+    /* 核心函数： APIC ID mapping to logical CPU number. */
 	cpu = generic_processor_info(id, ver);
 	if (cpu >= 0)
+		/* x86_cpu_to_acpiid 似乎没有实际用处？ TBD */
 		early_per_cpu(x86_cpu_to_acpiid, cpu) = acpiid;
 
 	return cpu;
 }
 
-/* 简约分析 to get the point. */
 int generic_processor_info(int apicid, int version)
 {
 	/* nr_cpu_ids 初始化自 CONFIG_NR_CPUS, or kernel parameter "nr_cpus".
 	 * 表示 kernel 支持的最大 CPU 数。 */
 	int cpu, max = nr_cpu_ids;
 
-	/* boot_cpu_physical_apicid 已在 early_acpi_parse_madt_lapic_addr_ovr -->
+	/* boot_cpu_physical_apicid 已在 early_acpi_process_madt --> ... ->
 	 * register_lapic_address 由 APIC ID register 初始化。本文条件下: X86_64 & SMP,
 	 * it is NOT SET in phys_cpu_present_map.
 	 *
@@ -1352,15 +1365,206 @@ static int __init acpi_parse_madt_ioapic_entries(void)
 ```
 至此，ACPI boot phase initialization 告终。后面仍有一些函数：
 
-  - 	init_apic_mappings()
-  - 	prefill_possible_map()
-  - 	init_cpu_to_node()
+  - get_smp_config()
+  - init_apic_mappings()
+  - prefill_possible_map()
+  - init_cpu_to_node()
 
 See what they do.
 
-init_apic_mappings 的代码有点困惑，看似无实质作用，仅是 corner case 的兼容，比如 ACPI table & MP table 都没有的 buggy case. (如果两个 table 都有，只使用 ACPI MADT 中的 local APIC 信息，refer: smp_read_mpc() ).
+函数 get_smp_config 与更早调用的 find_smp_config 密切相关。find_smp_config 在 memory 中寻找 MPS(MultiProcessor Specification) 的 MP Floating Pointer Structure, 分别有变量 *mpf_base*, *mpf_found* 记录信息。 Generally speaking, MPS 是古老的 spec, 它的功能已完全被 ACPI 包含，所以，正常情况下，二者有其一即可[1]。 但(个人推测), 在使用 MPS 到 ACPI 的演进过程中，出现过二者都有的 case.
 
->**Important background**: acpi_boot_init() 与 init_apic_mappings() 之间还有调用 get_smp_config(), 从 MP table(if present) 中初始化如 APIC ID 等相关变量。
+[1]. https://en.wikipedia.org/wiki/MultiProcessor_Specification
+
+NUMA 初始化之后来到 get_smp_config, 实际是 default_get_smp_config 函数。
+
+```
+void __init default_get_smp_config(unsigned int early)
+{
+	struct mpf_intel *mpf;
+
+	if (!smp_found_config)
+		return;
+
+	if (!mpf_found)
+		return;
+
+    /* 参数 early 唯一的使用者是 amd_numa_init(), 为了获取 boot CPU APIC ID. early
+     * 为 TRUE 时：
+     *   1. 若 ACPI 提供 local APIC info(acpi_lapic=1), 则不必走下去，因为函数
+     *      register_lapic_addr 中已拿到 boot_cpu_physical_apicid.
+     *   2. 若 ACPI 未提供 local APIC info(acpi_lapic=0), 则走下去，smp_read_mpc 中
+     *   		if (!acpi_lapic)
+	 *				register_lapic_address(mpc->lapic);
+	 *
+	 *			if (early)
+	 *				return 1;
+     *      同样会获取 boot_cpu_physical_apicid 并返回.
+     */
+	if (acpi_lapic && early)
+		return;
+
+	/* MPS doesn't support hyperthreading, aka only have thread 0 apic id
+	 * in MPS table */
+	/* 知识点：MPS 列出的 APIC ID 都是 physical core, 不支持 Intel HyperThread
+	 * 技术的 logical core. */
+
+    /* 若 ACPI MADT 提供了 both local APIC & I/O APIC, 则不必 parse MP?
+     * 间接表明 ACPI 未必提供 both 二者。*/
+	if (acpi_lapic && acpi_ioapic)
+		return;
+
+	mpf = early_memremap(mpf_base, sizeof(*mpf));
+	if (!mpf) {
+		pr_err("MPTABLE: error mapping MP table\n");
+		return;
+	}
+
+	pr_info("Intel MultiProcessor Specification v1.%d\n", mpf->specification);
+#if defined(CONFIG_X86_LOCAL_APIC) && defined(CONFIG_X86_32)
+	if (mpf->feature2 & (1 << 7)) {
+		pr_info("    IMCR and PIC compatibility mode.\n");
+		pic_mode = 1;
+	} else {
+		pr_info("    Virtual Wire compatibility mode.\n");
+		pic_mode = 0;
+	}
+#endif
+
+	/* Now see if we need to read further. */
+	/* MP Floating Pointer Structure 中有几个 feature bytes, byte1 表示 MP System
+	 * Configuration Type. MPS 预定义了几个 default MP system configuration, refer:
+	 * MPS, chapter 5. 若 byte1 为 0，表示不使用 MPS 提供的 default config; 不为 0
+	 * 则表示使用 default config, 这时 OS 根据 default config 自己构造 MP table. */
+	if (mpf->feature1) {
+		if (early) {
+			/* local APIC has default address */
+			/* MP default configuration 的条件之一： APIC 0xFEE00000*/
+			mp_lapic_addr = APIC_DEFAULT_PHYS_BASE;
+			goto out;
+		}
+
+		pr_info("Default MP configuration #%d\n", mpf->feature1);
+		construct_default_ISA_mptable(mpf->feature1);
+
+	} else if (mpf->physptr) {
+	    /* 不使用 MPS 的 default MP configuration, 则去解析 MP table. */
+		if (check_physptr(mpf, early))
+			goto out;
+	} else
+		BUG();
+
+	if (!early)
+		pr_info("Processors: %d\n", num_processors);
+
+	/* Only use the first configuration found. */
+out:
+	early_memunmap(mpf, sizeof(*mpf));
+}
+
+static int __init check_physptr(struct mpf_intel *mpf, unsigned int early)
+{
+	struct mpc_table *mpc;
+	unsigned long size;
+
+	size = get_mpc_size(mpf->physptr);
+	mpc = early_memremap(mpf->physptr, size);
+
+	/* Read the physical hardware table.  Anything here will
+	 * override the defaults. */
+	/* 解析 MP table, 仅分析 APIC, 入参 early 相关 */
+	if (!smp_read_mpc(mpc, early)) {
+#ifdef CONFIG_X86_LOCAL_APIC
+		smp_found_config = 0;
+#endif
+		pr_err("BIOS bug, MP table errors detected!...\n");
+		pr_cont("... disabling SMP support. (tell your hw vendor)\n");
+		early_memunmap(mpc, size);
+		return -1;
+	}
+	early_memunmap(mpc, size);
+
+	if (early)
+		return -1;
+
+#ifdef CONFIG_X86_IO_APIC
+	/*
+	 * If there are no explicit MP IRQ entries, then we are
+	 * broken.  We set up most of the low 16 IO-APIC pins to
+	 * ISA defaults and hope it will work.
+	 */
+	if (!mp_irq_entries) {
+		struct mpc_bus bus;
+
+		pr_err("BIOS bug, no explicit IRQ entries, using default mptable. (tell your hw vendor)\n");
+
+		bus.type = MP_BUS;
+		bus.busid = 0;
+		memcpy(bus.bustype, "ISA   ", 6);
+		MP_bus_info(&bus);
+
+		construct_default_ioirq_mptable(0);
+	}
+#endif
+
+	return 0;
+}
+
+/* 返回值是 mapping 的 logical CPU number. */
+static int __init smp_read_mpc(struct mpc_table *mpc, unsigned early)
+{
+	char str[16];
+	char oem[10];
+
+    ...
+
+	/* Initialize the lapic mapping */
+	/* 这两个 if() 判断是为了 amd_numa_init() --> early_get_smp_config() */
+	if (!acpi_lapic)
+		register_lapic_address(mpc->lapic);
+
+	if (early)
+		return 1;
+
+    ...
+
+	/* Now process the configuration blocks. */
+    ...
+
+	while (count < mpc->length) {
+		switch (*mpt) {
+		case MP_PROCESSOR:
+			/* ACPI may have already provided this data */
+			if (!acpi_lapic)
+				MP_processor_info((struct mpc_cpu *)mpt);
+			skip_entry(&mpt, &count, sizeof(struct mpc_cpu));
+			break;
+		case MP_BUS:
+			...
+		case MP_IOAPIC:
+			...
+		case MP_INTSRC:
+			...
+		case MP_LINTSRC:
+			...
+		default:
+			/* wrong mptable */
+			smp_dump_mptable(mpc, mpt);
+			count = mpc->length;
+			break;
+		}
+		x86_init.mpparse.mpc_record(1);
+	}
+
+	if (!num_processors)
+		pr_err("MPTABLE: no processors registered!\n");
+	return num_processors;
+}
+
+```
+init_apic_mappings 的代码有点困惑，看似无实质作用，仅是 corner case 的兼容，比如 ACPI table & MP table 都没有, CPU 却有 APIC 的 case. (若两个 table 都有，只使用 ACPI MADT 中的 local APIC 信息，refer: smp_read_mpc() ).
+
+>**Important background**: acpi_boot_init() 与 init_apic_mappings() 之间还有调用 get_smp_config()
 
 推测还需兼容 UP 的 case: *1e90a13d0c3dc* 中列出了一些稀有情况，如 UP has no ACPI table & APIC, UP has neither ACPI nor MP table, but has APIC. 这个函数名也有些 confusing, 目前理解，mapping 的含义是 APIC ID -> kernel logical CPU ID 的映射。
 
@@ -1371,7 +1575,7 @@ init_apic_mappings 的代码有点困惑，看似无实质作用，仅是 corner
 有些含糊，没有说明 **it** 是什么，目前认为 **it** should be **logical CPU ID**.
 
 ```
-void __init 把(void)
+void __init init_apic_mappings(void)
 {
 	unsigned int new_apicid;
 
