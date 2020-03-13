@@ -1599,7 +1599,7 @@ static int __init smp_read_mpc(struct mpc_table *mpc, unsigned early)
 ```
 OK, 从 firmware 获取 SMP 架构信息的处理至此应该全结束了, moving on.
 
-初看 init_apic_mappings, 函数名和代码都让人困惑。它的工作看起来仅是初始化 boot_cpu_physical_apicid, 而正常情况下，前面解析 ACPI MADT 和 MP table 时(分别通过 register_lapic_address & MP_processor_info )会初始化它。唯一的线索落在引入这几行代码的 commit *1e90a13d0c3dc*.
+初看 init_apic_mappings, 函数名和代码都让人困惑。它的工作看似仅初始化 boot_cpu_physical_apicid, 而正常情况下，前面解析 ACPI MADT 和 MP table 时(分别通过 register_lapic_address & MP_processor_info)会初始化它。唯一的线索落在引入这几行代码的 commit *1e90a13d0c3dc*.
 
 调用处的 comments:
 
@@ -1607,19 +1607,25 @@ OK, 从 firmware 获取 SMP 架构信息的处理至此应该全结束了, movin
 
 一眼看上去也是不知所云，看上去和后面的 prefill_possible_map() 有关。
 
-背景知识：发现系统是 SMP 时，或者说发现 APIC 时，首先要做的事：将 APIC register base address 映射到虚拟地址空间，方便读写；获取 boot_cpu_physical_apicid. 这正是函数 register_lapic_address 的内容。
+背景知识：发现系统是 SMP 时，或者说发现 APIC 时，若非 x2APIC mode, 首先要获得 APIC register base address 并映射到虚拟地址空间，方便读写；获取 boot_cpu_physical_apicid. 这些正是函数 register_lapic_address 的内容。
 
-上文已说：正常情况下， boot_cpu_physical_apicid 已在解析 ACPI MADT 或 MP table 时初始化。(初始化它的同时，也 map 了 APIC register.) 所以这里其实是为了兼容不正常情况的 corner case, 如 commit 中所说：
+上面提到的正常情况：有 ACPI MADT 或 MP table 时, 背景提到的 2 件事都有做过：
+
+  1. ACPI MADT: register_lapic_address
+  2. MP table: smp_read_mpc --> MP_processor_info. 前者 mapping APIC, 后者获取 boot_cpu_physical_apicid.
+
+而这里 init_apic_mappings 其实是为兼容不正常的 corner case, 如其调用处 comments 所述：无 ACPI MADT 和 MP table 时，APIC register base address 没有被 mapping(也没有初始化 boot_cpu_physical_apicid), 具体 case 如 commit 所述：
 
 >left a wreckage for systems which have neither ACPI nor mptables, but the CPU has an APIC, e.g. virtualbox.
 
-现在可以理解其函数名了：local APIC register 的 base address 需要 mapping 到虚拟地址空间，因为 prefill_possible_map 有调用 read_apic_id, 需要使用 virtual address 访问 memory. 若碰到 corner case 没有 map local APIC register, read_apic_id 时肯定要出问题！
+函数名终于 make sense, 而且后面的 prefill_possible_map 有调用 read_apic_id, 需要使用 virtual address 访问 memory mapped APIC registers. 若碰到 corner case 没有 map local APIC register, read_apic_id 时肯定要出问题！
 
-上面说到，此函数为了兼容 corner case: 未初始化 boot_cpu_physical_apicid & 未 mapping APIC register.  有哪儿些 **corner case**?
+纵览函数后，列出不正常情况的 **corner case**:
 
   1. (如 commit 所说:)ACPI MADT & MP table 都没有，却有 APIC. 这时不会调用 register_lapic_address.
-  2. 使用 MPS 的 default configuration 时， OS 自己构造的 MP table Processor entry 未设置 BP flag.
+  2. 使用 MPS 的 default configuration 时， OS 自己构造的 MP table Processor entry 未设置 BP flag, 也未 mapping APIC register base address.
 
+Tips again: 此函数专为 cover 那些 corner case! 同时也要兼容正常情况！
 ```
 void __init init_apic_mappings(void)
 {
@@ -1628,10 +1634,8 @@ void __init init_apic_mappings(void)
 	/* 略过 */
 	apic_check_deadline_errata();
 
-	/* 若是 x2apic mode, 表明这是较新的 CPU family. 回看 register_lapic_address
-	 * 会发现 x2apic_mode 下，不会获取 boot_cpu_physical_apicid.
-	 * (还是不明白！！！TBD)
-	 * APIC 所有寄存器都是 MSR，不需再确认寄存器地址。*/
+	/* 背景：无 ACPI MADT 和 MP table; x2APIC 所有寄存器是 MSR, 不需 memory mapping.
+	 * 所以直接 read MSR 获得 boot_cpu_physical_apicid 即可，无需 mapping. */
 	if (x2apic_mode) {
 		boot_cpu_physical_apicid = read_apic_id();
 		return;
@@ -1649,7 +1653,7 @@ void __init init_apic_mappings(void)
 		/* 进入此分支的另外 3 个条件：
 		 *   1. 无 table, 有 APIC. 正是 commit 中提到的 corner case.
 		 *   2. 有 table, 无 APIC, (目前认为)不可能有这种 case
-		 *   3. 有 table, 有 APIC, 这是正常情况，不在此上下文分析之列。
+		 *   3. 有 table, 有 APIC, 这是正常情况，此 branch 不处理。
 		 *
 		 * 看来此分支专为处理条件 1. mp_lapic_addr 在上面 detect_init_APIC 中已赋值。
 		 * apic_phys 看起来冗余？ */
@@ -1691,15 +1695,38 @@ void __init init_apic_mappings(void)
 		boot_cpu_apic_version = GET_APIC_VERSION(apic_read(APIC_LVR));
 	}
 }
+
+#ifdef CONFIG_X86_64
+/*
+ * Detect and enable local APICs on non-SMP boards.
+ * Original code written by Keir Fraser.
+ * On AMD64 we trust the BIOS - if it says no APIC it is likely
+ * not correctly set up (usually the APIC timer won't work etc.)
+ */
+/* 此函数仅被 init_apic_mapping 调用，且仅在 !smp_found_config = TRUE 时调用。 */
+static int __init detect_init_APIC(void)
+{
+	if (!boot_cpu_has(X86_FEATURE_APIC)) {
+		pr_info("No local APIC present\n");
+		return -1;
+	}
+
+	/* 所以这里的赋值仅为： 无 table, 有 APIC 的 case. */
+	mp_lapic_addr = APIC_DEFAULT_PHYS_BASE;
+	return 0;
+}
+#else
+
+#endif
 ```
 prefill_possible_map() 紧挨着 init_apic_mappings().
 
 ```
 /*
- * cpu_possible_mask should be static, it cannot change as cpu's
- * are onlined, or offlined. The reason is per-cpu data-structures
- * are allocated by some modules at init time, and dont expect to
- * do this dynamically on cpu arrival/departure.
+ * cpu_possible_mask should be static, it cannot change as cpu's are onlined,
+ * or offlined. The reason is per-cpu data-structures are allocated by some
+ * modules at init time, and don't expect to do this dynamically on CPU's
+ * arrival/departure.
  * cpu_present_mask on the other hand can change dynamically.
  * In case when cpu_hotplug is not compiled, then we resort to current
  * behaviour, which is cpu_possible == cpu_present.
@@ -1712,16 +1739,24 @@ prefill_possible_map() 紧挨着 init_apic_mappings().
  * We do this because additional CPUs waste a lot of memory.
  * -AK
  */
+/* cpu_possible_mask 应是指一个计算机系统实际支持的最大 CPU 数量，包括已 onlined,
+ * offlined(即 hotpluggable CPU). present 并不表示 online, present 可能仅是插上。
+ * 本函数是确定 possible CPU. */
 __init void prefill_possible_map(void)
 {
 	int i, possible;
 
 	/* No boot processor was found in mptable or ACPI MADT */
-	/* 此刻，num_processors == 0 是 UP 的情况？没有 table?*/
+	/* 根据 2a51fe083eba7, 这段代码看起来兼顾 2 个 case:
+	 *   1. 没有 ACPI MADT & MP table & APIC, 那就是 UP? 直接赋值为 1;
+	 *   2. Commit 所述 case. (背景: IIRC, Kdump kernel 只使用一个 CPU 运行，即
+	 *      nr_cpu_id=1). 这时 kdump kernel 依然会通过 early_acpi_boot_init -->
+	 *      register_lapic_addr 获得 boot_cpu_physical_apicid. 但在 acpi_boot_init
+	 *      中无法对 hot-plugged (boot) CPU enumerate(generic_processor_info处理),
+	 *      所以 num_processors 为 0.*/
 	if (!num_processors) {
 		if (boot_cpu_has(X86_FEATURE_APIC)) {
-			/* 没有 table, 有 APIC 的 case? 若如此，boot_cpu_physical_apicid 已在
-			 * 前一函数中赋值。*/
+			/* 变量 cpu 仅用来 debug, 但它和 apicid 好像是一回事? */
 			int apicid = boot_cpu_physical_apicid;
 			int cpu = hard_smp_processor_id();
 
@@ -1733,14 +1768,20 @@ __init void prefill_possible_map(void)
 				generic_processor_info(apicid, boot_cpu_apic_version);
 		}
 
+		/* case 1 */
 		if (!num_processors)
 			num_processors = 1;
 	}
 
+	/* 确定 possible cpu 的值，如果未通过 kernel parameter 设置 */
 	i = setup_max_cpus ?: 1;
 	if (setup_possible_cpus == -1) {
+		/* num_processors 是已 enumerated 的 online CPU, 作为 base. */
 		possible = num_processors;
+
 #ifdef CONFIG_HOTPLUG_CPU
+		/* disabled_cpus 包括 MADT 中 flags 是 disabled 的，还可能包括因内核最大支持
+		 * 数的限制，而被归入 disabled 的一些。*/
 		if (setup_max_cpus)
 			possible += disabled_cpus;
 #else
@@ -1750,6 +1791,7 @@ __init void prefill_possible_map(void)
 	} else
 		possible = setup_possible_cpus;
 
+	/* 正常情况下，这二者应该相等。不正常的情况是? */
 	total_cpus = max_t(int, possible, num_processors + disabled_cpus);
 
 	/* nr_cpu_ids could be reduced via nr_cpus= */
