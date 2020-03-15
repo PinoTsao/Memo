@@ -1620,6 +1620,8 @@ OK, 从 firmware 获取 SMP 架构信息的处理至此应该全结束了, movin
 
 函数名终于 make sense, 而且后面的 prefill_possible_map 有调用 read_apic_id, 需要使用 virtual address 访问 memory mapped APIC registers. 若碰到 corner case 没有 map local APIC register, read_apic_id 时肯定要出问题！
 
+**问题**: commit log 中提到的 virtualbox 的例子，无 ACPI MADT & MP table, 却有 APIC, 它是 UP 还是 SMP??? log 没有明确说明，目前只能推测它只可能是 UP, 等待验证。
+
 纵览函数后，列出不正常情况的 **corner case**:
 
   1. (如 commit 所说:)ACPI MADT & MP table 都没有，却有 APIC. 这时不会调用 register_lapic_address.
@@ -1719,7 +1721,18 @@ static int __init detect_init_APIC(void)
 
 #endif
 ```
-prefill_possible_map() 紧挨着 init_apic_mappings().
+prefill_possible_map() 紧挨着 init_apic_mappings(). 这里涉及 2016 年 10 月的 3 个 commit, 我们来还原下历史：
+
+  1. 10/3: 2a51fe083eba7 解决 kdump kernel 碰巧运行在 hotplugged CPU 上，导致该 CPU 没有调用 generic_processor_info() 映射 kernel logical CPU 的问题。
+  2. 10/22: ff8560512b8d4 发现 1. 会导致无 ACPI & MP table & APIC 的普通 UP doesn't boot.
+  3. 10/29: 1e90a13d0c3dc 发现 2. 会导致 virtualbox 这种 corner case(UP, 无 APCI
+     MADT & MP table, BUT has APIC) crash.
+
+In other words, 当系统只有 1 个 CPU 时，可能有几种情况：
+
+  1. SMP, kdump kernel is running.
+  2. 普通 UP
+  3. Corner case UP: virtualbox
 
 ```
 /*
@@ -1739,27 +1752,46 @@ prefill_possible_map() 紧挨着 init_apic_mappings().
  * We do this because additional CPUs waste a lot of memory.
  * -AK
  */
-/* cpu_possible_mask 应是指一个计算机系统实际支持的最大 CPU 数量，包括已 onlined,
- * offlined(即 hotpluggable CPU). present 并不表示 online, present 可能仅是插上。
- * 本函数是确定 possible CPU. */
+/* "possible CPU" 指一个计算机系统实际支持的最大 CPU 数量，当支持 CPU hotplug 时，它
+ * 包括已 onlined, offlined(待 hotplug CPU); 不支持时则等于 onlined CPU.
+ * 由上面 comments 可知，percpu 变量根据系统实际支持最大 CPU 数分配空间，尤其部分
+ * module 在 booting 阶段就要初始化 percpu 变量。
+ * 系统支持 CPU hotplug 时， present != online, present 可能仅是物理上的插上。
+ *
+ * 本函数要确定 possible CPU 数目. */
 __init void prefill_possible_map(void)
 {
 	int i, possible;
 
 	/* No boot processor was found in mptable or ACPI MADT */
-	/* 根据 2a51fe083eba7, 这段代码看起来兼顾 2 个 case:
-	 *   1. 没有 ACPI MADT & MP table & APIC, 那就是 UP? 直接赋值为 1;
-	 *   2. Commit 所述 case. (背景: IIRC, Kdump kernel 只使用一个 CPU 运行，即
-	 *      nr_cpu_id=1). 这时 kdump kernel 依然会通过 early_acpi_boot_init -->
-	 *      register_lapic_addr 获得 boot_cpu_physical_apicid. 但在 acpi_boot_init
-	 *      中无法对 hot-plugged (boot) CPU enumerate(generic_processor_info处理),
-	 *      所以 num_processors 为 0.*/
+	/* 变量 num_processors 在 generic_processor_info() 中初始化，表示从 ACPI MADT
+	 * 或者 MP table 中 enumerated *enabled CPU* 数. cpu_possible_mask &
+	 * cpu_present_mask 都根据它来初始化。
+	 *
+	 * The cases of num_processors = 0, according to 2a51fe083eba7, there
+	 * are 3:
+	 *   1. 有 APIC 却无 ACPI MADT & MP table, 即 1e90a13d0c3dc 所述 virtualbox
+	 *      case, 只执行一次 generic_processor_info, 即 number_processors = 1,
+	 *      间接验证该 commit 描述的 corner case 就是 UP;
+	 *   2. 如 commit 所述: kdump 时，hot-plugged CPU 是 boot CPU. (IIRC, Kdump
+	 *      kernel 只使用一个 CPU 运行，即 nr_cpu_id=1). 这时 kdump kernel 依然
+	 *      在 early_acpi_boot_init --> register_lapic_addr 通过读取 register
+	 *      获得 boot_cpu_physical_apicid. 但 acpi_boot_init 解析 MADT, enumerate
+	 *      CPU 时 无法找到 boot CPU, 所以 num_processors 为 0.
+	 *   3. 普通 UP, 无 ACPI & MP table & APIC, 直接 num_processors = 0, 无需
+	 *      map kernel logical CPU.
+	 */
 	if (!num_processors) {
 		if (boot_cpu_has(X86_FEATURE_APIC)) {
-			/* 变量 cpu 仅用来 debug, 但它和 apicid 好像是一回事? */
+			/* case 1 & 2.  变量 cpu 仅用来 debug, 但它和 apicid 好像是一回事?
+			 * No matter what case, boot_cpu_physical_apicid 都会被初始化, case 1
+			 * 在 init_apic_mapping(), case 2 的 kdump kernel 依然在解析 MADT
+			 * header 时初始化它。*/
 			int apicid = boot_cpu_physical_apicid;
 			int cpu = hard_smp_processor_id();
 
+			/* case 1 无 table; case 2 hotplug(boot) CPU 不在 ACPI MADT 中；
+			 * table is provide by BIOS. so, they are "not listed by BIOS". */
 			pr_warn("Boot CPU (id %d) not listed by BIOS\n", cpu);
 
 			/* Make sure boot cpu is enumerated */
@@ -1768,30 +1800,36 @@ __init void prefill_possible_map(void)
 				generic_processor_info(apicid, boot_cpu_apic_version);
 		}
 
-		/* case 1 */
+		/* case 3. */
 		if (!num_processors)
 			num_processors = 1;
 	}
 
-	/* 确定 possible cpu 的值，如果未通过 kernel parameter 设置 */
+	/* Kernel parameter "maxcpus"(setup_max_cpus) 表示 booting 阶段能 bringup
+	 * 的最大 CPU 数。未 bringup 的 CPU, 可在启动后使其 online. 0 表示 "nosmp".
+	 * 使用场景? 系统提供 8 个 CPU，但某次只想使用 2 个，若还需要，则开机后动态 online?
+	 * 理解它很重要，对理解代码逻辑很重要。*/
 	i = setup_max_cpus ?: 1;
+	/* 若未设置 possible_cpus in kernel parameter, 则计算 possible cpu 的值；
+	 * 若设置，则使用它. */
 	if (setup_possible_cpus == -1) {
-		/* num_processors 是已 enumerated 的 online CPU, 作为 base. */
+		/* num_processors 是已 enumerated 的 online(enabled) CPU, 作为 base. */
 		possible = num_processors;
 
 #ifdef CONFIG_HOTPLUG_CPU
-		/* disabled_cpus 包括 MADT 中 flags 是 disabled 的，还可能包括因内核最大支持
-		 * 数的限制，而被归入 disabled 的一些。*/
+		/* disabled_cpus 包括：MADT 中 flags 是 disabled 的，以及因内核最大支持数限制
+		 * (nr_cpus)而被归入 disabled 的。支持 CPU hotplug 时，他们都是 possible CPU. */
 		if (setup_max_cpus)
 			possible += disabled_cpus;
 #else
+		/* 不支持 hotplug 时，possible CPU = num_processors, 而且不能超过 maxcpus. */
 		if (possible > i)
 			possible = i;
 #endif
 	} else
 		possible = setup_possible_cpus;
 
-	/* 正常情况下，这二者应该相等。不正常的情况是? */
+	/* 正常情况下，二者应相等。异常情况是？ */
 	total_cpus = max_t(int, possible, num_processors + disabled_cpus);
 
 	/* nr_cpu_ids could be reduced via nr_cpus= */
@@ -1810,6 +1848,7 @@ __init void prefill_possible_map(void)
 		possible = i;
 	}
 
+	/* 修改 nr_cpu_ids 为系统实际支持数目 */
 	nr_cpu_ids = possible;
 
 	pr_info("Allowing %d CPUs, %d hotplug CPUs\n",
@@ -1817,8 +1856,48 @@ __init void prefill_possible_map(void)
 
 	reset_cpu_possible_mask();
 
+	/* 之前 generic_processor_info 中只 set enabled CPU into possible CPU,
+	 * 现在计入了 disabled CPU, 即 hotpluggable CPU. */
 	for (i = 0; i < possible; i++)
 		set_cpu_possible(i, true);
 }
+```
+kernel parameter *maxcpus* & *possible_cpus* 的[简单介绍](https://www.ibm.com/support/knowledgecenter/en/linuxonibm/com.ibm.linux.z.lgdd/lgdd_r_maxcpusparm.html)
 
+最后来到 init_cpu_to_node()
+
+```
+/*
+ * Setup early cpu_to_node.
+ *
+ * Populate cpu_to_node[] only if x86_cpu_to_apicid[],
+ * and apicid_to_node[] tables have valid entries for a CPU.
+ * This means we skip cpu_to_node[] initialisation for NUMA
+ * emulation and faking node case (when running a kernel compiled
+ * for NUMA on a non NUMA box), which is OK as cpu_to_node[]
+ * is already initialized in a round robin manner at numa_init_array,
+ * prior to this call, and this initialization is good enough
+ * for the fake NUMA cases.
+ *
+ * Called before the per_cpu areas are setup.
+ */
+void __init init_cpu_to_node(void)
+{
+	int cpu;
+	u16 *cpu_to_apicid = early_per_cpu_ptr(x86_cpu_to_apicid);
+
+	BUG_ON(cpu_to_apicid == NULL);
+
+	for_each_possible_cpu(cpu) {
+		int node = numa_cpu_node(cpu);
+
+		if (node == NUMA_NO_NODE)
+			continue;
+
+		if (!node_online(node))
+			init_memory_less_node(node);
+
+		numa_set_node(cpu, node);
+	}
+}
 ```
