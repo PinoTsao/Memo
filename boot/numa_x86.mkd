@@ -20,7 +20,7 @@ In other words, 对 Linux kernel 来说，有 memory 的 node 才是真 node.
 
 网摘: [NUMA "全书"](https://software.intel.com/en-us/articles/a-brief-survey-of-numa-non-uniform-memory-architecture-literature)
 
-## Initialization
+## NUMA Initialization
 
 NUMA 是 hardware 的设计，一个 NUMA node 上有"几个 CPU" & "多少 memory" 的信息只有 firmware 才知道。 On modern computing system, 这些信息通过 ACPI's SRAT & SLIT传递给 Linux kernel.
 
@@ -38,15 +38,16 @@ void __init initmem_init(void)
 /* According to comments above & a glance at function body, 可看出 NUMA 的初始化
  * 分 3 种不同方式: common X86, AMD-specific, NO NUMA(1 个 node).
  *
- * Why AMD-specific?
- * 推理: AMD 最先支持 NUMA(Opteron processor of 2003). 其早期设计， according to
- * head comments of amdtopology.c, NUMA 信息(memory range : NodeID)存储在
- * northbridge 的 PCI config space, 直接读取它构建 Kernel 的 NUMA data. I.e., AMD
+ * What is AMD-specific?
+ * AMD 在其第一款 64 bit CPU, Opteron of 2003, 最先支持 NUMA. According to head
+ * comments of amdtopology.c, 其 NUMA 信息(memory range : NodeID)存储在
+ * northbridge 的 PCI config space, 读取它构建 Kernel 的 NUMA data. I.e., AMD
  * NUMA 的初始设计不通过 ACPI table 传递 NUMA 信息。随着 Intel 开始支持 NUMA in late
  * 2007, 大家开始一致使用 ACPI table 的方式传递 NUMA 信息。
  *
  * In case CPU arch provided NUMA info failed to initialize NUMA in kernel,
- * kernel 有理由认为当前系统没有 NUMA, 把所有 CPU&memory 当作一个 dummy node.*/
+ * kernel 有理由认为当前系统没有 NUMA, 把所有 CPU&memory 当作一个 dummy node.
+ */
 void __init x86_numa_init(void)
 {
 	if (!numa_off) {
@@ -80,7 +81,7 @@ static int __init numa_init(int (*init_func)(void))
 	 * 背景 tips:
 	 *   1. 一个 APIC ID 对应一个 CPU, 一个 CPU 对应一个 NODE. CPU 的 APIC ID
 	 *      (register/ACPI 中各有一份)可能 non-contiguous;
-	 *   2. MAX_NUMNODES <-- NODES_SHIFT <-- CONFIG_NODES_SHIFT 的定义关系?:
+	 *   2. MAX_NUMNODES <-- NODES_SHIFT <-- CONFIG_NODES_SHIFT 的定义关系?
 	 *      autoconf.h 不是为 .c 直接 #include 用, 而 MAX_NUMNODES 方便直接使用。
 	 * Node 管理与 CPU 一样使用 bitmap --> mask 的形式。
 	 * 此初始化似乎多余？因为声明处已初始化。 */
@@ -183,7 +184,7 @@ int __init x86_acpi_numa_init(void)
 	return srat_disabled() ? -EINVAL : 0;
 }
 
-/* drivers/acpi/numa.c */
+/* drivers/acpi/numa/srat.c */
 int __init acpi_numa_init(void)
 {
 	int cnt = 0;
@@ -213,7 +214,7 @@ int __init acpi_numa_init(void)
 		 * 是 ACPI 术语(32-bit), 对应 kernel 使用的逻辑 NUMA ID(MAX_NUMNODES),
 		 * sub-table handler 将二者映射起来，也将 APIC ID 与 逻辑 NUMA ID 映射起来。
 		 * Kernel 限制 PXM ID 到 MAX_NUMNODES, 若 ACPI 定义的 PXM ID > MAX_NUMNODES,
-		 * 则 NUMA 初始化失败！ 注意 "数目" 与"ID" 的区别。
+		 * 则 NUMA 初始化失败！ 注意 "数目(count)" 与"ID" 的区别。
 		 *
 		 * ACPI's PXM ID 与 kernel's 逻辑 NUMA ID 通过: pxm_to_node_map[] &
 		 * node_to_pxm_map[] 互相 mapping: 对每一个 PXM ID, nodes_found_map 中
@@ -557,7 +558,7 @@ static bool __init numa_meminfo_cover_memory(const struct numa_meminfo *mi)
 /*
  * 不明白前一半 comments, 但 code 的确是践行后一半 comments. Round robin online node,
  * assign NodeID to each possible CPU in nr_cpu_ids. 和上面相邻代码有相同问题： 此前
- * 前并 set NodeID 给 CPU, so, 此处用意用处何在？ 
+ * 前并 set NodeID 给 CPU, so, 此处用意用处何在？
  * 注意： node_online_map 可以不连续 */
 static void __init numa_init_array(void)
 {
@@ -572,11 +573,52 @@ static void __init numa_init_array(void)
 	}
 }
 ```
+NUMA 自身的初始化终于结束，最后关于 nr_cpu_ids 的部分尚未详细分析，因为还不知道 CPU 的初始化是怎样(下一节的内容)；另外， NUMA node 与 CPU 之间的映射关系也需要在函数 init_cpu_to_node 中确定，也涉及 CPU 的初始化。所以，至此，先跳转去下一节分析 CPU 初始化，再来分析 init_cpu_to_node.
 
-NUMA 自身的初始化终于结束了，最后关于 nr_cpu_ids 的部分尚未详细分析，因为还不知道 CPU 的初始化是怎样(下一节的内容)；另外， NUMA node 与 CPU 之间的映射关系也需要在下面的函数中确定，这也涉及了 CPU 的初始化。所以，分析至此，可以先跳转去下一节分析 CPU 初始化先。
+终于回来了～ 回忆下 NUMA 和 CPU 初始化，核心内容之一是各种 ID 的映射。从 ACPI 角度来看，它使用 APIC ID 识别 CPU, 使用 PXM ID 识别 NUMA node, 但 kernel 要使用自己的 logical CPU ID 和 Node ID, 所以有了各种 mapping 工作。这些 mapping 工作是理解函数 *init_cpu_to_node* 的必要条件。
+
+Background: kernel 最终使用自己的 [Logical CPU ID:Node ID] 的 mapping, 这要做一些转换工作。解析 ACPI MADT 时(acpi_process_madt -> acpi_process_madt -> generic_processor_info)， 确定了 [Logical CPU ID:APIC ID] mapping in *x86_cpu_to_apicid*; 解析 SRAT 时(x86_numa_init -> x86_numa_init -> acpi_numa_init -> acpi_numa_processor_affinity_init)，确定了 [APIC ID:Node ID] mapping in *__apicid_to_node*, 所以顺理成章有了 [logical CPU ID:Node ID] mapping in *x86_cpu_to_node_map*, 即：
+
+>[Logical CPU ID:APIC ID] + [APIC ID:Node ID] --> [Logical CPU ID:Node ID]
 
 ```
-init_cpu_to_node
+/*
+ * Setup early cpu_to_node.
+ *
+ * Populate cpu_to_node[] only if x86_cpu_to_apicid[],
+ * and apicid_to_node[] tables have valid entries for a CPU.
+ * This means we skip cpu_to_node[] initialisation for NUMA
+ * emulation and faking node case (when running a kernel compiled
+ * for NUMA on a non NUMA box), which is OK as cpu_to_node[]
+ * is already initialized in a round robin manner at numa_init_array,
+ * prior to this call, and this initialization is good enough
+ * for the fake NUMA cases.
+ *
+ * Called before the per_cpu areas are setup.
+ */
+/* 函数名中的 cpu, node, 指自己定义的 logical CPU ID, 和 logical Node ID. */
+void __init init_cpu_to_node(void)
+{
+	int cpu;
+	u16 *cpu_to_apicid = early_per_cpu_ptr(x86_cpu_to_apicid);
+
+	/* 确认 APIC ID 有 map 到 logical CPU ID. */
+	BUG_ON(cpu_to_apicid == NULL);
+
+	for_each_possible_cpu(cpu) {
+		/* 根据 logical CPU ID 拿到对应的 Node ID, 正是要 mapping 的内容。*/
+		int node = numa_cpu_node(cpu);
+
+		if (node == NUMA_NO_NODE)
+			continue;
+
+		if (!node_online(node))
+			init_memory_less_node(node);
+
+		/* map logical CPU ID to Node ID*/
+		numa_set_node(cpu, node);
+	}
+}
 ```
 ## NUMA 相关之 CPU 初始化
 
@@ -1864,40 +1906,4 @@ __init void prefill_possible_map(void)
 ```
 kernel parameter *maxcpus* & *possible_cpus* 的[简单介绍](https://www.ibm.com/support/knowledgecenter/en/linuxonibm/com.ibm.linux.z.lgdd/lgdd_r_maxcpusparm.html)
 
-最后来到 init_cpu_to_node()
-
-```
-/*
- * Setup early cpu_to_node.
- *
- * Populate cpu_to_node[] only if x86_cpu_to_apicid[],
- * and apicid_to_node[] tables have valid entries for a CPU.
- * This means we skip cpu_to_node[] initialisation for NUMA
- * emulation and faking node case (when running a kernel compiled
- * for NUMA on a non NUMA box), which is OK as cpu_to_node[]
- * is already initialized in a round robin manner at numa_init_array,
- * prior to this call, and this initialization is good enough
- * for the fake NUMA cases.
- *
- * Called before the per_cpu areas are setup.
- */
-void __init init_cpu_to_node(void)
-{
-	int cpu;
-	u16 *cpu_to_apicid = early_per_cpu_ptr(x86_cpu_to_apicid);
-
-	BUG_ON(cpu_to_apicid == NULL);
-
-	for_each_possible_cpu(cpu) {
-		int node = numa_cpu_node(cpu);
-
-		if (node == NUMA_NO_NODE)
-			continue;
-
-		if (!node_online(node))
-			init_memory_less_node(node);
-
-		numa_set_node(cpu, node);
-	}
-}
-```
+prefill_possible_map() 后紧跟着 init_cpu_to_node(), 现在可以回到上面 NUMA Initialization 一节。
