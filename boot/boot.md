@@ -1344,7 +1344,7 @@ RELOAD_GDT 也是定义在 grub-core/lib/i386/relocator_common.S 的宏：
 		.macro RELOAD_GDT
 		/* 将此宏结束位置(relocator16.S 中)的 effective address(段内offset) 保存到 eax；
 		 * 然后继续保存到 local label: jump_vector 处。这里的 (RSI, 1) 是 AT&T 汇编语法，
-		 * 参考 "9.15.7 Memory References" of `info as`。有一个 tips：这里的 1 是元素
+		 * 参考 "9.14.7 Memory References" of `info as`。有一个 tips：这里的 1 是元素
 		 * SCALE，因为手册中有说：BASE 和 INDEX 是寄存器。*/
 		lea	(LOCAL(cont1) - LOCAL(base)) (RSI, 1), RAX
 		movl	%eax, (LOCAL(jump_vector) - LOCAL(base)) (RSI, 1)
@@ -5232,7 +5232,7 @@ INIT_PER_CPU(irq_stack_backing_store);
 .head.text section 中的 startup_64 是 VO 真正的入口点。
 
 >问题：如何保证 .head.text 的内容里，head_64.S 在最前面？
-答：其实很早借着重读 kbuild memo 的机会，找到了答案。原来的认知是正确的，只是验证方法不对。其实很简单，答案是：只需要保证 head_64.o 比 head64.o 先出现在 ld 面前即可，也就是说，命令行必须是 `ld head_64.o head64.o` 的 pattern. 验证的方式是 hack arch/x86/Makefile 这两个文件出现的顺序。之前的验证 hack 了错误的文件 arch/x86/kernel/Makefile
+答：借重读 kbuild memo 的机会，找到了答案。原来的认知是正确的，只是验证方法不对。其实很简单，答案是：只需要保证 head_64.o 比 head64.o 先出现在 ld 面前即可，也就是说，命令行必须是 `ld head_64.o head64.o` 的 pattern. 验证的方式是 hack arch/x86/Makefile 这两个文件出现的顺序。之前的验证 hack 了错误的文件 arch/x86/kernel/Makefile
 
 ```
 /*
@@ -6641,11 +6641,13 @@ asmlinkage __visible void __init start_kernel(void)
 	 *   - arch cmdline buffer -> static_command_line: 均可 touch */
 	setup_command_line(command_line);
 
-	/* 数一下 __cpu_possible_mask 的 1, 得出 nr_cpu_ids, 应该表示系统支持的 cpu 数目。*/
+	/* 数 __cpu_possible_mask 中 1 的个数, 得到 nr_cpu_ids. 正如函数 comments 所述，
+	 * 此函数很可能是 redundant, 以 x86 为例， nr_cpu_ids 已在 prefill_possible_map
+	 * 函数中确定。*/
 	setup_nr_cpu_ids();
 
-	/* PERCPU 的部分背景知识在上文 "percpu sections & variables" 一节。然后上面函数中
-	 * 确认了当前系统实际支持的 CPU 数: nr_cpu_ids.*/
+	/* PERCPU 的部分背景知识在上文 "percpu sections & variables" 一节。当前系统
+	 * 支持的 CPU 数: nr_cpu_ids 也已确定.*/
 	setup_per_cpu_areas();
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
 	boot_cpu_hotplug_init();
@@ -7089,12 +7091,29 @@ void __init setup_arch(char **cmdline_p)
 
 	x86_init.resources.reserve_resources();
 
-	/* Background: 分配给 main memory: RAM 的 CPU 地址空间并不是连续的。
+	/* Background: 分配给 main memory(RAM) 的 CPU 地址空间并不是连续的。
 	 * Non-RAM 的 range 被称为 memory hole 或者这里的 gap. 在低 4G 空间中找一块 4M
 	 * 的 gap, 用作 PCI MMIO, 记在 pci_mem_start 中。 */
 	e820__setup_pci_gap();
 
-	/* 剩下几个函数暂时目测无关紧要，略过。*/
+#ifdef CONFIG_VT
+	...
+#endif
+
+	/* default to default_banner() in paravirt.c. On my PC, it prints:
+	 *   "Booting paravirtualized kernel on bare hardware"
+	 * paravirt, an interesting topic to be learned. */
+	x86_init.oem.banner();
+
+	/* Only make sense to devicetree configured system. Skip. */
+	x86_init.timers.wallclock_init();
+
+	/* Refer Intel SDM CHAPTER 15 MACHINE-CHECK ARCHITECTURE. TBD. */
+	mcheck_init();
+
+	/* 看起来是 1st 时间相关的初始化。*/
+	register_refined_jiffies(CLOCK_TICK_RATE);
+	...
 }
 ```
 
@@ -7137,7 +7156,7 @@ void __init setup_arch(char **cmdline_p)
 	__attribute__((__section__(".x86_cpu_dev.init"))) = \
 	&cpu_devX;
 ```
-搜索发现，有多处使用此 macro, 基于 X86 指令集的 不同 vendor 的不同 CPU 有一些自己的特殊数据和方法，以 struct cpu_dev 表示。上面的 macro 定义比较 smart, 只定义了 pointer, 指向 struct cpu_dev. 在 early_cpu_init 中则很容易访问相应的 struct cpu_dev.
+搜索发现，有多处使用此 macro, 基于 X86 指令集的不同 vendor 的不同 CPU 有一些自己的特殊数据和方法，以 struct cpu_dev 表示。上面的 macro 定义比较 smart, 只定义了 pointer, 指向 struct cpu_dev. 在 early_cpu_init 中则很容易访问相应的 struct cpu_dev.
 
 本函数的作用是初始化 boot_cpu_data, 尤其在 early_identify_cpu() 中初始化 boot_cpu_data.x86_capability[]:
 ```
@@ -9480,6 +9499,8 @@ void __init kernel_randomize_memory(void)
 ```
 ### spinlock
 
+early_pfn_to_nid() 中有早期的 spinlock 操作，TBD.
+
 ### PERCPU variable
 
 percpu area 的初始化在 start_kernel -> setup_per_cpu_areas. 但这之前已有几处使用，如 initmem_init -> x86_numa_init -> numa_init -> early_cpu_to_node：
@@ -9495,7 +9516,8 @@ I.e, 在 percpu area 初始化前，也有使用 percpu variable 的需求(暂�
 
 Early percpu variable 的定义代码展开如下：
 ```
-/* numa.c。 Kernel 代码只有一处使用这个 macro, 就是本例 = =| */
+/* numa.c */
+/* Kernel 代码只有一处使用这个 macro, 就是本例 = =| */
 DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
 
 /* percpu.h */
@@ -9516,7 +9538,8 @@ DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
 #define DEFINE_PER_CPU_SECTION(type, name, sec)				\
 	__PCPU_ATTRS(sec) __typeof__(type) name
 
-/* PER_CPU_ATTRIBUTES 在 x86 下为空，但别的 arch 未必。grep arch/ 发现只有 IA64 有。*/
+/* PER_CPU_ATTRIBUTES 在 x86 下为空，其他 arch 未必。 grep arch/ 发现只有 IA64 有定义。
+ * __percpu 仅为 make check 用，可忽略。*/
 #define __PCPU_ATTRS(sec)						\
 	__percpu __attribute__((section(PER_CPU_BASE_SECTION sec)))	\
 	PER_CPU_ATTRIBUTES
@@ -9529,8 +9552,10 @@ Early percpu variable 的使用如下：
 ```
 /* reference 数组的 pointer. */
 #define	early_per_cpu_ptr(_name) (_name##_early_ptr)
+
 /* 第 _idx 个数组元素的值。目测只用在 setup_per_cpu_areas 中？ */
 #define	early_per_cpu_map(_name, _idx) (_name##_early_map[_idx])
+
 /* 第 _cpu 个数组元素的值。功能看起来和上面这位一样，但，是代码内日常使用，如第二个示例。 Why?
  * http://lkml.iu.edu/hypermail/linux/kernel/0804.1/3269.html 中有一点线索，看起来
  * 某些 percpu variable 会在 percpu area 初始化前后都要使用。 Wait to see. */
@@ -9560,7 +9585,10 @@ CONFIG_NR_CPUS 定义在 autoconf.h, (明显 autoconf.h 不用作直接 `#includ
 ```
 CONFIG_CPUMASK_OFFSTACK 实现细节待分析。
 
-```
+```c
+/* arch/x86/kernel/setup_percpu.c */
+/* Background Knowledge: head comments in mm/percpu.c */
+
 void __init setup_per_cpu_areas(void)
 {
 	unsigned int cpu;
@@ -9577,9 +9605,10 @@ void __init setup_per_cpu_areas(void)
 	 * on 32bit.  Use page in that case.
 	 */
 #ifdef CONFIG_X86_32
-	if (pcpu_chosen_fc == PCPU_FC_AUTO && pcpu_need_numa())
-		pcpu_chosen_fc = PCPU_FC_PAGE;
+...
 #endif
+
+	/* According to f58dc01ba2ca, FC abbreviates First Chunk.*/
 	rc = -EINVAL;
 	if (pcpu_chosen_fc != PCPU_FC_PAGE) {
 		const size_t dyn_size = PERCPU_MODULE_RESERVE +
