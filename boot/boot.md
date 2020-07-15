@@ -1,52 +1,65 @@
-# From Power on to linux kernel
+# From Power on to Linux kernel
+
+出于对底层的极大兴趣，研究了这个 subject: 基于代码, 逐行分析基于 X86 的 Linux OS 的启动过程。本 memo 记录了这个过程的所有细节。
+
+阅读这些内容需要熟悉包括单不限于 x86 CPU architecture, 汇编，编译，链接，以及各种硬件基础知识等。对于 X86 arch, 具体来说是 Intel® 64 and IA-32 Architectures Software Developer’s Manual, 该 manual 有约 10 volumes, 当引用该 manual 时，本文将用缩写 SDM 指代，如 SDM 1, SDM 2, SDM 3a, etc.
 
 ## 1st instruction after Power-up
-PC 在 power on 或者 reset(assertion of the RESET# pin) 后，系统总线上的 CPU 会做处理器的硬件初始化，这包括：将所有寄存器复位成默认值，将 CPU 置于 real mode，invalidate 内部所有 cache，如 TLB 等；对于 SMP 系统，还会执行硬件的 multiple processor (MP) initialization protocol 来选择一个 CPU 成为 bootstrap  processor(BSP)，被选出的 BSP 则立刻从当前的 CS:EIP 中取指令执行。
 
-Power-up 后，寄存器 CR0 的值为 0x60000010，意味着将 CPU 置于关闭 paging 的 real mode 状态.
+PC 在 power on 或 reset(assertion of the RESET# pin) 后，系统总线上的 CPU 会做处理器的硬件初始化，这包括：将所有寄存器复位成默认值，将 CPU 置于 real mode, invalidate 所有 cache，如 TLB 等；对于 SMP 系统，还会执行硬件的 multiple processor (MP) initialization protocol 来选择一个 CPU 成为 bootstrap  processor(BSP)，被选出的 BSP 则立刻从当前的 CS:IP 中取指令执行。
+
+Power-up 后，寄存器 CR0 的值为 0x60000010, Protection Enable(PE) bit 为 0, 意味着 CPU 处于 real mode.
+
 ![CR0_AFTER_PowerUp](cr0_after_powerup.png)
 
-其他的寄存器复位后的状态如下图示:
+其他寄存器复位后的状态如下图示:
+
 ![Registers After PowerUp](register_after_powerup.png)
 
 此处需提前介绍一下 X86 的 segment register，如下图：
 
 ![Segment Register](segment_register.png)
 
-segment register 包含 visual part 和 hidden part(有时也叫做 descriptor cache 或 shadow register)，当 segment selector 被加载进 visual part 时，处理器会自动将相应 segment descriptor 中的 Base Address, Limit, Accesstion Information 加载进 hidden part。这些 cache 在 segment register 中的信息，使得处理器做地址翻译时不必从 segment descriptor 中读取 base address 等信息，从而省去了不必要的 bus cycle。如果 segment descriptor table 发生了变化，处理器需要显式的重新加载 segment register，否则，地址翻译仍使用老的 segment descriptor 中的信息。也就是说，当使用 CS:EIP 的方式去寻址时(或者说在计算 linear address 时)，实际是使用 hidden part 中的 Base Address + EIP value。
+Segment register 包含 visual part 和 hidden part(有时也叫做 descriptor cache 或 shadow register)，当 segment selector 被加载进 visual part 时，CPU 自动将相应 segment descriptor 中的 Base Address, Limit, Accesstion Information 加载进 hidden part。这些 cache 在 segment register 中的信息，使得 CPU 做地址翻译时不必从 memory 中的 segment descriptor 读取 base address 等信息，从而节省不必要的 bus cycle。若 segment descriptor table 发生变化，CPU 需重新加载 segment register，否则，地址翻译仍使用旧的 segment descriptor 中的信息。
 
-由上文知， BSP 从 CS：EIP 中取第一条指令来执行。Power-up 后，CS.Base = FFFF0000H, EIP=0000FFF0H，所以第一条指令的地址 = FFFF0000H + 0000FFFFH = FFFFFFF0H，这个地址被映射到 ROM(一种古老存储技术，用于存储 firmware，但这种技术不断更新。为避免困扰，本文仍然通称为 ROM) 上的 BIOS 中的某条指令。当 PC 复位后第一次加载新的值到 CS 后，接下来的 linear address 的计算方式就是我们知道的： selector value << 4 + IP。
+也就是说，当使用 CS:EIP 的方式寻址时(或者说在计算 linear address 时)，实际是使用 hidden part 中的 Base Address + EIP value。
 
-主板上的 chipset 把第一条指令的地址 FFFFFFF0H 映射到包含 BIOS 的 ROM 中，典型的第一条指令是：
+由上文知， BSP 从 CS：IP 中取第一条指令执行。Power-up 后，CS.Base = FFFF0000H, EIP=0000FFF0H，所以第一条指令的地址 = FFFF0000H + 0000FFFFH = FFFFFFF0H，该地址映射到 [ROM](https://en.wikipedia.org/wiki/Read-only_memory)上的 system firmware(一般指 BIOS).
+
+典型的第一条指令是：
 
     FFFFFFF0:    EA 5B E0 00 F0         jmp far ptr F000:E05B
 
-这个跳转指令会刷新 CS 的值，那么 CS.Base 的值就变成了 F0000H(F000H << 4)，接下来的寻址就是按照 real mode 的方式： CS selector << 4 + EIP。
+跳转指令会刷新 CS, 所以 CS.Base 的值变为 F0000H(F000H << 4)。接下来的寻址就是 real mode 的方式： CS selector << 4 + IP.
 
-BIOS 第一条指令的具体细节很可能在不同的芯片/平台上而不同，BIOS 代码一般不是开源的，况且近年来出现的新的 firmware: EFI，就目前网络上各种资料看下来，笔者还无法得出一个 general 的答案。基于上面的典型第一条指令，可以推理一种执行过程：第一条指令跳转到第 1M 地址范围内，以 Q35 chipset 举例，chipset 的 Programmable Attribute Map(PAM) 寄存器会控制 768 KB 到 1 MB 地址空间中的 13 个 sections 的访问属性，开机后这些寄存器默认值的行为是 DRAM Disabled: All accesses are directed to DMI，也就是说对上述地址范围的访问会被 route 到 4G 的最后 1M 空间内，也就是说执行的代码还是来自 ROM 中的BIOS。后续 BIOS 是否做 memory shadowing(将自己 copy 到第 1M 地址空间的 DRAM)都可，只是 access 的速度有差别。另一方面，传统的 BIOS 都是运行在 real mode 下，它能看到的地址空间只有第 1M。此外，所谓的带外管理技术(如 Intel 的 Management Engine)，也可能提前将 BIOS copy 到第 1M 的 DRAM 空间中。
+System firmware 中第一条指令的实现可能在不同的芯片/平台上而不同，因为 BIOS 一般不开源，且近年来出现新的 firmware: EFI。笔者目前的知识还无法得出一个 general 的答案。基于上述典型第一条指令，可推理一种执行过程：第一条指令跳转到第 1M 地址范围内，以 [Intel ® 3 Series Express Chipset Family](https://www.intel.com/Assets/PDF/datasheet/316966.pdf) 为例，chipset 的 Programmable Attribute Map(PAM) 寄存器会控制 768 KB 到 1 MB 地址空间中的 13 个 sections 的访问属性，power-up 后这些寄存器默认值的行为是 DRAM Disabled: All accesses are directed to [DMI](https://en.wikipedia.org/wiki/Direct_Media_Interface)，猜测对上述地址范围的访问会被 route 到 4G 的最后 1M 空间内，也就是说执行的代码还是来自 ROM 中的 BIOS。后续 BIOS 是否做 memory shadowing(将自己 copy 到第 1M 空间的 DRAM) 都可，只是 access 的速度有差别。此外，猜测所谓的带外管理技术(如 Intel 的 Management Engine)，也可能提前将 BIOS copy 到第 1M 的 DRAM 空间中。
 
-BIOS 执行到最后是从已设置的启动设备中加载第一个 sector 的内容到内存，并跳转过去执行。我们 grub2 的硬盘启动为例分析。
+注: BIOS 运行在 real mode，只能看到第 1M 地址空间。
+
+BIOS 的最后工作是从已设置的启动设备中加载第一个 sector 到 RAM，并跳转过去执行。本文将以 grub2 的硬盘启动为例分析。
 
 ## GRUB2 booting process
 
-本节以只有一块硬盘的 PC 为例，基于 grub2 的代码分析 grub 的工作流程。这篇材料：[grub2-booting-process](https://www.slideshare.net/MikeWang45/grub2-booting-process) 可以作为很好的参考。
+本节假设 PC 只有一块硬盘，基于代码分析 grub 的工作流程。这篇材料：[grub2-booting-process](https://www.slideshare.net/MikeWang45/grub2-booting-process) 可以作为很好的参考。
 
-BIOS 的最后工作是将硬盘 MBR(也叫 boot sector) 中的内容加载到地址 0000:7C00，并跳转过去继续执行。为什么将 MBR 加载到这个比 32kb 小 1024 byte 的地址？ 这里有[一篇科普](http://www.ruanyifeng.com/blog/2015/09/0x7c00.html)。使用 MBR 这个术语是为了和 VBR 区分，Master boot record 是整个硬盘的第一个 sector，Volume boot record 是分区的第一个 sector。
+BIOS 的最后工作是将硬盘上的 Master Boot Record(MBR, 也叫 boot sector) 加载到地址 0000:7C00，并跳转过去执行。 0x7c00 = 31kb, 为什么将 MBR 加载到这个地址？[这篇](http://www.ruanyifeng.com/blog/2015/09/0x7c00.html)做出了解释。另外，使用 MBR 这个术语是为了和 Volume Boot Record(VBR) 区分，MBR 是整个硬盘的第一个 sector, 而 Volume boot record 是分区的第一个 sector.
 
-很显然，仅仅 512 bytes 大小的 boot sector 是装不下一个功能强大的 grub 的，所以 grub 使用的方案是分成几个部分，第一部分(也是最小的)被安装在 MBR 中，其他的较大的部分放在别的位置，被 MBR 加载。用 grub 的术语讲，grub 的工作流程被分为几个 stage：stage 1，stage 1.5，stage 2。对于 grub2 来说：
+显然，512 bytes 的 boot sector 装不下功能强大的 grub，所以 grub 使用的方案是将代码分成几个部分，用 grub 的术语讲，grub 的工作流程分为: stage 1, stage 1.5, stage 2.
 
-* stage 1 是位于 MBR 中的 boot.img，用于加载 stage 1.5 的 core.img。(boot.img 在某些场景下也可以安装在 VBR 中)；
-* stage 1.5 是位于 MBR 和第一个磁盘分区之间(以前这个 size 有 63 个 sector，今天普遍是 2048 个 sector)的 core.img，它包含了访问文件系统的驱动程序，可以从文件系统读取 stage 2 的内容；
+* stage 1 是位于 MBR 的 boot.img，用于加载 stage 1.5 的 core.img. (boot.img 在某些场景下也可以安装在 VBR 中)
+* stage 1.5 是位于 MBR 和第一个磁盘分区之间的 core.img，它包含了访问文件系统的驱动程序，可以从文件系统读取 stage 2 的内容；以前这块空间有 63 sectors, 今天普遍是 2048 sectors
 * stage 2 是位于 /boot/grub 目录下的所有文件，包括配置文件和模块等。
 
-安装在硬盘上的 grub2 的布局如下图：
+安装在硬盘上的 grub2 布局如下：
 
 ![grub](GNU_GRUB_on_MBR_partitioned_hard_disk_drives.png)
 
 简化版长这样：
+
 ![grub](grub_hdd_layout.png)
 
-core.img 又包含了多个 image 和模块，它的布局如下：
+core.img 包含多个 image 和 module，其布局如下：
+
 ![grub core image](core_image.png)
 
 ### boot.img/MBR/boot sector
