@@ -296,6 +296,7 @@ cylinder_start:
 可看出格式并不遵循 DAP 定义，应该是还有其他用处，待分析。DAP 前还有变量 mode，记录 INT 13/AH=41h/BX=55AAh 的结果，即磁盘是否支持 LBA(1：支持，0：不支持), 后面的代码直接检查这个变量即可知道是否支持 LBA mode，不必再使用 INT 13h.
 
 初始化 [DAP](https://en.wikipedia.org/wiki/INT_13H#INT_13h_AH=42h:_Extended_Read_Sectors_From_Drive):
+
 ```assembly
 LOCAL(lba_mode):
 	xorw	%ax, %ax
@@ -333,7 +334,7 @@ diskboot.img 的工作是加载 core.img 中剩余的部分到 RAM, 并跳过去
 
 diskboot.img 需要知道 core.img 剩余部分的 sector address & size 才能去读，显然，address 在 grub-install 时才能确定；而 core.img 的 size 在 grub-mkimage(生成 core.img) 时才能确定. core.img 的 address & size 定义在 diskboot.S 末尾：
 
-```
+```assembly
 	.org 0x200 - GRUB_BOOT_MACHINE_LIST_SIZE
 LOCAL(firstlist):	/* this label has to be before the first list entry!!! */
 				 	/* fill the first data listing with the default */
@@ -370,7 +371,7 @@ blocklist_default_seg:
 
 代码分析：
 
-```
+```assembly
 	/* this sets up for the first run through "bootloop" */
 	/* 将 firstlist 地址保存到寄存器 di.   $ label 的形式表示取 label 的地址。 */
 	movw	$LOCAL(firstlist), %di
@@ -474,7 +475,8 @@ LOCAL(setup_sectors):
 ```
 
 略过 chs_mode 的代码，来到 copy_buffer:
-```
+
+```assembly
 LOCAL(copy_buffer):
 /* 将刚刚读到 buffer 中的数据 cp 到目的地址 */
 	/* load addresses for copy from disk buffer to destination */
@@ -568,7 +570,7 @@ ljmp $0, $ABS(LOCAL (codestart))
 ```
 跳过开头部分的 special data area 来到 lzma_dcomress.img 的真正代码处.  **GRUB_DECOMPRESSOR_MACHINE_COMPRESSED_SIZE** & **GRUB_DECOMPRESSOR_MACHINE_UNCOMPRESSED_SIZE**, 顾名思义，由 grub-mkimage 生成 core.img 时填写。
 
-```
+```assembly
 /* the real mode code continues... */
 LOCAL (codestart):
 	cli		/* we're not safe here! */
@@ -630,7 +632,8 @@ LOCAL (codestart):
 ```
 
 将紧挨着 lzma_decompress.img 的数据(开始于 decompressor_end)解压到 buffer GRUB_MEMORY_MACHINE_DECOMPRESSION_ADDR(0x100000) 处，并跳转过去执行：
-```
+
+```assembly
 post_reed_solomon:
 
 #ifdef ENABLE_LZMA
@@ -684,9 +687,9 @@ post_reed_solomon:
 
 可看出：kernel.img 的入口是 startup.S，起始地址为 0x9000，因 kernel.img 运行在保护模式下，所以文件开头有 directive `.code32`。
 
-> Tip: kernel.img 前，real mode 的 CS 都是 0; 切到 protect mode 后，CS segment descriptor's base address 也是 0. 
+> Tip: kernel.img 前，real mode 的 CS 都是 0; 切到 protect mode 后，CS segment descriptor's base address 也是 0.
 
-```
+```assembly
 .code32
 
 /* memory reference 参考： 9.14.7 Memory References of `info as`.
@@ -697,9 +700,9 @@ movl	%ecx, (LOCAL(real_to_prot_addr) - _start) (%esi)
 movl	%edi, (LOCAL(prot_to_real_addr) - _start) (%esi)
 movl	%eax, (EXT_C(grub_realidt) - _start) (%esi)
 ```
-kernel.img 首先把自己 copy 到链接地址 0x9000 :
+kernel.img 先把自己 copy 到链接地址 0x9000:
 
-```
+```assembly
 	/* copy back the decompressed part (except the modules) */
 	/* 二者相减得到 kernel.img 的 size，放在 ecx, movsb 指令会用到 */
 	movl	$(_edata - _start), %ecx
@@ -875,7 +878,7 @@ grub_dl_t grub_dl_load_core_noinit (void *addr, grub_size_t size)
 	...
 }
 
-/* 将所有包含代码和数据的 section 从 buffer 加载到分配的内存 */
+/* Load section of type SHF_ALLOC from buffer to allocated memory. */
 static grub_err_t grub_dl_load_segments (grub_dl_t mod, const Elf_Ehdr *e)
 {
 	...
@@ -1113,6 +1116,7 @@ grub_err_t grub_arch_dl_relocate_symbols (grub_dl_t mod, void *ehdr, Elf_Shdr *s
 	}
 }
 ```
+
 Module has been loaded & linked, it can work from now, initialize it:
 
 ```c
@@ -1148,7 +1152,7 @@ static grub_err_t grub_cmd_normal (struct grub_command *cmd __attribute__ ((unus
 	grub_enter_normal_mode (config);
 }
 
-/* This starts the normal mode.  */
+/* This starts the normal mode. */
 void grub_enter_normal_mode (const char *config)
 {
 	...
@@ -1212,8 +1216,10 @@ grub_mod_fini (void)
 
 所以现在可以理解 grub_dl_init 函数了。以 normal 模块为例(grub-core/normal/main.c)，它的 initialization 函数内容很简单，基本都在注册命令，比如我们最关心的命令：
 
-	/* Register a command "normal" for the rescue mode.  */
-	grub_register_command ("normal", grub_cmd_normal, 0, N_("Enter normal mode."));
+```c
+/* Register a command "normal" for the rescue mode.  */
+grub_register_command ("normal", grub_cmd_normal, 0, N_("Enter normal mode."));
+```
 
 grub_main 函数的最后一步就是执行这个命令。
 
@@ -1229,9 +1235,9 @@ grub-mkconfig 生成 grub.cfg 时，应会根据实际环境在 menu entry 中�
 
 >initrd16 /initramfs-4.15.16-300.fc27.x86_64.img
 
-linux16 命令由 1inux16 module 提供，代码在 grub-core/loader/i386/pc/linux.c 中：
+linux16 命令由 1inux16 module 提供，代码在 grub-core/loader/i386/pc/linux.c：
 
-```
+```c
 static grub_err_t grub_cmd_linux (grub_command_t cmd __attribute__ ((unused)), int argc, char *argv[])
 {
 	struct linux_i386_kernel_header lh;
@@ -1381,7 +1387,7 @@ grub_menu_execute_entry(...)
 }
 ```
 
-grub_cmd_boot 函数的内容只有一行：调用 grub_loader_boot 函数：
+grub_cmd_boot 函数的内容只有一行：调用 grub_loader_boot：
 
 ```c
 grub_err_t grub_loader_boot (void)
@@ -1401,6 +1407,7 @@ grub_err_t grub_loader_boot (void)
 		...
 }
 ```
+
 在 linux16 命令对应的函数 grub_cmd_linux 尾部, **grub_loader_boot_func** 已被赋值为 grub_linux16_boot:
 
 ```c
@@ -1545,7 +1552,7 @@ Get back to relocator16.S:
 
 RELOAD_GDT is also a macro defined in grub-core/lib/i386/relocator_common.S:
 
-```
+```assembly
 	.macro RELOAD_GDT
 
 	/* 将 macro end address 的 effective address(offset in segement) 放到 eax,
@@ -1620,12 +1627,13 @@ Get back to relocator16.S:
 
 DISABLE_PAGING is still defined in grub-core/lib/i386/relocator_common.S:
 
-	.macro DISABLE_PAGING
+```
+.macro DISABLE_PAGING
 	movl	%cr0, %eax
 	andl	$(~GRUB_MEMORY_CPU_CR0_PAGING_ON), %eax
 	movl	%eax, %cr0
-	.endm
-
+.endm
+```
 DISABLE_PAGING 顾名思义。grub  运行在 protect mode, 若使用 16-bit boot protocol，则需回到 real mode, 才好跳转到 Linux kernel 的 setup code. BTW, grub 从 real mode 切换到  protect mode 时，并没有开启 paging.
 
 relocator16.S again:
