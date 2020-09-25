@@ -3969,7 +3969,10 @@ SYM_FUNC_END(.Lrelocated)
  * 其他两项都是空(0)，猜测 .dynamic section 未来应该也不会被用到，而且被 objcopy 为
  * 上层目录的 vmlinux.bin 时(objcopy --strip-all)删除了所有符号信息 & 重定位信息.
  * 2019/1/2：还不了解打包到 bzImage 的 relocation info 是什么情况，那些被 strip
- * 的 relocation info 说不定在 bzImage 中。
+ * 的 relocation info 说不定在 bzImage 中。答：(2020/09/08), 两个 strip 操作并不
+ * 一样，source root 下的 vmlinux 被 strip 后保留了 relocation section, ELF header
+ * 等等 ELF format 数据，而 arch/boot/vmlinux.bin 则是被 strip 了代码之外的一切，
+ * 通过 file 命令查看二者的输出可知。
  */
 /*
  * Adjust the global offset table
@@ -5164,7 +5167,15 @@ Program Headers:
    04     .notes
 ```
 
-可以看出 p_align = 2M, for each segment, *Offset* & *VirtAddr* 都对齐到 2M; 前 2 个 segment 之间有 gap, 因 0x1000000(PhysAddr) + 0x1343384(FileSiz) = 0x2343384 < 0x2400000.
+可以看出 p_align = 2M, for each segment, *Offset* & *VirtAddr* 都对齐到 2M; 前 2 个 segment 之间有 gap, 因 0x1000000(PhysAddr) + 0x1343384(FileSiz) = 0x2343384 < 0x2400000, 通过 `hexdump` 可以发现 gap 被填充 0:
+
+```
+$ hexdump -s 0x1543384 -n 0xBCC7C vmlinux
+1543384 0000 0000 0000 0000 0000 0000 0000 0000
+*
+15ffff4 0000 0000 0000 0000 0000 0000
+1600000
+```
 
 #### ZO: extract_kernel: handle_relocations
 
@@ -5664,7 +5675,7 @@ $(obj)/zoffset.h: $(obj)/compressed/vmlinux FORCE
 
 github 上电子书 《Linux Inside》 有一个 [issue](https://github.com/0xAX/linux-insides/issues/597), 虽然提问内容不太对, 但还是触发了一个问题(我猜很少人会想到)：解压缩完毕后，会使用 `jmp	*%rax` 跳到 VO 中执行，这条指令 jmp 不会覆盖吗? 这个问题需要结合多个 facts：上面的实例数据，更上面的 bzImage file layout 图示，代码细节。buffer size 是 ~30.4M; 解压数据中 VO memory size 是 ～26.5M, vmlinux.relocs 是 ～0.8M, 总计 ~27.3M; ZO memory size 是 ～7.9M, 几乎全被 .rodata..compressed(压缩数据占据)，紧贴 buffer 底部摆放，重点是：解压函数代码(extract_kernel) 和 label: relocated 都位于 .text(这点不容易注意到)，在 .rodata..compressed 之后,  .head.text 和 .rodata..compressed 部分空间会被覆盖, .text 不会被解压数据覆盖，所以 jmp 指令不会被覆盖.
 
-#### linker script
+#### simple memo for `info ld`
 
 Linux kernel uses several linker scripts for different executives, setup, ZO, VO all have their scripts, the first two is comparatively easy, while VO's script is complicated. 理解 linker script 对理解 kernel 代码很必要。
 
@@ -5738,50 +5749,63 @@ X86 下链接 vmlinux 用的 script 是 arch/x86/kernel/vmlinux.lds.S，但这�
  1. UEFI 启动分析，EFI handover protocol, 即 X86-64 CPU 上，32-bit EFI firmware 启动 64-bit kernel
  2. 使用 ld version < 2.24 编译，查看 decompressor 中得 GOT 前三个 entry
 
-## VO/The "real" Linux kernel
+## VO: The "real" Linux kernel
 
-为什么强调 "real" 呢？虽然前面分析的代码也属于 Linux kernel, 但并不是绝大多数 developer 的 coding area. 通常我们在说 kernel development 时，主要指的 VO 部分，因为源码根目录下的绝大多数文件属于 VO. 为了保证尽可能简单的分析流程，理解最重要的 steps, 我们将忽略一些不重要的 branch feature, 无特殊说明时，我们只分析 x86_64 代码, 将忽略： SME(AMD's Secure Memory encryption), 5-level paging, PTI(Page Table Isolation), XEN.
+Why "real"? 虽然前面分析的代码也属于 Linux kernel, 但不是绝大多数 developer 的 coding area. 通常我们在说 kernel development 时，主要指 VO 部分，源码的绝大多数文件属于 VO. In hindsight, the complexity of VO code is much higher than setup & ZO, utterly different orders of magnitude. Reaffirmation: for brevity & focusing on the topic of this article, the following analysis targets x86_64 only, and will omit the non-important features like SME(AMD's Secure Memory encryption), 5-level paging, PTI(Page Table Isolation), XEN, etc.
 
 ### vmlinux linker script
 
-linker script 很少是 developer 的焦点，但有时会在这里找到一些问题的答案。学习 linker script 的权威材料在 `info ld`. 对 x86 来说，它的 memory layout 由 arch/x86/kernel/vmlinux.lds.S 指定。
+linker script 很少是 developer 的焦点，但偶尔也可以从这里找到一些问题的答案。vmlinux's linker script is arch/x86/kernel/vmlinux.lds.S, it defines the memory layout for vmlinux.
 
 #### jiffies & jiffies_64
-vmlinux.lds.S 的开头就有个有趣的小问题，代码如下(微调了格式，方便阅读)：
 
-	#ifdef CONFIG_X86_32
-		OUTPUT_ARCH(i386)
-		ENTRY(phys_startup_32)
-		jiffies = jiffies_64;
-	#else
-		OUTPUT_ARCH(i386:x86-64)
-		ENTRY(phys_startup_64)
-		jiffies_64 = jiffies;
-	#endif
+>NOTE: 本小节代码已 outdated, updated by **d8ad6d39c35d2**. 但本着学习的目的，依然 revamp the analysis, 同时？
 
-问题来了: jiffies 和 jiffies_64 在 X86_32 和 X86_64 分别是如何定义的？
+At the head of vmlinux.lds.S(微调格式，方便阅读)：
 
-X86_32 下，script 中有:
+```c
+#ifdef CONFIG_X86_32
+	OUTPUT_ARCH(i386)
+	ENTRY(phys_startup_32)
+	jiffies = jiffies_64;
+#else
+	OUTPUT_ARCH(i386:x86-64)
+	ENTRY(phys_startup_64)
+	jiffies_64 = jiffies;
+#endif
+```
+
+Question: How are **jiffies** & **jiffies_64** defined under X86_32 & X86_64 respectively?
+
+Under X86_32, linker script has:
 
 	jiffies = jiffies_64;
 
-定义了符号 jiffies，它的值(地址)等于 jiffies_64，而 jiffies_64 定义在 kernel/time/timer.c 中：
+means **jiffies** is defined by linker script, whose value equals **jiffies_64**. Refer to *3.5.5 Source Code Reference* of `info ld`. While **jiffies_64** is defined in kernel/time/timer.c:
 
-	__visible u64 jiffies_64 __cacheline_aligned_in_smp = INITIAL_JIFFIES;
+```c
+__visible u64 jiffies_64 __cacheline_aligned_in_smp = INITIAL_JIFFIES;
+```
 
-所以，script 中定义的符号 reference 了代码中的符号。
+So, linker script defined **jiffies** points to the same address as code defined **jiffies_64**.
 
-X86_64 下，script 中有：
+Under X86_64, linker script has:
 
 	jiffies_64 = jiffies;
 
-而源代码中(arch/x86/kernel/time.c)有：
+**jiffies** is defined in arch/x86/kernel/time.c:
 
-	#ifdef CONFIG_X86_64
+```c
+#ifdef CONFIG_X86_64
 	__visible volatile unsigned long jiffies __cacheline_aligned_in_smp = INITIAL_JIFFIES;
-	#endif
+#endif
+```
 
-说明 jiffies 和 jiffies_64 两个符号在代码中都有定义，又因为 script 中符号的值表示其地址，所以 script 中的赋值操作表示这两个符号的地址相等，通过 readelf 读取两个符号的值可以确认：
+while **jiffies_64** is still defined in kernel/time/timer.c, i.e., both of them are defined in C code. The assignment in linker script make both of them points to the same address, which is the address of **jiffies**.
+
+In commit **d8ad6d39c35d2**'s words: 'jiffies' and 'jiffies_64' are meant to alias (two different symbols that share the same address).
+
+It can ben confirmed by:
 
 ```
 $ readelf -s vmlinux | grep -w jiffies
@@ -5792,30 +5816,59 @@ $ readelf -s vmlinux | grep -w jiffies_64
  82843: ffffffff82205000     8 OBJECT  GLOBAL DEFAULT   24 jiffies_64
 ```
 
+(2020/09)Above is the analysis for outdated code. After commit **d8ad6d39c35d2**, code has evolved as following.
+
+linker script:
+```
+#ifdef CONFIG_X86_32
+	OUTPUT_ARCH(i386)
+	ENTRY(phys_startup_32)
+#else
+	OUTPUT_ARCH(i386:x86-64)
+	ENTRY(phys_startup_64)
+#endif
+
+jiffies = jiffies_64;
+```
+
+kernel/time/timer.c:
+```c
+__visible u64 jiffies_64 __cacheline_aligned_in_smp = INITIAL_JIFFIES;
+```
+
+Both i386 & x86_64 now have the same logic, not only simplifying the code, more into in that commit.
+
 #### linking address of VO
 
-VO 的 linker script 中涉及了 VMA(virtual memory address) 和 LMA(load memory address) 两种地址.
+VO's linker script involves VMA(virtual memory address) & LMA(load memory address), the latter seems seldom seen.
 
-将 linker script command `SECTIONS` 的开头两行展开(x86_64 下)：
+Expand first 2 lines of command `SECTIONS` for x86_64:
+
 ```
 . = __START_KERNEL;
 phys_startup_64 = ABSOLUTE(startup_64 - LOAD_OFFSET);
 ```
 ==>
+
 ```
 . = __START_KERNEL_map + ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN);
 phys_startup_64 = startup_64 - __START_KERNEL_map;
 ```
 ==>
+
 ```
 . = 0xffffffff80000000 + ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN);
 phys_startup_64 = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN);
 ```
-(这里快进了一步. Tip: __START_KERNEL_map = 0xffffffff80000000, 注意 __START_KERNEL_map 和 __START_KERNEL 的区别)
 
-arch/x86/kernel/head_64.S 的开头定义了符号 startup_64，是 VO 的入口。由上述展开结果可知，VO 的起始 VMA = __START_KERNEL_map + offset, 参考 Documentation/x86/x86_64/mm.txt 可知，分配给 kernel 的地址空间从 __START_KERNEL_map 开始。
+>NOTE: __START_KERNEL_map = 0xffffffff80000000. 注意 __START_KERNEL_map 和 __START_KERNEL 的区别。
 
-第一个 output section definition 是：
+The expansion result shows, VO's VMA = __START_KERNEL_map + *offset*. According to Documentation/x86/x86_64/mm.rst, Linux kernel is arranged at __START_KERNEL_map as its start virtual address, but configuration gives the *offset*.
+
+startup_64 is entry of VO under x86_64, which is defined at the head of arch/x86/kernel/head_64.S.
+
+1st output section definition:
+
 ```
 .text :  AT(ADDR(.text) - LOAD_OFFSET) {
 	_text = .;
@@ -5823,21 +5876,16 @@ arch/x86/kernel/head_64.S 的开头定义了符号 startup_64，是 VO 的入口
 	...
 }
 ```
-AT() 表示 .text section 的 LMA, 即物理地址。AT() 中的表达式展开后等于：
+
+AT() 表示 .text section 的 LMA, i.e., physical address. 展开 AT() 中的表达式:
+
 ```
 ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)
 ```
-这里出现的 VMA 和 LMA 定义，在下文分析会经常 reference.
 
-head_64.S 和 head64.C 中经常看到求某符号编译时物理地址(LMA in linker script)的表达式：
+这里出现的 VMA 和 LMA 概念，下文常会 reference, **VMA**, **LMA** 专指 linker script 设计的 VO 虚拟地址 & 加载(物理)地址。
 
-	physical address of symbol = virtual address of symbol - _text + load address
-
-或
-
-    physical address of symbol = virtual address of symbol - __START_KERNEL_map
-
-前者很容易理解: 符号在 image 内的 offset 加上 image 实际加载地址，得到符号的物理地址。后者略有点小设计在其中，为什么会有这种关系呢? vmlinux.lds 中的特殊地址设计，使得 VO 的 LMA 和 VMA 范围分别是：
+Linker script 的特殊地址设计，使得 VO 的 LMA 和 VMA 范围分别是：
 
 >物理地址(LMA): [(0 + **offset**) -- KERNEL_IMAGE_SIZE]
 
@@ -5845,10 +5893,47 @@ head_64.S 和 head64.C 中经常看到求某符号编译时物理地址(LMA in l
 
 **offset** = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)
 
-所以, 符号的 LMA = VMA - __START_KERNEL_map. 表面看这个等式, 减法结果表示偏移，但这个偏移值在虚拟地址和物理地址中表示的意义一样: 即符号在 VO image 中的 offset. 又因为 VO 物理地址从地址 0 开始，所以此时 offset 也是物理地址。若 KASLR 开启或者 kernel 配置为 relocatable, 将导致起始物理地址不同于 ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)，在 __startup_64 函数中会根据物理地址的 load delta 调整 head_64.S 中构建的页表。
+若 KASLR 开启或者 kernel 配置为 relocatable, VO 物理地址将不同于 ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN), __startup_64 函数中会根据物理地址的 load delta 调整 head_64.S 中构建的页表。
+
+head_64.S & head64.c 中常看到求符 LMA 的表达式：
+
+	LMA of symbol = VMA of symbol - VMA of _text + LMA of VO
+
+或
+
+	LMA of symbol = VMA of symbol - __START_KERNEL_map
+
+恰是利用二者在 linker script 中的特殊关系。
 
 #### PHDRS
-script 中通过 `PHDRS` 定义了自己的 Program Header:
+
+`PHDRS` command format is defined in linker script like this:
+
+```
+PHDRS
+{
+    NAME TYPE [ FILEHDR ] [ PHDRS ] [ AT ( ADDRESS ) ]
+        [ FLAGS ( FLAGS ) ] ;
+}
+```
+
+Section 是 ELF 文件中的基本存储单元，segment 在 section 之上从 program loading 视角增加(封装)的一层抽象概念, 也就是说，section 被 map 到 segment, 通过 `readelf -l vmlinux` 可看到这种映射关系.
+
+Output section & segment 都可以指定自己的 load address, 二者的 load address 有什么关系？ `info ld` says:
+
+>You can specify that a segment should be loaded at a particular address in memory by using an 'AT' expression.  This is identical to the 'AT' command used as an output section attribute.  The 'AT' command for a program header overrides the output section attribute.
+
+`info ld` provides tips for manually mapping via `PHDRS`:
+
+>The headers are processed in order and it is usual for them to map to sections in ascending load address order.
+The linker will create reasonable program headers by default. When the linker sees the 'PHDRS' command in the linker script, it will not create any program headers other than the ones specified.
+
+VO's linker script followed the rule: map to sections in ascending load address order.
+
+Q: 若乱序映射 segment 时会怎样？
+
+VO linker script uses `PHDRS` command as:
+
 ```
 PHDRS {
 	text PT_LOAD FLAGS(5);          /* R_E */
@@ -5863,21 +5948,18 @@ PHDRS {
 }
 ```
 
-关于 ELF 格式中 section 和 segment 的问题: output section 可以指定自己的 load address, `PHDRS` 中也可以指定 segment 的 load address, 这二者的 load address 之间有什么关系？分析: section 是 ELF 文件中的基本存储单元，segment 是在 section 之上从 program loading 视角增加(封装)的一层抽象概念, 也就是说，section 被 map 到 segment, 通过 `readelf -l vmlinux` 可看到这种映射关系. linker script 中，output section 的定义从 VMA 到 LMA，(窃以为都应该)是顺序的，映射到 segment 时也应是顺序的，虽然 `info ld` 中没有关于这个问题的描述，但本例中的显式映射是这样，有理由认为是有心如此。
+未指定 load address, 且纵观 linker script, section->segment 的 mapping 也是顺序的，也就是说根据 `PHDRS` 中的顺序映射 script 中的 output section, 所以 p_paddr 由 section load address 决定.
 
-Q: 若乱序映射 segment 时会怎样？
-
-本例中，`PHDRS` 命令只简单定义了几个 segment, 未指定 load address, 且纵观 linker script, section->segment 的 mapping 也是顺序的，也就是说根据 `PHDRS` 中的顺序映射 script 中的 output section, 所以 p_paddr 由 section load address 决定.
-
-因为 segment 是 program loading 角度的概念，所以被加载的 segment 在文件中的 offset(p_offset) 和它的虚拟地址(p_vaddr)应该对齐到目标架构的 page size. 这也是 ELF spec 对这两个 field 的 enforcement.
+Segment 的文件中 offset(p_offset) 和虚拟地址(p_vaddr)应该对齐到目标架构的 page size. 这是 ELF spec 对这两个 field 的 enforcement.
 
 #### percpu sections & variables
 
-linker script 中 output percpu section 的定义是：
+Linker script defines output percpu section as:
 ```
-	PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)
+PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)
 ```
-代码展开，列出所有相关 macro:
+
+核心 macro 相关定义:
 ```
 #define PERCPU_VADDR(cacheline, vaddr, phdr)				\
 	__per_cpu_load = .;						\
@@ -5908,7 +5990,8 @@ linker script 中 output percpu section 的定义是：
 #define PERCPU_DECRYPTED_SECTION
 #endif
 ```
-So, `PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)` 的展开结果是：
+
+So, `PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)` is expanded as:
 ```
 __per_cpu_load = .;
 .data..percpu 0 : AT(__per_cpu_load - 0xffffffff80000000) {
@@ -5930,21 +6013,22 @@ __per_cpu_load = .;
 ```
 搜索代码发现(截至2019年底) percpu variable 定义的实际情况是：
 
-  1. .data..percpu..first section 中只有：`struct fixed_percpu_data fixed_percpu_data`;
-  2. .data..percpu..page_aligned section 中有 5 处定义, 如: `struct gdt_page gdt_page` 和 `struct tss_struct cpu_tss_rw`;
-  3. .data..percpu..read_mostly section 中有 10+ 定义;
-  4. .data..percpu section 中有大量定义;
-  5. .data..percpu..shared_aligned section 不存在, 因为有 #define MODULE;
-  6. .data..percpu..decrypted section 只有 AMD SME 时才存在，忽略.
+  1. **.data..percpu..first** section 中只有：`struct fixed_percpu_data fixed_percpu_data`;
+  2. **.data..percpu..page_aligned** section 中有 5 处定义, 如: `struct gdt_page gdt_page` 和 `struct tss_struct cpu_tss_rw`;
+  3. **.data..percpu..read_mostly** section 中有 10+ 定义;
+  4. **.data..percpu** section 中有大量定义;
+  5. **.data..percpu..shared_aligned** section 中有 10 个左右;
+  6. **.data..percpu..decrypted section** 只有 AMD SME 时才存在，忽略.
 
-percpu section 的定义有几个有趣的地方:
+percpu section 几个有趣的地方:
 
-  1. section 虚拟地址从 0 开始，i.e., percpu symbol 虚拟地址从 0 开始;
+  1. section 虚拟地址从 0 开始;
   2. 作为 VO image 的一部分数据，他们的 LMA(物理地址)(自然应该)与其他部分一致；
   3. 变量 __per_cpu_load 记下 percpu section 原本应有的 VMA(虚拟起始地址)，会用到。
 
-有了上述 background knowledge, 现在可以详细分析所有 percpu 相关代码了：
-```
+有了上述 background knowledge, 可以详细分析 script 中 percpu 相关代码：
+
+```c
 #if defined(CONFIG_X86_64) && defined(CONFIG_SMP)
 	/*
 	 * percpu offsets are zero-based on SMP.  PERCPU_VADDR() changes the
@@ -5969,15 +6053,16 @@ percpu section 的定义有几个有趣的地方:
 /* Per-cpu symbols which need to be offset from __per_cpu_load
  * for the boot processor. */
 /*
- * output percpu section 的 VMA 被刻意安排起始于 0, LMA(物理地址) 与其他 section 一致。
- * 看过下面 head_64.S 的分析后可知: VO 的 VMA 通过 paging 映射到实际物理地址, percpu
- * section 的虚拟地址 [0 - SIZEOF(.data..percpu)] 没有被映射, 但它原本应占据的虚拟地址
- * 空间作为 VO image 的一部分已被映射到它的实际物理地址。所以此时无法直接使用 percpu 变量，
- * 也就是说，无法通过 percpu 符号的变量名找到它的值(变量名表示其 symbol value, 即虚拟地址).
+ * output percpu section 的虚拟地址(VMA)起始于 0, 物理地址(LMA)与其他 section 一致。
+ * 看过下面 head_64.S 的分析后可知: 为 VO 所在 memory range 构建 page table 时，
+ * percpu section 的虚拟地址 [0 - SIZEOF(.data..percpu)] 没有被映射到物理地址，
+ * 而它原本应占据的虚拟地址空间作为 VO image 的一部分被映射。所以此时无法直接使用
+ * percpu 变量，i.e., 无法通过 percpu 符号的变量名找到它的值(变量名表示其 symbol
+ * value, 即虚拟地址).
  *
  * Trick: 为现阶段使用的 percpu variable 起一个新名字, 且新名字的 symbol value 等于
- * 该 percpu variable 原本在 VO 虚拟地址空间的地址，这样就可通过 paging 找到其实际物理地址.
- * 在 head_64.S 中，会看到使用这两个变量的地方. Wait to see.
+ * 该 percpu variable 原本在 VO 虚拟地址空间的地址，这样就可通过新变量名字找到它的值.
+ * 在 head_64.S 中，会看到使用这两个变量的地方. Wait to see. 现在还有吗？
  * lds builtin function ABSOLUTE 被 d071ae09a4a14 引入，make llvm happy. */
 #define INIT_PER_CPU(x) init_per_cpu__##x = ABSOLUTE(x) + __per_cpu_load
 INIT_PER_CPU(gdt_page);
@@ -5990,8 +6075,8 @@ INIT_PER_CPU(irq_stack_backing_store);
 
 #ifdef CONFIG_SMP
 /* output percpu section 中第一个 input section 是 .data..percpu..first section,
- * 其中只定义了 struct fixed_percpu_data fixed_percpu_data; 又因 output percpu
- * section 的 VMA 是 0, 所以有如下判断. */
+ * 只定义了 struct fixed_percpu_data fixed_percpu_data; output percpu section
+ * 虚拟起始地址是 0. */
 . = ASSERT((fixed_percpu_data == 0),
            "fixed_percpu_data is not at start of per-cpu area");
 #endif
@@ -6001,16 +6086,30 @@ INIT_PER_CPU(irq_stack_backing_store);
 
 ### prior to start_kernel
 
-**start_kernel** 是一个很有名的函数，其中包含真正的 kernel 初始化，即各子系统的初始化。在它之前，依然是各种准备工作。
+Linux kernel initialization function **start_kernel** includes the routines to initialize all sub-systems, there are still much preparation works before it.
 
-由上一节的 linker script 可知，output section ".text" 最开头的 input section 是 .head.text, 说明它位于 VO image 的开头，这是有意而为。.head.text section 的内容只在两个文件中: arch/x86/kernel/head_64.S & arch/x86/kernel/head64.c, 但这两个文件的内容不仅属于它.
+由上节中 VO linker script 知，output section **.text**'s 1st input section is **.head.text**, it exists in 2 files: arch/x86/kernel/head_64.S & arch/x86/kernel/head64.c. 但两个文件的内容不全属于它.
 
-.head.text section 中的 startup_64 是 VO 真正的入口点。
+startup_64 is the entry of VO, which locates in **.head.text** section of arch/x86/kernel/head_64.S.
 
->问题：如何保证 .head.text 的内容里，head_64.S 在最前面？
-答：借重读 kbuild memo 的机会，找到了答案。原来的认知是正确的，只是验证方法不对。其实很简单，答案是：只需要保证 head_64.o 比 head64.o 先出现在 ld 面前即可，也就是说，命令行必须是 `ld head_64.o head64.o` 的 pattern. 验证的方式是 hack arch/x86/Makefile 这两个文件出现的顺序。之前的验证 hack 了错误的文件 arch/x86/kernel/Makefile
+>Question: 如何保证 .head.text 的内容里，head_64.S 中那部分在最前面？
+Answer: 保证 head_64.o 比 head64.o 先出现在 ld 前即可，i.e., 命令行必须是 `ld head_64.o head64.o` 的 pattern.
+借重读 kbuild memo 的机会，找到了答案。原来的认知是正确的，只是验证方法不对。正确的方式是 改变 arch/x86/Makefile 这两个文件出现的顺序。之前的验证 hack 了错误的文件 arch/x86/kernel/Makefile.
 
-```
+arch/x86/kernel/head_64.S:
+
+```assembly
+/*
+ * We are not able to switch in one step to the final KERNEL ADDRESS SPACE
+ * because we need identity-mapped pages.
+ */
+/* TBD. */
+#define l4_index(x)	(((x) >> 39) & 511)
+#define pud_index(x)	(((x) >> PUD_SHIFT) & (PTRS_PER_PUD-1))
+
+L4_PAGE_OFFSET = l4_index(__PAGE_OFFSET_BASE_L4)
+L4_START_KERNEL = l4_index(__START_KERNEL_map)
+
 /*
  * __START_KERNEL_map = 0xffffffff80000000，所以 L3_START_KERNEL = 510, 计算器可
  * 验证. 以 4-level paging 举例，一个 PGD entry 映射 512G; 一个 PUD entry(level 3)
@@ -6019,14 +6118,11 @@ INIT_PER_CPU(irq_stack_backing_store);
 L3_START_KERNEL = pud_index(__START_KERNEL_map)
 
 	/* Why 2 个关于 section 的 directive? 某社区大佬帮找到了始作俑者: eaeae0cc985fa,
-	 * 但看起来 .text 是多余的。_HEAD 引入的目的是保证本 section 在 vmlinux 的最前面 */
+	 * 但看起来 .text 是多余的。_HEAD 的引入保证 startup_64 在 vmlinux 的开头。 */
 	.text
 	__HEAD
 	.code64
-	.globl startup_64
-	/* 这是 VO 的入口点。由下面的 comments 可以看出，有些支持 64-bit boot protocol 的
-	 * boot loader 可以直接解压缩 VO. */
-startup_64:
+SYM_CODE_START_NOALIGN(startup_64)
 	UNWIND_HINT_EMPTY /* NOT essential, 略过 */
 	/*
 	 * At this point the CPU runs in 64bit mode CS.L = 1 CS.D = 0,
@@ -6045,20 +6141,31 @@ startup_64:
 	 * compiled to run at we first fixup the physical addresses in our page
 	 * tables and then reload them.
 	 */
+	/* According to comments above, boot loader who support 64-bit boot protocol
+	 * could decompress VO directly. */
 
 	/* Set up the stack for verify_cpu(), similar to initial_stack below */
 	/*
-	 * 因为马上调用函数 verify_cpu. No need for verbiage. 看起来是此函数专用 stack.
-	 * BUT why there? TBD.
-	 * 关于 lea 指令: load effective address. Effective address 指 segment 内的
-	 * offset, 因为 segment base address 是 0, 所以 effective address = linear
-	 * address. 这个概念在遥远的上文解释过, 权威定义在 Intel SDM 3a, "Figure 3-5.
-	 * Logical Address to Linear Address Translation". 直觉上, lea 指令应该不感知
-	 * CPU 的 paging 机制，所以这里得到的地址是虚拟地址.
-	 * 注意: 此刻是 identity mapped paging. */
+	 * 马上调用函数 verify_cpu. 看起来是此函数专用 stack. BUT why there? 继续使用
+	 * ZO 的 stack 不可以吗？ TBD.
+	 *
+	 * Tip for lea again: load effective address. Effective address is offset in
+	 * segment, 因 64-bit mode's segment base address 是 0, 所以 effective address
+	 * = linear address. Refer to:
+	 *   1. Intel SDM 3a, "Figure 3-5. Logical Address to Linear Address Translation"
+	 *   2. Intel SDM 1, "3.7.5 Specifying an Offset"
+	 *
+	 * 64-bit mode specific RIP-relative addressing, Refer to Intel SDM 1,
+	 * "3.7.5.1 Specifying an Offset in 64-Bit Mode", add signed 32-bit displacement
+	 * to address of next instruction.
+	 *
+	 * lea 指令不感知 CPU 是否开启 paging, 这里得到的是 linear(virtual) address,
+	 * 因为此刻是 identity mapped paging, 所以也是 physical address. */
 	leaq	(__end_init_task - SIZEOF_PTREGS)(%rip), %rsp
 
 	/* Sanitize CPU configuration */
+	/* 根据 x86_64 ABI 的 calling convention: 函数返回值在rax 中, 表示 CPU 是否支持
+	 * long mode. */
 	call verify_cpu
 
 	/*
@@ -6068,30 +6175,31 @@ startup_64:
 	 * programmed into CR3.
 	 */
 	/*
-	 * Tip Again: lea = load effective address, effective address 本质是 segment
-	 * 内的 offset, 详细定义在 Intel SDM volume 1, "3.7.5 Specifying an Offset".
-	 * 64-bit mode 下各 segment base 为 0, 所以 effective address = linear address.
-	 * 这是 64-bit mode 特有的 RIP-relative addressing, 参考 Intel SDM volume 1,
-	 * "3.7.5.1 Specifying an Offset in 64-Bit Mode", 加上一个 displacement 到 RIP
-	 * 的下一条指令地址.
+	 * 此刻是 identity mapped paging, linear(virtual) address = physical address,
+	 * 所以 lea 指令得到符号 _text 的实际物理地址，即 VO load address.
 	 *
-	 * 此刻是 identity mapped paging, 虚拟地址(linear address) = 物理地址, 所以这里
-	 * lea 指令得到符号 _text 的实际物理地址，也即 VO 的实际起始物理地址.
-	 * 根据 x86_64 ABI 的 calling convention: 函数返回值(在rax 中) 表示 (AMD SME)
-	 * C-bit location in page table entry. */
+	 * x86_64 calling convention: If the class is INTEGER or POINTER, the next
+	 * available register of the sequence %rdi, %rsi, %rdx, %rcx, %r8 and %r9
+	 * is used
+	 */
 	leaq	_text(%rip), %rdi
 	pushq	%rsi
 	call	__startup_64
 	popq	%rsi
 
+	/* w/o AMD SME, rax holds return value 0. */
+
 	/* Form the CR3 value being sure to include the CR3 modifier */
-	/*
-	 * w/o KASLR: 相减获得 early_top_pgt 的 LMA. 还需加 physical address delta 才能
+	/* w/o KASLR: 相减获得 early_top_pgt 的 LMA. 还需加 physical address delta 才能
 	 * 得到它的实际物理地址.
-	 * w/ KASLR: early_top_pgt 是 R_X86_64_32S, 会被加上 v_delta, 即 LMA + v_delta */
+	 * w/ KASLR: early_top_pgt 是 R_X86_64_32S, 会被加上 v_delta(virtual address delta
+	 * results from KASLR), 即 LMA + v_delta
+	 */
 	addq	$(early_top_pgt - __START_KERNEL_map), %rax
 	jmp 1f
-ENTRY(secondary_startup_64)
+SYM_CODE_END(startup_64)
+
+SYM_CODE_START(secondary_startup_64)
 	/* SKIP ...*/
 
 1:
@@ -6107,21 +6215,23 @@ ENTRY(secondary_startup_64)
 	/* w/o KASLR: __startup_64 函数将 physical address delta 写入 phys_base; rax
 	 * 是 early_top_pgt 的 LMA, 二者相加得到 early_top_pgt 的实际物理地址.
 	 * w/ KASLR: __startup_64 函数将 p_delta - v_delta 写入 phys_base. 所以结果是：
-	 * LMA + v_delta + p_delta -v_delta = LMA + p_delta, 结果不变。
-	 * 用 early_top_pgt 的实际物理地址更新 CR3 */
+	 * LMA + v_delta + p_delta -v_delta = LMA + p_delta, 依然是 early_top_pgt 的
+	 * 实际物理地址。
+	 *
+	 * Switch from ZO's identity mapped page table to VO's page table.
+	 */
 	addq	phys_base(%rip), %rax
 	movq	%rax, %cr3
 
 	/* Ensure I am executing from virtual addresses */
-	/*
-	 * 之前是根据 VO 实际物理地址建立的 identity mapped page table; 现在要切换为 VO
-	 * 自己 page table: early_top_pgt. CR3 虽已更新，但未生效, 因为 RIP 还是老页表的
-	 * 虚拟地址。通过更新 RIP 为目标页表的虚拟地址使其生效, 即可通过新页表找到 label 1 处
+	/* CR3 虽已更新，但未生效, 因为 RIP 还是老页表的虚拟地址。更新 RIP 为目标页表的
+	 * 虚拟地址使其生效, 即可通过新页表找到 label 1 处
 	 * 的指令。
 	 *
-	 * 通过 objdump -d 和 readelf -r 的输出可知`movq $1f, %rax`是 R_X86_64_32S 类型.
-	 * 若无 KASLR，此处 OK, 但 KASLR 情况下貌似不对? 2019/6/20 update: 经过分析 kaslr
-	 * 下的 __startup_64 函数，这个问题迎刃而解。 */
+	 * According to `objdump -d` & `readelf -r`, relocation type of "movq $1f, %rax"
+	 * is R_X86_64_32S.
+	 * 若无 KASLR，此处 OK, 但 KASLR 情况下貌似不对? 2019/6/20 update: 经过分析 KASLR
+	 * 下的 __startup_64 函数，问题迎刃而解。*/
 	movq	$1f, %rax
 	ANNOTATE_RETPOLINE_SAFE
 	jmp	*%rax
@@ -6169,18 +6279,24 @@ ENTRY(secondary_startup_64)
 	 * addresses where we're currently running on. We have to do that here
 	 * because in 32bit we couldn't load a 64bit linear address.
 	 */
-	/* early_gdt_descr 中含有 percpu 变量，相关处理参考上文 linker script 中 “percpu
-	 * sections & variables” 一节。
-	 * 使用 vmlinux 自己的 GDT，但对注释的 "userspace address" 不解, ZO & VO 中 GDT
-	 * 的 DPL 都是 0, why "userspace"? blame 显示这段注释自 kernel 导入 git 就存在，
-	 * 高度怀疑这段注释 out of date. */
+	/* early_gdt_descr 中含有 percpu 变量，相关处理参考上文 linker script 中
+	 * “percpu sections & variables” 一节。
+	 *
+	 * Loading GDT of vmlinux, which is defined in common.c.
+	 * 但对注释的 "userspace address" 不解, ZO & VO 中 GDT 的 DPL 都是 0, why
+	 * "userspace"? blame 显示这段注释自 kernel 导入 git 就存在，怀疑这段注释
+	 * out of date.
+	 */
 	lgdt	early_gdt_descr(%rip)
 
 	/* set up data segments */
 	/*
-	 * 64-bit mode 下, segmentation 被部分 disable，创建了一个 flat 64-bit linear-
-	 * address space. processor 默认 CS, DS, ES, SS 为 0; 但 FS, GS 依然按照传统
-	 * 方式使用。commit ffb6017563aa 对下面的代码做了解释, 但目前仍没有很理解. TBD */
+	 * In 64-bit mode, segmentation is partly disabled, processor treats
+	 * segment base of CS, DS, ES, SS as 0(except FS & GS), creating a flat
+	 * 64-bit linear address space.
+	 *
+	 * commit ffb6017563aa 对下面的代码做了解释, 大约是为了重回 compatible mode 方便.
+	 * 仍没有很理解. TBD */
 	xorl %eax,%eax
 	movl %eax,%ds
 	movl %eax,%ss
@@ -6196,10 +6312,10 @@ ENTRY(secondary_startup_64)
 
 	/* Set up %gs.
 	 *
-	 * The base of %gs always points to the bottom of the irqstack
-	 * union.  If the stack protector canary is enabled, it is
-	 * located at %gs:40.  Note that, on SMP, the boot cpu uses
-	 * init data section till per cpu areas are set up.
+	 * The base of %gs always points to fixed_percpu_data. If the
+	 * stack protector canary is enabled, it is located at %gs:40.
+	 * Note that, on SMP, the boot cpu uses init data section until
+	 * the per cpu areas are set up.
 	 */
 	/*
 	 * Intel SDM 3a, chapter 3.4.4 "Segment Loading Instructions in IA-32e Mode:
@@ -6208,18 +6324,17 @@ ENTRY(secondary_startup_64)
 	 * by a 64-bit implementation.
 	 * wrmsr: move content of edx:eax into 64-bit MSR specified by ecx */
 	/*
-	 * initial_gs 处是 percpu 变量 “union irq_stack_union irq_stack_union” 原本
-	 * 应有的虚拟地址(实际虚拟地址是 0), 这样才可以通过 paging 找到变量的物理地址. 注意：
-	 * 此阶段, percpu 特性还没有初始化 & 使用，现在使用的 percpu 变量还是"原始数据", 这是
-	 * 原注释中的 "Note that, bluhbluh" 的含义.
-	 * x86 是 little-endian, 所以 initial_gs+4(%rip) 的值放在 edx(higher 32-bit).
-	 * 但不知此时初始化 MSR_GS_BASE 的目的是什么? 2019/7/18 update: 后面分析 percpu
-	 * 变量的读时，是使用汇编语言，而汇编语句就是使用了 %gs: symbol 的形式，可知现在初始化
-	 * %gs 的用处。
+	 * initial_gs 处是 percpu 变量 "struct fixed_percpu_data fixed_percpu_data" 原本
+	 * 应有的虚拟地址(实际虚拟地址是 0), 这样才可以通过 paging 找到变量的物理地址。
+	 * (它是 percpu section 中第一个变量) 此阶段, percpu 特性还没有初始化 & 使用，使用的
+	 * percpu 变量还是"原始数据", 这是原注释中的 "Note that, bluhbluh" 的含义.
 	 *
-	 * 刚开始对原注释说的 "bottom of the irqstack" 有点困惑，不确定 bottom 指一段地址的
-	 * "开头" 还是 "结尾"，现在可以确定是指 "开头". 而且看过 union irq_stack_union 定义
-	 * 中的注释，就可以理解 %gs:40 的含义了 */
+	 * x86 是 little-endian, 所以 initial_gs+4(%rip) 的值放在 edx(higher 32-bit).
+	 * 但不知此时初始化 MSR_GS_BASE 的目的是什么? 2019/7/18 update: 后面读 percpu 变量
+	 * 使用的汇编语言，汇编代码使用 %gs: symbol 的形式，可知现在初始化 %gs 的用处。
+	 *
+	 * 还不理解 irq stack canary 的用处，TBD.
+	 */
 	movl	$MSR_GS_BASE,%ecx
 	movl	initial_gs(%rip),%eax
 	movl	initial_gs+4(%rip),%edx
@@ -6227,7 +6342,7 @@ ENTRY(secondary_startup_64)
 
 	/* rsi is pointer to real mode structure with interesting info.
 	   pass it to C */
-	/* 注意： rsi 的值是 boot parameter 的物理地址; 此时使用的是 kernel 页表 */
+	/* NOTE: rsi holds physical address of boot parameter; using VO's page table. */
 	movq	%rsi, %rdi
 
 .Ljump_to_C_code:
@@ -6277,36 +6392,27 @@ END(secondary_startup_64)
 	/* Both SMP bootup and ACPI suspend change these variables */
 	__REFDATA
 	.balign	8
-	GLOBAL(initial_code)
-	.quad	x86_64_start_kernel
-	GLOBAL(initial_gs)
-	/* 参考 linker script 一节中 percpu 相关描述. 2019/7/18 update: 真是没有想到，
-	 * 这么底层的代码还会被改的机会，见 commit: e6401c1309317 */
-	.quad	INIT_PER_CPU_VAR(irq_stack_union)
-	GLOBAL(initial_stack)
-	/*
-	 * The SIZEOF_PTREGS gap is a convention which helps the in-kernel
-	 * unwinder reliably detect the end of the stack.
-	 */
-	.quad  init_thread_union + THREAD_SIZE - SIZEOF_PTREGS
+SYM_DATA(initial_code,	.quad x86_64_start_kernel)
+SYM_DATA(initial_gs,	.quad INIT_PER_CPU_VAR(fixed_percpu_data))
+
+/*
+ * The SIZEOF_PTREGS gap is a convention which helps the in-kernel unwinder
+ * reliably detect the end of the stack.
+ */
+SYM_DATA(initial_stack, .quad init_thread_union + THREAD_SIZE - SIZEOF_PTREGS)
 	__FINITDATA
+
 	...
 
-	__INITDATA
-
-	.balign 4
-GLOBAL(early_recursion_flag)
-	.long 0
-
-/* 将符号地址对齐到 PAGE_SIZE boundary */
-#define NEXT_PAGE(name) \
-	.balign	PAGE_SIZE; \
-GLOBAL(name)
+/* Macro used to align symbol address to PAGE_SIZE boundary */
+#define SYM_DATA_START_PAGE_ALIGNED(name)			\
+	SYM_START(name, SYM_L_GLOBAL, .balign PAGE_SIZE)
 
 #ifdef CONFIG_PAGE_TABLE_ISOLATION
 /* SKIP */
 #else
-	#define NEXT_PGD_PAGE(name) NEXT_PAGE(name)
+	#define SYM_DATA_START_PTI_ALIGNED(name) \
+		SYM_DATA_START_PAGE_ALIGNED(name)
 	#define PTI_USER_PGD_FILL	0
 #endif
 
@@ -6319,40 +6425,57 @@ GLOBAL(name)
 	.endr
 
 	__INITDATA  /* 看起来是多余的 directive */
-NEXT_PGD_PAGE(early_top_pgt)
-	/* 开辟 512 x 8 = 4k 空间，在 __startup_64 函数中填充.
+	.balign 4
+SYM_DATA_START_PTI_ALIGNED(early_top_pgt)
+	/* 512 x 8 = 4k, filled in __startup_64.
 	 * Tip: VO 的虚拟地址空间起始于 __START_KERNEL_map = 0xffffffff80000000, size
-	 * limit 是 KERNEL_IMAGE_SIZE. kernel 自身在页表中的地址映射从这个虚拟地址开始. */
+	 * limit 是 KERNEL_IMAGE_SIZE. kernel 自身在页表中的地址映射从这个虚拟地址开始.
+	 */
 	.fill	512,8,0
-	.fill	PTI_USER_PGD_FILL,8,0 /* 忽略 */
+	.fill	PTI_USER_PGD_FILL,8,0 /* W/o PTI, it is void. */
+SYM_DATA_END(early_top_pgt)
 
-NEXT_PAGE(early_dynamic_pgts)
+SYM_DATA_START_PAGE_ALIGNED(early_dynamic_pgts)
+	/* 16 x PAGE_SIZE space */
 	.fill	512*EARLY_DYNAMIC_PAGE_TABLES,8,0
+SYM_DATA_END(early_dynamic_pgts)
+
+SYM_DATA(early_recursion_flag, .long 0)
 
 	.data
 
 #if defined(CONFIG_XEN_PV) || defined(CONFIG_PVH)
 /* SKIP */
 #else
-NEXT_PGD_PAGE(init_top_pgt)
-	/* 开辟 512 x 8 = 4k 空间, 在 x86_64_start_kernel 函数末填充 */
+SYM_DATA_START_PTI_ALIGNED(init_top_pgt)
+	/* 512 x 8 = 4k, initialized at the bottom of x86_64_start_kernel. */
 	.fill	512,8,0
-	.fill	PTI_USER_PGD_FILL,8,0 /* 忽略 */
+	.fill	PTI_USER_PGD_FILL,8,0 /* W/o PTI, it is void. */
+SYM_DATA_END(init_top_pgt)
 #endif
 
-/*
- * 由上文分析知 L3_START_KERNEL = 510, 即在映射 VO 自身时，前 510 个 entry 不会被用到，
- * 初始化第 511, 512 号 entry 指向下一级页表即可. 注意: index 从 0 开始，所以相关 C 代码
- * 中是第 510, 511 号 entry.
- * 符号虚拟地址减链接起始地址，得到符号的物理地址(参考上文 “linking address of VO”)，再配上
- * 相应 page flags. 一个 PMD(level2_kernel_pgt) 映射 1G 空间，足够 cover kernel image. */
-NEXT_PAGE(level3_kernel_pgt)
+#ifdef CONFIG_X86_5LEVEL
+/* omit */
+#endif
+
+/* 由上文知 L3_START_KERNEL = 510, 即为 VO 构建 page table 时，PUD 前 510 个 entry
+ * 不会用到，初始化第 511, 512 号 entry 指向下一级页表即可. Index 从 0 开始，所以
+ * 相关 C 代码中是第 510, 511 号 entry.
+ *
+ * Get LMA of level2_kernel_pgt & level2_fixmap_pgt, refer to bottom of section
+ * “linking address of VO”. 再配上相应 page flags. NOTE: LMA 特指 linker script
+ * 设计的物理地址。
+ *
+ * One PMD(level2_kernel_pgt) covers 1G space, suffice to cover KERNEL_IMAGE_SIZE.
+ */
+SYM_DATA_START_PAGE_ALIGNED(level3_kernel_pgt)
 	.fill	L3_START_KERNEL,8,0
 	/* (2^48-(2*1024*1024*1024)-((2^39)*511))/(2^30) = 510 */
 	.quad	level2_kernel_pgt - __START_KERNEL_map + _KERNPG_TABLE_NOENC
 	.quad	level2_fixmap_pgt - __START_KERNEL_map + _PAGE_TABLE_NOENC
+SYM_DATA_END(level3_kernel_pgt)
 
-NEXT_PAGE(level2_kernel_pgt)
+SYM_DATA_START_PAGE_ALIGNED(level2_kernel_pgt)
 	/*
 	 * 512 MB kernel mapping. We spend a full page on this pagetable
 	 * anyway.
@@ -6367,17 +6490,17 @@ NEXT_PAGE(level2_kernel_pgt)
 	 *  runtime.  Care must be taken to clear out undesired bits
 	 *  later, like _PAGE_RW or _PAGE_GLOBAL in some cases.
 	 */
-	/*
-	 * 根据 Documentation/x86/x86_64/mm.txt: __START_KERNEL_map 映射到物理地址 0.
-	 * 一个 PMD 可映射 1G 空间，足够 cover KERNEL_IMAGE_SIZE. level2_kernel_pgt 从
-	 * 第一个 entry 开始映射物理地址 [0 - 512M/1G], 但实际前几个 entry 无用，因为 VO
-	 * 的 LMA = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN) */
+	/* 根据 Documentation/x86/x86_64/mm.rst: __START_KERNEL_map 映射物理地址 0.
+	 * level2_kernel_pgt 从第一个 entry 映射物理地址 [0 - 512M/1G), 但实际前几个
+	 * entry 无用，因为 VO LMA = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN).
+	 */
 	PMDS(0, __PAGE_KERNEL_LARGE_EXEC,
 		KERNEL_IMAGE_SIZE/PMD_SIZE)
+SYM_DATA_END(level2_kernel_pgt)
 
-/* 开头留下 512 - 4 - 2 = 506 个 entry 应是留作映射 module 用, 待确认; then 映射 2 个
+/* 预留开头 512 - 4 - 2 = 506 个 entry, 作映射 module 用? 待确认; then 映射 2 个
  * page table; 最后 8 M 暂不需映射，留空。 */
-NEXT_PAGE(level2_fixmap_pgt)
+SYM_DATA_START_PAGE_ALIGNED(level2_fixmap_pgt)
 	.fill	(512 - 4 - FIXMAP_PMD_NUM),8,0
 	pgtno = 0
 	.rept (FIXMAP_PMD_NUM)
@@ -6387,54 +6510,56 @@ NEXT_PAGE(level2_fixmap_pgt)
 	.endr
 	/* 6 MB reserved space + a 2MB hole */
 	.fill	4,8,0
+SYM_DATA_END(level2_fixmap_pgt)
 
 /* 留出 2 个 page table = 8k 空间, mapping 需要. */
-NEXT_PAGE(level1_fixmap_pgt)
+SYM_DATA_START_PAGE_ALIGNED(level1_fixmap_pgt)
 	.rept (FIXMAP_PMD_NUM)
 	.fill	512,8,0
 	.endr
+SYM_DATA_END(level1_fixmap_pgt)
 
 #undef PMDS
 
 	.data
 	.align 16
-	.globl early_gdt_descr  /* GDTR 的内容 */
-early_gdt_descr:
-	.word	GDT_ENTRIES*8-1
-early_gdt_descr_base:
-	/* linker script 一节中已经介绍了 percpu section 的背景知识，这是使用的地方。
-	 * INIT_PER_CPU_VAR(gdt_page) 表示 gdt_page 的新名字，可以通过 paging 找到其
-	 * 物理地址. */
-	.quad	INIT_PER_CPU_VAR(gdt_page)
 
-ENTRY(phys_base)
-	/* This must match the first entry in level2_kernel_pgt */
-	/*
-	 * 看起来 phys_base 就是为了存储 LMA 和实际物理地址的 delta, 名不符实, and 原注释何意?
-	 * 想了半天终于明白了! 故事要从 linker script 定义的 VMA 和 LMA 说起. 上文已提到,
-	 * vmlinux 占据的地址空间被设计为：
-	 *
-	 *   VMA: [0xffffffff80000000 + offset -- KERNEL_IMAGE_SIZE]
-	 *   LMA: [0                  + offset -- KERNEL_IMAGE_SIZE]
-	 *
-	 *   KERNEL_IMAGE_SIZE = 512M or 1G(KASLR);
-	 *   offset = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)
-	 *
-	 * level2_kernel_pgt 可映射 1G 空间, 且是按照上述 VMA -> LMA 的关系进行映射，所以
-	 * 第一个 entry 映射物理地址 0; C 函数 __startup_64 将通过将物理地址的 load_delta
-	 * 加到页表中的物理地址，来修正页表映射关系，所以 phys_base 中存储的 load_delta 等于
-	 * level2_kernel_pgt 中第一个 entry 中的地址!
-	 *
-	 * w/o KASLR, phys_base = p_delta; w/ KASLR phys_base = p_delta - v_delta */
-	.quad   0x0000000000000000
+/* GDTR 的内容. linker script 一节已介绍 percpu section, 这是使用的地方。
+ * INIT_PER_CPU_VAR(gdt_page) 表示 gdt_page 的新名字，可以通过 paging 找到其
+ * 物理地址。*/
+SYM_DATA(early_gdt_descr,		.word GDT_ENTRIES*8-1)
+SYM_DATA_LOCAL(early_gdt_descr_base,	.quad INIT_PER_CPU_VAR(gdt_page))
+
+	.align 16
+/* This must match the first entry in level2_kernel_pgt */
+/* 看起来 phys_base 就是为了存储 LMA 和实际物理地址的 delta, 名不符实, and 原注释何意?
+ * 想了半天终于明白了! 故事要从 linker script 定义的 VMA 和 LMA 说起. 上文已提到,
+ * vmlinux 占据的地址空间被设计为：
+ *
+ *   VMA: [0xffffffff80000000 + offset -- KERNEL_IMAGE_SIZE]
+ *   LMA: [0                  + offset -- KERNEL_IMAGE_SIZE]
+ *
+ *   KERNEL_IMAGE_SIZE = 512M or 1G(KASLR);
+ *   offset = ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN)
+ *
+ * level2_kernel_pgt 可映射 1G 空间, 且是按照上述 VMA -> LMA 的关系进行映射，所以
+ * 第一个 entry 映射物理地址 0; C 函数 __startup_64 将通过将物理地址的 load_delta
+ * 加到 PMD entry, 来 fix 页表映射关系，所以 phys_base 中存储的 load_delta 等于
+ * level2_kernel_pgt 中第一个 entry 中的地址。
+ *
+ * w/o KASLR, phys_base = p_delta; w/ KASLR phys_base = p_delta - v_delta
+ */
+SYM_DATA(phys_base, .quad 0x0)
 EXPORT_SYMBOL(phys_base)
 
+...
 ```
-分析 __startup_64 函数前埋下一个问题: KASLR 开启时，VO 代码执行时，符号引用是如何不出错的?
+
+分析 __startup_64 函数前埋下一个问题: With KASLR enabled, VO 代码执行时，符号引用是如何不出错的?
 
 **Tip**: __startup_64 函数工作在 identity-mapped paging 下, 虚拟地址 = 物理地址。
 
-继续分析 head64.c 中的 .head.text section(以函数出现的逻辑顺序 layout). 第一个用到的函数是 __startup_64：
+head64.c 中 **.head.text** section 第一个用到的函数是 __startup_64(以函数出现顺序 layout):
 ```
 /* Code in __startup_64() can be relocated during execution, but the compiler
  * doesn't have to generate PC-relative relocations when accessing globals from
@@ -6442,11 +6567,12 @@ EXPORT_SYMBOL(phys_base)
  * boot-time crashes. To work around this problem, every global pointer must
  * be adjusted using fixup_pointer().
  */
-/* 函数作用: 初始化 head_64.S 中的 built-in 页表, 并 fix 其映射关系，因 built-in 页表
- * 是按照 linker script 中的 VMA -> LMA 关系 hardcode 而来，而 VO 实际加载物理地址会因
- * relocatable 或 kaslr 特性而不同。
- * 注：本段仅考虑 relocatable 带来的物理地址变化，不考虑 kaslr 带来的虚拟地址随机化的情况，
- * 下文会另起一段单独分析此函数在 kaslr 下的情况 */
+/* 函数作用: 初始化 head_64.S 中的 built-in page table, 根据实际加载地址 fix 映射关系。
+ * Built-in page table 按 linker script 中的 VMA -> LMA 关系 hardcode 而来，而 VO 实际
+ * 物理地址因 relocatable 或 kaslr 特性而不同于 linker script's LMA.
+ *
+ * 注：本段仅分析因 relocatable 导致的物理地址不同。KASLR 的情况下文单独分析。
+ * (Involve randomized virtual address)*/
 unsigned long __head __startup_64(unsigned long physaddr,
 				  struct boot_params *bp)
 {
@@ -6462,12 +6588,11 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	int i;
 	unsigned int *next_pgt_ptr;
 
-	/* 简单的判断和 fix pointer. 下方会详细分析 fixup_pointer */
+	/* involve a bunch of fixup_pointer, which is analyzed later. */
 	la57 = check_la57_support(physaddr);
 
 	/* Is the address too large? */
-	/* MAX_PHYSMEM_BITS 和 MAX_PHYSADDR_BITS 的区别看起来是 sparsemem 机制引入，不懂，
-	 * 暂留疑。但这个判断的逻辑 self-documented. */
+	/* MAX_PHYSMEM_BITS & MAX_PHYSADDR_BITS 在 x86_64 下分别是 46 & 44, WHY? */
 	if (physaddr >> MAX_PHYSMEM_BITS)
 		for (;;);
 
@@ -6480,8 +6605,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
 
 	/* Is the address not 2M aligned? */
-	/* 2M aligned 是对 VO 加载地址的要求，即使有 relocatable 或 kaslr, 实际物理地址也
-	 * 必须 2M aligned, 所以 load_delta 也将是 2M 对齐 */
+	/* 2M alignment is required for loading address of VO, so load_delta is aligned
+	 * to 2M too. */
 	if (load_delta & ~PMD_PAGE_MASK)
 		for (;;);
 
@@ -6492,11 +6617,12 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	load_delta += sme_get_me_mask();
 
 	/* Fixup the physical addresses in the page table */
-	/*
-	 * 入参: early_top_pgt 的编译时虚拟地址, VO 的实际物理地址。
+	/* 入参: early_top_pgt 的编译时虚拟地址, VO 的实际物理地址。Tip: 数组名是 pointer，
+	 * 使用 & 后，依然是同一个 pointer value.
+	 *
 	 * 看过 fixup_pointer 的分析可知: pgd = early_top_pgt 的实际物理地址(also 虚拟地址)。
 	 *
-	 * 初始化 PGD 中地址 __START_KERNEL_map 对应的 entry: 找到下一级页表的物理地址.
+	 * 初始化 __START_KERNEL_map 对应的 PGD entry: 找到下一级页表的物理地址.
 	 * 以 level3_kernel_pgt 为例将等式展开：
 	 *
 	 * *p = level3_kernel_pgt + _PAGE_TABLE_NOENC - __START_KERNEL_map + load_delta
@@ -6504,7 +6630,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 *
 	 * 前二者相减得到 level3_kernel_pgt 链接时的 LMA(物理地址), 加上 load_delta 得到
 	 * 符号的实际物理地址; _PAGE_TABLE_NOENC 是 flags.
-	 * 明显, __START_KERNEL_map(0xffffffff80000000) 对应 PGD 的最后一个 entry. */
+	 * 明显, __START_KERNEL_map(0xffffffff80000000) 对应 last entry of PGD.
+	 */
 	pgd = fixup_pointer(&early_top_pgt, physaddr);
 	p = pgd + pgd_index(__START_KERNEL_map);
 	if (la57)
@@ -6536,7 +6663,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 * creates a bunch of nonsense entries but that is fine --
 	 * it avoids problems around wraparound.
 	 */
-	/*
+	/* 除了 LMA & VMA 的 page table, VO 还有一个 identity mapped page table.
+	 *
 	 * next_pgt_ptr = next_early_pgt 的实际物理地址(also 虚拟地址). 后者定义在本文件
 	 * 开头, 是 int 数据，为何这样使用? Lucky, 直接 blame 代码就找到 187e91fe5e91:
 	 * 为了兼容 Clang 编译器.
@@ -6545,8 +6673,11 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 * C 中如何引用 linker script 中的符号，这两种情况有细微的不同，参考：
 	 * https://stackoverflow.com/questions/8045108/use-label-in-assembly-from-c
 	 *
-	 * early_dynamic_pgts 被声明为二维指针数组，所以 pud = early_dynamic_pgts 的
-	 * 实际物理地址, pmd = early_dynamic_pgts 实际物理地址 + 4k. */
+	 * early_dynamic_pgts 声明为二维数组。pud = early_dynamic_pgts 的实际物理地址,
+	 * pmd = early_dynamic_pgts 实际物理地址 + 4k.
+	 *
+	 * Identity-mapping 看起来将在 AMD SME Encrypt-in-Place 时使用
+	 */
 	next_pgt_ptr = fixup_pointer(&next_early_pgt, physaddr);
 	pud = fixup_pointer(early_dynamic_pgts[(*next_pgt_ptr)++], physaddr);
 	pmd = fixup_pointer(early_dynamic_pgts[(*next_pgt_ptr)++], physaddr);
@@ -6558,8 +6689,8 @@ unsigned long __head __startup_64(unsigned long physaddr,
 		p4d = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
 		/* SKIP... */
 	} else {
-		/* pgd 中的 512 个 entry, 目前只用了最后一个 entry. 如注释所说(目前不理解)，
-		 * 再做一个 identity mapping. 只需一个 PGD entry(PUD), [i + 1] 是何意?
+		/* pgd 的 512 个 entry, 目前只用了最后一个。 如注释所说，再做一个
+		 * identity mapping. 只需一个 PGD entry(PUD), [i + 1] 是何意?
 		 * 答: 应是为 AMD SME. 参考 AMD64 programmer manual volume 2:
 		 * 7.10.8 Encrypt-in-Place. */
 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
@@ -6572,16 +6703,18 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	pud[i + 0] = (pudval_t)pmd + pgtable_flags;
 	pud[i + 1] = (pudval_t)pmd + pgtable_flags;
 
-	/* 初始化: identity-mapping 的 PMD entry flags */
+	/* 初始化 identity-mapping 的 PMD entry flags */
 	pmd_entry = __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL;
 	/* Filter out unsupported __PAGE_KERNEL_* bits: */
 	mask_ptr = fixup_pointer(&__supported_pte_mask, physaddr);
 	pmd_entry &= *mask_ptr;
 	pmd_entry += sme_get_me_mask();
-	/* 初始化: PMD 中映射 VO 的第一个 entry 中的地址: VO 实际起始物理地址 */
+	/* Identity mapping PMD 中使用的第一个 entry 中的地址是 VO 实际起始物理地址。
+	 * 注意：“第一个”未必是 PMD 中 index 0 entry. */
 	pmd_entry +=  physaddr;
 
-	/* 其余 entry 的值只需更新 physical address */
+	/* 其余 entry 的值只需更新 physical address. 按需初始化 identity mapping page
+	 * table, 没有浪费。 */
 	for (i = 0; i < DIV_ROUND_UP(_end - _text, PMD_SIZE); i++) {
 		/* 找到 physaddr 对应 PMD 中的第一个 index, 不断 + i 直到映射 whole VO image
 		 * size; 用 PMD_SIZE 不断更新 mapped physical address. */
@@ -6594,98 +6727,82 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 * we might write invalid pmds, when the kernel is relocated
 	 * cleanup_highmap() fixes this up along with the mappings
 	 * beyond _end.
-	 */
-	/* 为何这块 fix 页表中物理地址的代码与上面相隔那么远? 实验证明: 将此 code block 搬
-	 * 到上面，kernel 可正常启动。但 Maintainer 很可能认为这种修改 pointless.
 	 *
-	 * 特意判断 _PAGE_PRESENT, 因为此 PMD 中的 entry 可能用了一半(w/o KASLR)，也可能
-	 * 全部用了(w/ KASLR), 若只使用了一半, 则没必要 loop all entries. */
+	 * Only the region occupied by the kernel image has so far
+	 * been checked against the table of usable memory regions
+	 * provided by the firmware, so invalidate pages outside that
+	 * region. A page table entry that maps to a reserved area of
+	 * memory would allow processor speculation into that area,
+	 * and on some hardware (particularly the UV platform) even
+	 * speculative access to some reserved areas is caught as an
+	 * error, causing the BIOS to halt the system.
+	 */
+	/* 为何这块 fix 页表中物理地址的代码与上面相隔那么远? 实验证明: 将此 code block
+	 * 搬到上面，kernel 可正常启动。但 Maintainer 很可能认为这种修改 pointless.
+	 *
+	 * 虚拟地址空间给 kernel 分配了 1G space, using a whole PMD to map it. 但根据
+	 * kernel 自身的 size, 1G 并不会完全使用，比如因：
+	 *     ALIGN(CONFIG_PHYSICAL_START,CONFIG_PHYSICAL_ALIGN)
+	 * 导致前几个 PMD entry 不会使用; 显然，PMD 中末尾 entry 也可能用不着。
+	 */
+
 	pmd = fixup_pointer(level2_kernel_pgt, physaddr);
-	for (i = 0; i < PTRS_PER_PMD; i++) {
+
+	/* invalidate pages before the kernel image */
+	for (i = 0; i < pmd_index((unsigned long)_text); i++)
+		pmd[i] &= ~_PAGE_PRESENT;
+
+	/* fixup pages that are part of the kernel image */
+	/* PMD entry 未必全部使用，不必 loop all entries, 所以判断 _PAGE_PRESENT.
+	 *
+	 * W/o KASLR: only mapping first 512M physical address using first half
+	 * of PMD entries; w/ KASLR, mapping whole 1G physical address using whole
+	 * PMD, but only part of PMD entries are mapped to kernel itself.
+	 * Refer to: https://github.com/PinoTsao/Memo/blob/master/boot/earlymapping.txt
+	 */
+	for (; i <= pmd_index((unsigned long)_end); i++)
 		if (pmd[i] & _PAGE_PRESENT)
 			pmd[i] += load_delta;
-	}
+
+	/* invalidate pages after the kernel image */
+	for (; i < PTRS_PER_PMD; i++)
+		pmd[i] &= ~_PAGE_PRESENT;
 
 	/*
 	 * Fixup phys_base - remove the memory encryption mask to obtain
 	 * the true physical address.
 	 */
-	/* phys_base 定义在 head_64.S，default to 0, 这里只加上 delta 明显不够, 在本函数
+	/* phys_base is defined as 0 in head_64.S. 这里只加上 delta 明显不够, 在本函数
 	 * 结束后, head_64.S 有对其继续处理. 但原注释明显 NOT enough! */
 	*fixup_long(&phys_base, physaddr) += load_delta - sme_get_me_mask();
 
-	/* 下面的代码都是 AMD SME 相关，SKIP... */
-	/* Encrypt the kernel and related (if SME is active) */
-	sme_encrypt_kernel(bp);
-
-	/*
-	 * Clear the memory encryption mask from the .bss..decrypted section.
-	 * The bss section will be memset to zero later in the initialization so
-	 * there is no need to zero it after changing the memory encryption
-	 * attribute.
-	 */
-	if (mem_encrypt_active()) {
-		vaddr = (unsigned long)__start_bss_decrypted;
-		vaddr_end = (unsigned long)__end_bss_decrypted;
-		for (; vaddr < vaddr_end; vaddr += PMD_SIZE) {
-			i = pmd_index(vaddr);
-			pmd[i] -= sme_get_me_mask();
-		}
-	}
-
-	/*
-	 * Return the SME encryption mask (if SME is active) to be used as a
-	 * modifier for the initial pgdir entry programmed into CR3.
-	 */
-	/* Memory Encryption mask: C-bit location in page table entry, mask 形式, 或
-	 * 0 without AMD SME */
-	return sme_get_me_mask();
+	/* all following code are AMD SME related, omit. */
+	...
 }
 
+/* Why need fixup_pointer for accessing pointer variable?
+ * At the moment, we are in identity-mapping with page table from ZO, pointer's value
+ * is the virtual address defined from VO linker script, can't find the desired physical
+ * address with it.
+ * 可想而知，找到某符号最自然的方式应是 VO 的实际物理地址 + 符号在 VO image 中的 offset.
+ */
 static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
 {
 	/* ptr(符号的编译地址) 减去 _text(VO 的编译起始地址), 是符号在 VO image 中的 offset,
-	 * 加到 VO 的物理地址上，即得到符号的物理地址，或曰运行地址.
-	 * identity-mapped paging, 物理地址 = 虚拟地址。*/
+	 * 加到 VO 的物理地址上，即得到符号的物理地址。
+	 * Identity-mapped paging, 物理地址 = 虚拟地址。*/
 	return ptr - (void *)_text + (void *)physaddr;
 }
 ```
-> NOTES
 
->分析 __startup_64 时, 除了上面埋下的问题，又发现了新的 issue: 对于同一个符号引用，通过 `readelf -r` 发现，在不同位置的引用会生成不同的 relocation type; 不同的编译器对同一位置的同一符号也会生成不同的 relocation type. 举例：
+分析 __startup_64 时, 除了上面埋下的问题，又发现了新的 issue: 对于同一个符号，在不同位置的引用会生成不同的 relocation type; 不同的编译器对同一位置的同一符号也会生成不同的 relocation type. For example:
 
->  1. 符号 level3_kernel_pgt 在 __startup_64 被引用了 2 次, 我的环境中(GCC 8.2.1)，relocation type 分别是 R_X86_64_64, R_X86_64_32S。
->  2. 符号 next_early_pgt 在 __startup_64 被引用了 2 次，但 2 次引用的方式不一样。根据 commit 187e91fe5e91 可知，不同编译器下 relocation type 可能不同。
+  1. 符号 level3_kernel_pgt 在 __startup_64 被引用 2 次, 我的环境中(GCC 8.2.1)，relocation type 分别是 R_X86_64_64, R_X86_64_32S;
+  2. 由 commit 187e91fe5e91 知，同一位置的同一符号，不同编译器下 relocation type 可能不同。
 
-除了上面埋下的问题，还引申出一个小问题：为什么需要用 fixup_pointer 访问一些变量？因为这时是 identity-mapping, 所有绝对地址寻址的符号(代码直接使用符号本身)将找不到它真正的值，因为符号本身表示 linker script 中定义的虚拟地址。可以通过分析二进制文件确认。
+顺便以 .rela.head.text section 中 early_top_pgt(R_X86_64_32S) 为例，观察实际的链接情况。
 
-以 .rela.head.text section 中第一个 R_X86_64_32S 类型重定位项为例，分析为什么需要这种符号引用的 fix. `readelf -r head64.o` 的输出：
-
-```
-Relocation section '.rela.head.text' at offset 0xd38 contains 30 entries:
-...
-  Offset          Info           Type           Sym. Value    Sym. Name + Addend
-00000000003b  002d00000002 R_X86_64_PC32     0000000000000000 sme_me_mask - 4
-000000000042  002b0000000b R_X86_64_32S      0000000000000000 early_top_pgt + 0
-...
-```
-`objdump -d head64.o` 的输出：
-```
-Disassembly of section .head.text:
-
-0000000000000000 <__startup_64>:
-...
-  2a:   48 89 fb                mov    %rdi,%rbx /* 所以 rbx 的值是入参 physaddr */
-  2d:   48 89 f7                mov    %rsi,%rdi
-  30:   48 89 f5                mov    %rsi,%rbp
-  33:   e8 00 00 00 00          callq  38 <__startup_64+0x38>
-  38:   48 8b 3d 00 00 00 00    mov    0x0(%rip),%rdi        # 3f <__startup_64+0x3f>
-  3f:   4c 8d 83 00 00 00 00    lea    0x0(%rbx),%r8
-...
-```
-可以看出：链接重定位时，将使用符号 early_top_pgt 的 symbol value(即它的虚拟地址) 填入 offset 0x42 处, 而 rbx 的值是入参 physaddr(背景: __startup_64 的入参; x86_64 ABI 的 calling convention), 二者相加得到的地址肯定找不到 early_top_pgt, 所以需要 fixup. 可想而知：找到符号 early_top_pgt 最自然的方式应该是 VO 的实际物理地址 + 符号在 VO image 中的 offset.
-
-为了对上述分析进一步确认(因为 .o 的输出没有列出 symbol value)，可以查看 `readelf -r vmlinux` 和 `objdump -d vmlinux` 的输出. 留一个上文解释过的小问题给读者: 为什么 vmlinux 中还有 relocation section?
+>留一个上文解释过的小问题给读者: 为什么 vmlinux 中还有 relocation section?
 
 `readelf -r vmlinux`:
 ```
@@ -6695,6 +6812,7 @@ Relocation section '.rela.text' at offset 0x10a618a8 contains 299850 entries:
 ffffffff81000232  1590a0000000b R_X86_64_32S      ffffffff82798000 early_top_pgt + 0
 ...
 ```
+
 `objdump -d vmlinux`:
 ```
 ffffffff810001f0 <__startup_64>:
@@ -6702,46 +6820,45 @@ ffffffff810001f0 <__startup_64>:
 ffffffff8100022f:       4c 8d 83 00 80 79 82    lea    -0x7d868000(%rbx),%r8
 ...
 ```
-可以确认，上述分析没有问题。一点 tips:
+Tips:
 
-  - relocation 位置： 8100022f + **3** = 81000232;(读者可以思考下 3 是怎么来的)
-  - early_top_pgt symbol value =  ffffffff82798000;
-  - little-endian 将 number "82798000" 表示为 "00 80 79 82";
-  - R_X86_64_32S 的 S 表示 sign extended, 所以 "82798000" 实际被 sign extended 为 "ffffffff82798000".
+  - relocation 位置： 8100022f + **3** = 81000232;(读者可思考下 **3** 怎么来的)
+  - early_top_pgt symbol value =  ffffffff 82798000;
+  - little-endian 将 number **82798000** 表示为 "00 80 79 82";
+  - R_X86_64_32S 的 S 表示 sign extended, 所以 **82798000** 实际被 sign extended 为 **ffffffff 82798000**.
 
-是时候回答上文埋下的问题了：无论是 relocatable 带来的物理地址随机化，还是 kaslr 带来的物理/虚拟双随机化，其符号引用问题都在 __startup_64 函数 fix 页表时被 fix. 上面的分析 cover 了 relocatable kernel(仅物理地址发生变化) 的情况，没有 involve 虚拟地址随机化. KASLR 引入的虚拟地址随机化使得细节变得复杂，针对虚拟地址被随机化的情况再次分析 __startup_64：
+是时候回答上文埋下的问题了：无论是 relocatable 带来的物理地址随机化，还是 KASLR 带来的物理/虚拟双随机化，其符号引用问题都在 __startup_64 函数 fix 页表时被 fix. 上面的 __startup_64 分析 cover 了 relocatable kernel(仅物理地址发生变化) 的情况，没有 involve 虚拟地址随机化. KASLR 引入的虚拟地址随机化使得细节变得复杂，针对虚拟地址被随机化的情况再次分析 __startup_64.
 
-```
-/* 将 KASLR 后的物理地址和虚拟地址的差值分别命名为 p_delta, v_delta, 与 linker script
- * 中的 VMA，LMA 不同，p_delta 和 v_delta 没有相关性，VMA 和 LMA 因为一个 ALIGN 相关。
- *
- * 须知一个前提：对 KASLR 引入的虚拟地址随机化，ZO 函数 handle_relocations 中做了预处理,
- * 将 v_delta 加到 VO 中所有绝对地址寻址(relocation type 是 R_X86_64_32, R_X86_64_32S,
- * R_X86_64_64)的位置.   举例，若 VO 中原有指令：
- *
- *     jmp <absolute virtual address of A>
- *
- * 经 handle_relocations 处理后，变成
- *
- *     jmp <absolute virtual address of A + v_delta>
- *
- * 仅分析 kaslr 下修正 kernel 自身地址映射关系的代码 */
+将 KASLR 后的物理地址和虚拟地址的差值分别命名为 p_delta, v_delta, 与 linker script 中的 VMA，LMA 不同，p_delta 和 v_delta 没有相关性，VMA 和 LMA 因为一个 ALIGN 相关。
+
+Tip: 对 KASLR 引入的虚拟地址随机化，ZO 函数 handle_relocations 中做了预处理, 将 v_delta 加到 VO 中所有绝对地址寻址(relocation type 是 R_X86_64_32, R_X86_64_32S,
+ R_X86_64_64)的位置。也就是说，VO 中原指令：
+
+	jmp <absolute virtual address of A>
+
+经 handle_relocations 处理后，变成
+
+	jmp <absolute virtual address of A + v_delta>
+
+仅分析 KASLR 下修正 kernel 自身地址映射关系的代码
+
+```c
 unsigned long __head __startup_64(unsigned long physaddr,
 				  struct boot_params *bp)
 {
-...
-	/*
-	 * _text 是 R_X86_64_64. kaslr 后，等式展开:
+	...
+	/* In my environment, _text is of type R_X86_64_64. After KASLR:
 	 *
 	 * load_delta = physaddr - (_text + v_delta - __START_KERNEL_map);
 	 *            = physaddr - (_text - __START_KERNEL_map) - v_delta ;
 	 *            = p_delta - v_delta
 	 *
-	 * 这个结果乍一看，对我来说是无法理解的. But, take it easy, 完整分析后会理解的。
-	 * kaslr 下的 p_delta, 等于无 kaslr 时的 load_delta */
+	 * 乍看这结果，我无法理解。 But, take it easy, 完整分析后会理解的。
+	 * KASLR 下的 p_delta, 等同于无 KASLR 时的 load_delta.
+	 */
 	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
 
-...
+	...
 	/* early_top_pgt 和 fixup_pointer 函数中的 _text 都是 R_X86_64_32S.
 	 * level3_kernel_pgt 是 R_X86_64_64.     将 fixup_pointer 展开：
 	 *
@@ -6755,6 +6872,7 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	 * *p = level3_kernel_pgt + _PAGE_TABLE_NOENC - __START_KERNEL_map + load_delta
 	 *    = (level3_kernel_pgt + v_delta) + _PAGE_TABLE_NOENC - __START_KERNEL_map + p_delta - v_delta
 	 *    = level3_kernel_pgt - __START_KERNEL_map + p_delta + _PAGE_TABLE_NOENC
+	 *    = level3_kernel_pgt's LMA + p_delta + _PAGE_TABLE_NOENC
 	 *
 	 * 与无 KASLR 时结果一样。*/
 	pgd = fixup_pointer(&early_top_pgt, physaddr);
@@ -6765,25 +6883,28 @@ unsigned long __head __startup_64(unsigned long physaddr,
 		*p = (unsigned long)level3_kernel_pgt;
 	*p += _PAGE_TABLE_NOENC - __START_KERNEL_map + load_delta;
 
-...
-	/* level3_kernel_pgt 在 head_64.S 中的引用是 R_X86_64_64, 所以 pud[510] 和
-	 * pud[511] 现在的值是 level3_kernel_pgt 的 (LMA + v_delta).    等式展开：
+	...
+	/* level3_kernel_pgt & _text 都是绝对地址寻址，fixup_pointer 展开后，pud 依然是
+	 * level3_kernel_pgt 的实际物理地址。pud[510] & pud[511] 分别指向 level2_kernel_pgt
+	 * & level2_fixmap_pgt, 二者在 head_64.S 中的 relocation type 都是 R_X86_64_64, 所以
+	 * pud[510] & pud[511] 中的值分别是 2 个符号的 LMA + v_delta.    等式展开：
 	 *
 	 *     = LMA + v_delta + p_delta - v_delta = LMA + p_delta
 	 *
-	 * 与无 kaslr 时结果一样。*/
+	 * 与无 KASLR 时结果一样。*/
 	pud = fixup_pointer(&level3_kernel_pgt, physaddr);
 	pud[510] += load_delta;
 	pud[511] += load_delta;
 
-...
+	...
+
 	/* 这里 fix kernel 自身的 mapping. 虚拟地址随机化的范围很小，只能在__START_KERNEL_map
 	 * 开始的 1G 范围内，i.e., 不会超出 Page middle directory 的范围；物理地址随机化的
 	 * 范围远远大于虚拟地址(64TB in 4-level paging, 4PB in 5-level paging)。 等式展开：
 	 *
 	 *     pmd[i] = pmd[i] + p_delta -v_delta
 	 *
-	 * 这看起来跟上面的 load_delta 一样难理解, 需要画个图分析。见下图 */
+	 * 看起来跟上面的 load_delta 一样难理解, 需要画图分析。见下图 */
 	pmd = fixup_pointer(level2_kernel_pgt, physaddr);
 	for (i = 0; i < PTRS_PER_PMD; i++) {
 		if (pmd[i] & _PAGE_PRESENT)
@@ -6792,22 +6913,25 @@ unsigned long __head __startup_64(unsigned long physaddr,
 
 	/* phys_base = p_delta - v_delta */
 	*fixup_long(&phys_base, physaddr) += load_delta - sme_get_me_mask();
-...
+	...
 }
 ```
 
 ![VOFixKASLR](fixkaslr.png)
 
-来解读此图:
+解读上图:
 
-  1. 背景知识：VO 的原始映射关系定义在 linker script 中，如图中第一条水平横线所示。 **start** 表示 VO(vmlinux) 的**起始**虚拟地址，物理地址。VO 的 image size 被限制在 KERNEL_IMAGE_SIZE, KASLR 下是 1G; 这 1G 虚拟地址在代码中静态完整映射到物理地址。
-  2. 若只有物理地址发生变化，则只需在 PMD 的 entry 中加上 p_delta
-  3. 若虚拟地址和物理地址都发生变化(under KASLR), 即如图所示: original VMA -> new VMA, original LMA -> new LMA. 原映射关系下，new VMA 本来 map 到物理地址 X, KASLR 后要 map 到 new LMA, 即 new VMA -> X + (p_delta - v_delta),so, 上面分析中难理解的地方恍然大悟了。
+  1. 背景知识：VO 的原始映射关系定义在 linker script, 如图中水平实线所示。 **start** 表示 VO 的**起始**地址。VO 的 image size 被限制在 KERNEL_IMAGE_SIZE, KASLR 下是 1G; 这 1G 虚拟地址在代码中静态完整映射到物理地址。
+  2. 若仅物理地址变化，只需在 PMD entry 中加上 p_delta;
+  3. 若虚拟地址和物理地址都变化(under KASLR), 即如图所示: original VMA -> new VMA, original LMA -> new LMA. 原映射关系下，new VMA 本来 map 到物理地址 X, KASLR 后要 map 到 new LMA, 即 new VMA -> X + (p_delta - v_delta), so, 上面分析中难理解的地方恍然大悟了。
 
-看到这里，可以回到上文 head_64.S 中继续分析了。Not long from now, head_64.S 会跳到 x86_64_start_kernel 执行：
+至此，可以回到上文 head_64.S 调用 __startup_64 处继续分析。
+
+Not long from now, head_64.S 会跳到 x86_64_start_kernel:
 
 
-```
+```c
+/* 注意：入参 real_mode_data 表示的地址是物理地址。 */
 asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 {
 	/*
@@ -6830,9 +6954,9 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	cr4_init_shadow();
 
 	/* Kill off the identity-map trampoline */
-	/* early_top_pgt 中有做 identity mapping, 但目前还不知道具体含义。这里看起来已使用
-	 * 完成，可以清理掉，并 reset 相关变量。清理完成需要将页表地址重新写入 cr3. 其中有计算
-	 * early_top_pgt 实际物理地址的过程，逻辑在上文已解释 */
+	/* __startup_64 函数在 early_top_pgt 中对 kernel image range 有做 identity mapping,
+	 * AMD SME Encrypt-in-Place 用到了它。用完清理。
+	 */
 	reset_early_page_tables();
 
 	clear_bss();
@@ -6856,12 +6980,11 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	/* 有趣的 __va, 入参是符号的物理地址，下文单独分析 */
 	copy_bootdata(__va(real_mode_data));
 
-	/*
-	 * Load microcode early on BSP.
-	 */
+	/* Load microcode early on BSP. */
 	load_ucode_bsp();
 
-	/* set init_top_pgt kernel high mapping。另一个 top pgt 终于初始化了，等待使用 */
+	/* set init_top_pgt kernel high mapping */
+	/* 另一个 top pgt 终于初始化了，等待使用 */
 	init_top_pgt[511] = early_top_pgt[511];
 
 	x86_64_start_reservations(real_mode_data);
@@ -6885,11 +7008,13 @@ void __init x86_64_start_reservations(char *real_mode_data)
 		break;
 	}
 
-	/* 终于，来了这里，长征总算开始了，海阔凭鱼跃，天高任鸟飞，可以开始研究感兴趣的子系统了 */
+	/* Finally, come to here. 长征开始，海阔凭鱼跃，天高任鸟飞。*/
 	start_kernel();
 ```
-__va() 分析：
-```
+
+Macro __va() analysis:
+
+```c
 /* 入参是物理地址 */
 #define __va(x)			((void *)((unsigned long)(x) + PAGE_OFFSET))
 
@@ -6903,24 +7028,19 @@ __va() 分析：
 #endif /* CONFIG_DYNAMIC_MEMORY_LAYOUT */
 
 #ifdef CONFIG_DYNAMIC_MEMORY_LAYOUT
-unsigned long page_offset_base __ro_after_init = __PAGE_OFFSET_BASE_L4;
-...
+	unsigned long page_offset_base __ro_after_init = __PAGE_OFFSET_BASE_L4;
+	...
 #endif
 
 #define __PAGE_OFFSET_BASE_L4	_AC(0xffff888000000000, UL)
-...
-#endif
-
-代码展开后其实逻辑很简单，只是给入参物理地址加上了 0xffff888000000000 得到其虚拟地址，但
-明白其背景才是重要的。由 Documentation/x86/x86_64/mm.rst 可看出，4-level paging 时，
-[ffff888000000000, ffffc87fffffffff] 的 64TB 空间用于 direct mapping of all
-physical memory, 也就是说，虚拟地址 ffff888000000000 映射到物理地址 0.
 ```
+
+代码逻辑很简单: 入参物理地址加上 0xffff888000000000 得到其虚拟地址。但需知其背景知识，according to Documentation/x86/x86_64/mm.rst, under 4-level paging, the range of [ffff888000000000, ffffc87fffffffff], which is of size 64TB, is used as direct mapping of all physical memory, i.e., 虚拟地址 ffff888000000000 映射物理地址 0.
 
 在 ZO 中也看到 BUILD_BUG_ON 的定义, 但 VO 中的实现不同，VO 中的实现才是正宗的：
 
-```
-/* in include/linux/build_bug.h, 按照出境顺序列出所有相关定义 */
+```c
+/* include/linux/build_bug.h, 按照出镜顺序列出相关定义 */
 /**
  * BUILD_BUG_ON - break compile if a condition is true.
  * @condition: the condition which the compiler should know is false.
@@ -6932,23 +7052,23 @@ physical memory, 也就是说，虚拟地址 ffff888000000000 映射到物理地
 #define BUILD_BUG_ON(condition) \
 	BUILD_BUG_ON_MSG(condition, "BUILD_BUG_ON failed: " #condition)
 
-# 把 condition 反转了一下
+# 把 condition 反转
 #define BUILD_BUG_ON_MSG(cond, msg) compiletime_assert(!(cond), msg)
 
-# 因为上面将条件反转，所以这里 condition 为 false 才会 break build
 #define compiletime_assert(condition, msg) \
 	_compiletime_assert(condition, msg, __compiletime_assert_, __LINE__)
 
 #define _compiletime_assert(condition, msg, prefix, suffix) \
 	__compiletime_assert(condition, msg, prefix, suffix)
 
-/* __OPTIMIZE__ 是 c preprocessor 的 prefined macro, 与常见的 __FILE__, __LINE__
- * 是一样的，但它属于 GNU C extensions, 而后者是 C 语言定义的标准 macro. Refer:
+/* __OPTIMIZE__ 是 C preprocessor 的 predefined macro, 与常见的 __FILE__, __LINE__
+ * 一样，但它属于 GNU C extensions, 而后者是 C 语言定义的标准 macro. Refer:
  *     https://gcc.gnu.org/onlinedocs/cpp/Common-Predefined-Macros.html
  *
  * "__OPTIMIZE__ is defined in all optimizing compilations kernel." Kernel 默认
  * 使用 -O2 编译。
- * 只有声明，没有定义，根据 attribute 描述，是允许的 */
+ * 只有声明，没有定义，根据 attribute 描述，是允许的
+ */
 #ifdef __OPTIMIZE__
 # define __compiletime_assert(condition, msg, prefix, suffix)		\
 	do {								\
@@ -6961,22 +7081,24 @@ physical memory, 也就是说，虚拟地址 ffff888000000000 映射到物理地
 #endif
 
 /* Refer: https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html
- * Tip: 1. 使用此 attribute 声明的函数，若被调用，则 break build with included message.
- *      2. it is possible to leave the function undefined */
+ * Tip:
+ *   1. 使用此 attribute 声明的函数，若被调用，则 break build with included message.
+ *   2. it is possible to leave the function undefined
+ */
 #define __compiletime_error(message) __attribute__((__error__(message)))
 ```
 
 #### Task Management in x86
 
-为什么要莫名的插入这个 topic 呢？在学习 interrupt 基础知识的时候，分析一个中断的详细流程，不可避免的涉及到 task switch, stack switch 等等概念，这些概念都属于 task management, 关于它的详细描述在 Intel SDM 3a 的 chapter 7 整整一章中。此处仅在逻辑上梳理下概念。
+为什么莫名插入这个 topic? 学习 interrupt & 分析中断的详细流程时，不可避免的涉及 task switch, stack switch 等等概念，他们都属于 task management. Intel SDM 3a has whole chapter 7 dedicated for **Task Management**. 本节仅梳理干货，做一个 quick reference.
 
-Intel x86 CPU 在硬件上提供了 multi-tasking 的机制，这种机制仅仅 available 在 protect mode(IA-32). IA-32 提供的 task management 机制包括保存 task state, dispatching task for execution, task switch. **当 CPU 运行在 protect mode, 所有 CPU 的运行都源于一个 task.** 虽然 X86 提供了硬件的 multi-tasking 机制，但一个 OS 也可以实现自己的 software level multi-tasking mechanism.
+Intel X86 在硬件上提供了 multi-tasking 的机制，这种机制仅仅 available 在 protected mode(IA-32). IA-32's task management 机制包括: saving the state of a task, for dispatching tasks for execution, and for switching from one task to another. **当 CPU 运行在 protected mode, 所有 CPU 的运行都源于一个 task.** 虽然 X86 提供了硬件的 multi-tasking 机制，但 OS 也可以实现自己的 software level multi-tasking mechanism.
 
-一个 task 在概念上包括 2 部分: task execution space & task-state segment (TSS). Task execution space 指代码运行 related 的 code/data/stack segment, 还有可能包括 privilege protection mechanism 带来的 stack segment per privilege level; TSS 则是一个 memory segment, 其中描述了 task 执行所需要的所有 segment, 以及提供了保存 task state info 的空间，只能定义在 GDT 中。
+Task 在概念上包括 2 部分: task execution space & task-state segment (TSS). Task execution space 指代码运行 related 的 code/data/stack segment, 还可能包括 privilege protection mechanism 带来的 stack segment per privilege level; TSS 则是一个 memory segment, 其中描述了 task 执行所需要的所有 segment, 以及提供了保存 task state info 的空间，只能定义在 GDT 中。
 
-我们在谈论 task 时，它的身份是通过这个 task 的 TSS 的 segment selector 标识出来。一个 task 的 state，主要是它的执行上下文，也就是它执行时的所有 register value. 执行一个 task 的方式可想可知核心是通过 task gate。
+A task is identified by the segment selector for its TSS. Task state 指 task 运行的 context, simply speaking: all memory segments, register, etc. 执行 task 的前提是 identify the segment selector that points to a task gate or the TSS for the task.
 
-CPU 为了管理 task, 定义了 5 种数据结构(格式在 Intel SDM 中，不赘述)：
+X86 定义了 5 种数据结构管理 task:
 
   - Task-state segment (TSS).
   - Task-gate descriptor.
@@ -6984,39 +7106,43 @@ CPU 为了管理 task, 定义了 5 种数据结构(格式在 Intel SDM 中，不
   - Task register.
   - NT flag in the EFLAGS register.
 
-当 CPU 运行在 protect mode, 必须至少定义一个 TSS 及 TSS descriptor, 且 TSS 的 segment selector 必须已加载到 task register.  这几种结构之间的关系： TR --(selector)--> TSS; Task-gate descriptor --(selector)--> TSS.
+Relationship among them: TR holds segment selector for TSS; Task-gate descriptor holds segment selector for TSS, provides indirect, protected reference to a task.
 
-64-bit mode 下，task state 和 数据结构都与 protect mode 相似，但 task switching 机制不可用，task management 和 task switch 都必须在软件中执行。虽然如此，一个 64-bit 的 TSS 依然必须存在。
+When operating in protected mode, a TSS and TSS descriptor must be created for at least one task, and the segment selector for the TSS must be loaded into the task register (using the LTR instruction).
 
-对于我们下面中断的分析，本章节存在的最重要意义是，通过 gate 进入 interrupt/exception handler 时，stack push 的情况，这些内容不详述，需要多读 INTEL SDM.
+In 64-bit mode, task structure and task state are similar to those in protected mode. However, the task switching mechanism available in protected mode is not supported in 64-bit mode. Task management and switching must be performed by software. Although hardware task-switching is not supported in 64-bit mode, a 64-bit task state segment (TSS) must exist.
+
+The OS must create at least one 64-bit TSS after activating IA-32e mode. It must execute the LTR instruction (in 64-bit mode) to load the TR register with a pointer to the 64-bit TSS responsible for both 64-bit mode programs and compatibility-mode programs.
 
 补了基础知识，来对照 kernel 代码复习一下。boot code 工作在 real mode, 跳转到 protect mode(64-bit further more) 的 ZO, 然后跳转到 64-bit 的 VO。
 
-```
+```c
 /* real mode, boot code */
 void go_to_protected_mode(void)
 {
 	...
-		/* Actual transition to protected mode... */
-	/* 此函数中定义的 GDT 中有一个 TSS，但也说明了，实际没有用，因为我们没有 privilege 的切换 */
+	/* Actual transition to protected mode... */
+	/* 该 GDT 中有 TSS. 但实际没有用，因为没有 privilege 的切换 */
 	setup_gdt();
 	protected_mode_jump(boot_params.hdr.code32_start,
 			    (u32)&boot_params + (ds() << 4));
 
 }
-
+```
+```assembly
 /* arch/x86/boot/pmjump.S */
 
-	/* 进入 protect mode 前，准备好 TSS 的 segment selector */
+	/* Before entering protected mode, prepar segment selector for TSS. */
 	movw	$__BOOT_TSS, %di
 	...
 
 	# Set up TR to make Intel VT happy
-	/* 进入 protect mode 后，立刻 load TR 里*/
+	/* After entering protected mode，load TR immediately */
 	ltr	%di
 ```
+
 ZO 运行时：
-```
+```assembly
 /* head_64.S */
 
 	/* 进入 64-bit mode 前，加载了 64 bit 的 TSS descriptor */
@@ -7038,17 +7164,17 @@ gdt:
 	.quad   0x0000000000000000	/* TS continued */
 gdt_end:
 ```
-VO 的 head_64.S 中没有 ltr 操作，下文有解释。
+但 VO 中未看到 ltr 操作? 下一节中解答
 
 #### Early Interrupt Initialization
 
-上文分析到 `copy_bootdata(__va(real_mode_data))` 时，又有一个小问题： real_mode_data 是物理地址，代码中要 access 时须使用它的虚拟地址，走 page table，所以使用 __va 进行转换。由 Documentation/x86/x86_64/mm.rst 可知，4-level paging 时，虚拟地址 ffff888000000000 到 ffffc87fffffffff 的 64 TB 是用于 direct mapping of all physical memory (page_offset_base) 的，即物理地址 [0, 64TB) 映射虚拟地址 [ffff888000000000, ffffc87fffffffff)。但是截至 copy_bootdata 函数前，没有看到有初始化页表做这个 mapping。调查过程中忘记不小心 blame 到某个 commit 提示说, Interrupt Descriptor Table(IDT) 中的 page fault handler 会自动做这件事。原本想暂时推后中断代码的分析，看起来天不遂人愿:p
+上文分析到 `copy_bootdata(__va(real_mode_data))` 时，又有一个小问题： real_mode_data 是物理地址，代码中要 access 时须使用它的虚拟地址，走 page table，所以使用 __va 进行转换。由 Documentation/x86/x86_64/mm.rst 可知，4-level paging 时，虚拟地址 ffff888000000000 到 ffffc87fffffffff 的 64 TB 用于 direct mapping of all physical memory (page_offset_base), 即物理地址 [0, 64TB) 映射虚拟地址 [ffff888000000000, ffffc87fffffffff)。但是截至 copy_bootdata 函数前，未看到 page table 有做这个 mapping. 调查过程中 accidentally blame 到某个 commit 提示说, Interrupt Descriptor Table(IDT) 中的 page fault handler 会自动做这件事。原本想暂时推后中断代码的分析，看起来天不遂人愿:p
 
-中断架构是相对独立的一个系统，开始之前，有必要温故一些基础知识。中断初始化的入口是 idt_setup_early_handler, 一眼看到 set_intr_gate 函数，熟读 Intel software developer manual 的同学应该可以想到这是在说 gate descriptor, 所以我们将从它开始科普。
+中断初始化的入口是 idt_setup_early_handler, 一眼看到 set_intr_gate 函数，熟读 Intel SDM 的同学应该可以想到这是在说 gate descriptor. **中断**是一个相对独立的系统，开始之前，有必要温故一些基础知识，就从它开始。
 
 x86 架构定义了几个 descriptor table: GDT(Global), LDT(Local), IDT. Descriptor table，顾名思义，table 中是一个个 descriptor entry. Descriptor 的基本结构参考 Intel SDM 3a "3.4.5 Segment Descriptors". 根据 descriptor 中的 S flag, 可分类为:
 
-  1. system descriptor. 包括如下几种:
+  1. system descriptor, includes:
 
     * Local descriptor-table (LDT).
     * Task-state segment (TSS) descriptor.
@@ -7059,9 +7185,9 @@ x86 架构定义了几个 descriptor table: GDT(Global), LDT(Local), IDT. Descri
 
   2. code or data segment descriptor
 
-system descriptor 的前 2 个描述特殊用途的 memory segment; 后 4 个叫 gate descriptor, to provide controlled access to code segments with different privilege levels(Intel SDM 3a, 5.8.2 Gate Descriptors). Gate descriptor 使用的场景跨越很大，所以它的格式定义散落在 Intel SDM 3a 中: 5.8.3 Call Gates, 6.11 IDT DESCRIPTORS, 7.2.5 Task-Gate Descriptor. 二者的区别，一眼可以看到的: segment descriptor 用于描述一个 memory segment; 而 gate descriptor 用于描述某个 code segment 中特定 procedure 的地址。
+system descriptor 的前 2 个描述特殊用途的 memory segment; 后 4 个叫 gate descriptor, to provide controlled access to code segments with different privilege levels(Intel SDM 3a, 5.8.2 Gate Descriptors). Gate descriptor 使用的场景跨越很大，所以它的格式定义散落在 Intel SDM 3a 中: 5.8.3 Call Gates, 6.11 IDT DESCRIPTORS, 7.2.5 Task-Gate Descriptor. 二者的区别，一眼可以看到的: segment descriptor 用于描述 memory segment; 而 gate descriptor 用于描述某 code segment 中特定 procedure 的地址。
 
-跨 privilege level 的 procedure transfer, 通常是通过指令 call 或 jmp 一个 far pointer(segment selector: segment offset). 根据 far pointer 的不同，可以分为 Direct Calls or Jumps to Code Segments(Intel SDM 3a, 5.8.1), 和 call gate 两种. 两种 far pointer 的区别是： 使用 call gate 时，offset 可以随意填写，processor 不会检查，因为实际的 offset 在 gate descriptor 中。两种方式都会做 privilege level checking, 但肯定是有不同，参考 Intel SDM 3a 的:
+跨 privilege level 的 procedure transfer, 通常是通过指令 call 或 jmp 一个 far pointer(segment selector: segment offset). 根据 far pointer 的不同，可以分为 Direct Calls or Jumps to Code Segments(Intel SDM 3a, 5.8.1), 和 call gate 两种. 两种 far pointer 的区别是： 使用 call gate 时，offset 可以随意填写，processor 不会检查，因为实际的 offset 在 gate descriptor 中。两种方式都会做 privilege level checking, 但肯定是有不同，参考 Intel SDM 3a:
 
   * Figure 5-6. Privilege Check for Control Transfer Without Using a Gate
   * Figure 5-11. Privilege Check for Control Transfer with Call Gate
@@ -7070,7 +7196,7 @@ system descriptor 的前 2 个描述特殊用途的 memory segment; 后 4 个叫
 
 我个人 prefer 将 descriptor 这样分类：
 
-  1. segment descriptor: 描述一个 memory segment. 根据 descriptor 中的 S flag, 又细分为
+  1. segment descriptor: 描述 memory segment. 根据 descriptor 中的 S flag, 又细分为
 
     * system segment: LDT & TSS
     * code or data segment
@@ -7088,18 +7214,18 @@ Gate descriptor 中, Task gate 用于 multi-tasking 管理, provides an indirect
 
 IDT 可以包含三种 descriptor: Task-gate descriptor, Interrupt-gate descriptor, Trap-gate descriptor. 目前猜测 Linux kernel 都是用后 2 种 gate descriptor.
 
-当 processor 检测到 interrupt 或 exception 发生时，会做下面任意一种动作:
+When processor detect interrupt or exception, it will do either of:
 
   - Executes an implicit call to a handler procedure.
   - Executes an implicit call to a handler task.
 
-call to handler procedure 通过 interrupt gate 或 trap gate; call to handler task 通过 task gate.
+call to handler procedure via interrupt gate or trap gate; call to handler task via task gate.
 
 Quick memo: Intel SDM volume 1, 6.4.1 Call and Return Operation for Interrupt or Exception Handling Procedures.
 
-通过 handler procedure 处理 interrupt 或 exception 时，若 handler procedure 的 privilege level 与正在执行的程序相同，则不会发生 stack switch; 若 handler procedure 的 privilege level 更高，则会发生 stack switch.
+通过 handler procedure 处理 interrupt 或 exception 时，若 handler procedure 的 privilege level 与正在执行的程序相同，则不会发生 stack switch; 若 handler procedure 的 privilege level 更高，则会发生 stack switch. 现在可以回答上一节的问题：为什么 VO 初始化时没有 ltr 操作，没有看到有效的 TSS 定义? Intel SDM 3a, 7.7 TASK MANAGEMENT IN 64-BIT MODE says: Although hardware task-switching is not supported in 64-bit mode, a 64-bit task state segment (TSS) must exist...The operating system must create at least one 64-bit TSS after activating IA-32e mode... 但 vmlinux 没有做。My analysis: 迄今 Linux kernel 始终运行在 ring 0, 没有 privilege level change, 所以不会发生 stack switch, 也就不需要 TSS(stack info is defined in TSS).
 
-若无 stack switch，调用 interrupt/exception handler procedure 时 processor 会做如下事:
+若无 stack switch, 调用 interrupt/exception handler procedure 时 processor 会做如下事:
 
   1. Pushes the current contents of the EFLAGS, CS, and EIP registers (in that order) on the stack.
   2. Pushes an error code (if appropriate) on the stack.
@@ -7107,7 +7233,7 @@ Quick memo: Intel SDM volume 1, 6.4.1 Call and Return Operation for Interrupt or
   4. If the call is through an interrupt gate, clears the IF flag in the EFLAGS register.
   5. Begins execution of the handler procedure.
 
-若有 stack switch，调用 interrupt/exception handler procedure 时 processor 会做如下事:
+若有 stack switch, 调用 interrupt/exception handler procedure 时 processor 会做如下事:
 
   1. Temporarily saves (internally) the current contents of the SS, ESP, EFLAGS, CS, and EIP registers.
   2. Loads the segment selector and stack pointer for the new stack (that is, the stack for the privilege level being called) from the TSS into the SS and ESP registers and switches to the new stack.
@@ -7117,7 +7243,7 @@ Quick memo: Intel SDM volume 1, 6.4.1 Call and Return Operation for Interrupt or
   6. If the call is through an interrupt gate, clears the IF flag in the EFLAGS register.
   7. Begins execution of the handler procedure at the new privilege level.
 
-Handler task 与 handler procedure 的不同在于： handler task 顾名思义，是 x86 架构定义的 task, 处理 interrupt/exception 时，等同于 task switch. 而 task switch 时，被 interrupted program 的 context 会保存到 TSS. task 有自己的 address space, 而 handler procedure 与被 interrupted program 在同一个 address space.
+Handler task 与 handler procedure 的不同在于： handler task 顾名思义，是 x86 架构定义的 task, 处理 interrupt/exception 时，等同于 task switch. 而 task switch 时，the interrupted program context 会保存到 TSS. task 有自己的 address space, 而 handler procedure 与被 interrupted program 在同一个 address space.
 
 64-bit mode 下，interrupt/exception 的处理行为都略有不同，详细参考 Intel SDM 3a, 6.14 EXCEPTION AND INTERRUPT HANDLING IN 64-BIT MODE.
 
@@ -7125,22 +7251,22 @@ Error code: 32-bit value, exception 才会 push error code, 表示这个 excepti
 
 Tip: 代码到目前为止，maskable external interrupts 是被 mask 的，ZO 的入口, compressed 目录下 head_64.s 中开头有 `cli` 指令。
 
- 现在可以回到代码上了：
-```
-/* arch/x86/kernel/idt.c */
+Now get back to arch/x86/kernel/idt.c for idt_setup_early_handler:
 
+```c
 /* Must be page-aligned because the real IDT is used in a fixmap. */
-/* 之前还未关注过 bss section. 这时可以看一下 linker script 中的 .bss section 处理。*/
+/* 参考 linker script 中 .bss section 的处理。*/
 gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;
+...
 
 void __init idt_setup_early_handler(void)
 {
 	int i;
 
-	/* X86 上, Vector numbers [0 - 31] 是预留给 architecture-defined exceptions
-	 * and interrupts 的，又因为 maskable external interrupts 目前一直被 mask，所以
+	/* Vector numbers [0 - 31] is reserved for architecture-defined exceptions
+	 * and interrupts. 因为 maskable external interrupts 目前一直被 mask，所以
 	 * 才可以初始化 IDT 且只初始化 vector 0-31. 入参 early_idt_handler_array 定义在
-	 * head_64.S 中，在下方详细分析。*/
+	 * head_64.S, 在下方详细分析。*/
 	for (i = 0; i < NUM_EXCEPTION_VECTORS; i++)
 		set_intr_gate(i, early_idt_handler_array[i]);
 #ifdef CONFIG_X86_32
@@ -7150,21 +7276,11 @@ void __init idt_setup_early_handler(void)
 	load_idt(&idt_descr);
 }
 
-/* 补充背景知识：为了 task switch(IDT 中的 gate descriptor 也是一种)，需要 TSS 的存在。
- * ZO 中的 GDT 有定义 TSS，但 VO 中至今未看到，Intel SDM 3a, 7.7 TASK MANAGEMENT IN
- * 64-BIT MODE 给出了间接答案：
- *   Although hardware task-switching is not supported in 64-bit mode, a 64-bit
- *   task state segment (TSS) must exist...
- *   The operating system must create at least one 64-bit TSS after activating
- *   IA-32e mode....
- * 直接答案是：若从 ZO 跳转到 VO，TSS 已定义且已 load TR; 若从 64-bit boot protocol
- * 而来，则 loader 必须也已定义 TSS 并 load TR.
- *
- * 但是！！！至今为止，其实都没有发生 task switch with privilege change, ZO 中的 TSS
- * 也只是假的，有 descriptor, 没有实际空间(看 ZO head_64.S 中 GDT 中的 TSS 定义)。*/
+
+/* Refer to Intel SDM 3a, 6.11 IDT DESCRIPTORS for IDT entry format. */
 static void set_intr_gate(unsigned int n, const void *addr)
 {
-	/* idt_data 为描述 IDT 的 descriptor 而定义. 从其名字可看出. */
+	/* Used to describe IDT descriptor. */
 	struct idt_data data;
 
 	BUG_ON(n > 0xFF);
@@ -7172,17 +7288,19 @@ static void set_intr_gate(unsigned int n, const void *addr)
 	memset(&data, 0, sizeof(data));
 	data.vector	= n;
 	data.addr	= addr;
-	/* 回忆一下，当前用的 VO 自己的 GDT 定义在 arch/x86/kernel/cpu/common.c. 当前是
-	 * long mode, 所以需要 64-bit code segment, __KERNEL_CS 正是它的 selector. */
+
+	/* Tips: VO 自己的 GDT 定义在 arch/x86/kernel/cpu/common.c; head_64.S 已重新 load
+	 * GDTR.
+	 * interrupt/exception handler 与普通 kernel code在同一 code segment. */
 	data.segment	= __KERNEL_CS;
-	/* type 0xE, 使用 interrupt gate, Why not trap gate for exception? 没有使用
-	 * interrupt stack table(ist) 为 0，说明使用 modified version of the legacy
-	 * stack-switching mechanism, 参考 Intel SDM 3a, 6.14.4 Stack Switching in
-	 * IA-32e Mode */
-	data.bits.type	= GATE_INTERRUPT; /* */
+
+	/* type 0xE, 使用 interrupt gate, Why not trap gate for exception? Interrupt
+	 * stack table(ist) is 0, 说明使用 modified version of the legacy stack-switching
+	 * mechanism, 参考 Intel SDM 3a, 6.14.4 Stack Switching in IA-32e Mode */
+	data.bits.type	= GATE_INTERRUPT;
 	data.bits.p	= 1;
 
-	/* idt_table 定义在 idt.c 文件头部，IDTR 的格式，与 GDTR 的格式一样，limit 在前面。
+	/* idt_table 定义在 idt.c 文件头部。IDTR(idt_descr) 与 GDTR 格式一样，limit 在前面。
 	 * 参考： Intel SDM 3a, Figure 3-11. Pseudo-Descriptor Formats */
 	idt_setup_from_table(idt_table, &data, 1, false);
 }
@@ -7197,7 +7315,7 @@ idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sy
 		idt_init_desc(&desc, t);
 		/* 在非 paravirt 情况下，此函数最终仅是 memcpy 的动作*/
 		write_idt_entry(idt, t->vector, &desc);
-		/* 暂且 non of my business, skip. */
+		/* skip for now. */
 		if (sys)
 			set_bit(t->vector, system_vectors);
 	}
@@ -7205,23 +7323,26 @@ idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sy
 
 /* early_idt_handler_array 定义在 assembly, 在 C 中被 declare 为 array */
 extern const char early_idt_handler_array[NUM_EXCEPTION_VECTORS][EARLY_IDT_HANDLER_SIZE];
+```
 
-/* arch/x86/kernel/head_64.S */
-
+early_idt_handler_array in arch/x86/kernel/head_64.S:
+```assembly
 	__INIT
-ENTRY(early_idt_handler_array)
-/* EXCEPTION_ERRCODE_MASK(0x27d00) 用 bitmask 的方式标识有 error code 的 exception,
+SYM_CODE_START(early_idt_handler_array)
+/*
+ * EXCEPTION_ERRCODE_MASK(0x27d00) 用 bitmask 的方式标识有 error code 的 exception.
  * 将 0x27d00 展开为 binary, 对照 Intel SDM 3a, Table 6-1. Protected-Mode Exceptions
  * and Interrupts 的 Error Code 一列，会发现一一对应.
  *
- * 对于没有 error code 的 exception, push 一个 dummy error code 0, 初看还无法理解，
- * 等完整分析后才会恍然大悟.
+ * 对于没有 error code 的 exception, push 一个 dummy error code 0, 初看不理解，完整
+ * 分析后恍然大悟.
  *
  * EARLY_IDT_HANDLER_SIZE 是 9，它的注释已给出解释。参考指令手册中 push 的描述可知，
  * PUSH imm8 只需 2 bytes(下面 2 个 push 的操作数都是 imm8), 而对于 jmp 指令，通过
  * objdump -d 可知，使用 PC relative 方式寻址，有时是 5 bytes，有时是 2 bytes，这就是
  * 注释中: up to five bytes 的含义。因为我们声明它为 2 维数组，且第 2 维 size 是 9, 所以
- * 不管少几个 byte, ".fill" 都将该数组元素填满为 9 bytes. */
+ * 不管少几个 byte, ".fill" 都将该数组元素填满为 9 bytes.
+ */
 
 	i = 0
 	.rept NUM_EXCEPTION_VECTORS
@@ -7239,18 +7360,27 @@ ENTRY(early_idt_handler_array)
 	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
 	.endr
 	...
-END(early_idt_handler_array)
+SYM_CODE_END(early_idt_handler_array)
 ```
+
 至此，early IDT 的 setup 完成，后面就是等待 exception 的发生，和 exception handler 的执行。回忆一下，目前所 care 的是 copy_bootdata 导致的 page fault exception, 所以我们将 focus 它的处理流程。page fault exception 的详细描述在 Intel SDM 3a, 6.15 EXCEPTION AND INTERRUPT REFERENCE. 触发 page fault 的几种情况中，最直接的是 P flag 不存在，也就是我们这个 case 的情况，明显，虚拟地址 ffff888000000000 还没在页表中映射。
 
-分析 page fault 前，依然有背景知识(画外音：怎么还有= =|): Intel SDM 3a, 6.14 EXCEPTION AND INTERRUPT HANDLING IN 64-BIT MODE. 简而言之，其过程是：发生 interrupt/exception 时，首先 stack pointer (SS:RSP)无条件压栈；然后将 EFLAGS, CS, EIP 依次压栈；若有 error code，则把 error code 压栈。所有 stack push 完成，跳转到 gate 表示的 handler entry 执行.
+分析 page fault 前，依然有背景知识(画外音：怎么还有= =|): Intel SDM 3a, 6.14 EXCEPTION AND INTERRUPT HANDLING IN 64-BIT MODE & Figure 6-4. Stack Usage on Transfers to Interrupt and Exception-Handling Routines. Simply speaking, when interrupt/exception happens, processor will do following in turn:
 
-Linux kernel 的代码到目前为止都运行在 ring 0, 不存在 privilege level change. 所以发生 interrupt/exception 时，其 stack 情况如 Intel SDM 3a, Figure 6-8. IA-32e Mode Stack Usage After Privilege Level Change 右侧所示。在我们的代码示例中，stack 的情况扩展为这样：
+  1. **OPTIONAL**: 若发生 privilege level change, i.e. stack switch, 则 push stack pointer ;
+  2. Push EFLAGS, CS, EIP;
+  3. **OPTIONAL**: 若有 error code，则 push error code.
+  4. 跳转到 gate 表示的 handler entry 执行.
 
-![Alt text](hstack.png)
+Linux kernel 目前为止都运行在 ring 0, 不存在 privilege level change, 所以发生 interrupt/exception 时，其 stack 情况如 Intel SDM 3a, Figure 6-4. Stack Usage on Transfers to Interrupt and Exception-Handling Routines 上半部分所示。但是：64-bit mode also pushes SS:RSP unconditionally, rather than only on a CPL change. Refer to Intel SDM 3a, 6.14.2 64-Bit Mode Stack Frame.
 
-不看代码还不能完全理解，所以 let's take page fault for example and get back to code:
-```
+idt_setup_early_handler 使用 early_idt_handler_array 初始化 IDT 后，发生 interrupt/exception 至调用 early_idt_handler_common 之间，IRQ stack 长这样：
+
+![Early Interrupt Stack](interruptstack.png)
+
+Take page fault for example and get back to code:
+
+```assembly
 #ifdef CONFIG_PARAVIRT_XXL
 ...
 #else
@@ -7258,18 +7388,21 @@ Linux kernel 的代码到目前为止都运行在 ring 0, 不存在 privilege le
 	#define INTERRUPT_RETURN iretq
 #endif
 
-early_idt_handler_common:
+...
+
+SYM_CODE_START_LOCAL(early_idt_handler_common)
 	/*
 	 * The stack is the hardware frame, an error code or zero, and the
 	 * vector number.
 	 */
-	cld /* 为了 string operation 做准备 */
+	cld /* 为 string operation 做准备 */
 
-	incl early_recursion_flag(%rip) /* early_recursion_flag++, 看起来统计重入而已 */
+	/* early_recursion_flag++, 看起来统计重入而已 */
+	incl early_recursion_flag(%rip)
 
-	/* x86_64 下，pt_regs 定义在 arch/x86/include/asm/ptrace.h, 而下面的一堆 push，
-	 * 明显在保存 interrupted routine 的上下文为 pt_regs 结构。通过上面 handler stack
-	 * 图示，配合 pt_regs 定义，才能理解下面注释的含义 */
+	/* pt_regs is defined in arch/x86/include/asm/ptrace.h
+	 * 一堆 push，明显在保存 interrupted routine 的 context 为 pt_regs 结构。通过上面
+	 * handler stack 图示，配合 pt_regs 定义，才能理解下面注释的含义 */
 
 	/* The vector number is currently in the pt_regs->di slot. */
 	pushq %rsi				/* pt_regs->si */
@@ -7290,13 +7423,13 @@ early_idt_handler_common:
 	pushq %r15				/* pt_regs->r15 */
 	UNWIND_HINT_REGS
 
-	/* 看起来本 interrupt procedure 存在的意义基本是为了 page fault */
+	/* early_idt_handler_common 仅为处理 page fault */
 	cmpq $14,%rsi		/* Page fault? */
 	jnz 10f
-	/* 知识点：page fault 时，cpu 自动将导致 page fault 的虚拟地址 Load 到 CR2 */
+	/* 知识点：发生 page fault 时，CPU 自动将导致 page fault 的虚拟地址 load 到 CR2. */
 	GET_CR2_INTO(%rdi)	/* Can clobber any volatile register if pv */
-	/* Tip: x86-64 ABI 定义整数入参的传递依次使用: %rdi, %rsi, %rdx, %rcx, %r8 and %r9
-	 * 根据已知的 virt address 和 phys address, 在页表中做映射，细节分析暂时忽略。 */
+	/* x86-64 ABI: 传递整数入参，从左到右依次使用: %rdi, %rsi, %rdx, %rcx, %r8 and %r9.
+	 * Already got direct mapping's virt address, just do it. Omit the analysis. */
 	call early_make_pgtable
 	/* x86-64 ABI: 整数返回值在 eax 中. 映射 OK, 则跳到 20f */
 	andl %eax,%eax
@@ -7313,18 +7446,18 @@ early_idt_handler_common:
 
 20:
 	decl early_recursion_flag(%rip)
-	/* handler procedure 完成，time to return to interrupted routine.
-	 * 该函数定义在 arch/x86/kernel/entry/entry.S */
+	/* Handled exception, time to return to interrupted routine. */
 	jmp restore_regs_and_return_to_kernel
 END(early_idt_handler_common)
 
-/* Entry.S */
-GLOBAL(restore_regs_and_return_to_kernel)
+/* arch/x86/kernel/entry/entry.S */
+SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
 #ifdef CONFIG_DEBUG_ENTRY
 	...
 #endif
-	/* 定义在 arch/x86/kernel/entry/calling.h 中的 assembly macro, 依次 pop 上面
-	 * push 的 register, 直到 rdi. 我们的 case 中，regs->orig_as 是 error code. */
+	/* assembly macro defined in arch/x86/kernel/entry/calling.h, 依次 pop 上面
+	 * push 的 register, 直到 rdi. In our case(exception), regs->orig_ax is error code.
+	 * skip error code, 准备 iret 返回到 interrupted program. */
 	POP_REGS
 	addq	$8, %rsp	/* skip regs->orig_ax */
 	/*
@@ -7336,7 +7469,7 @@ GLOBAL(restore_regs_and_return_to_kernel)
 /* x86-64 下的 iret 比 x86 曲折(x86 下的 INTERRUPT_RETURN 就是一条 iret.) */
 #define INTERRUPT_RETURN	jmp native_iret
 
-ENTRY(native_iret)
+SYM_INNER_LABEL_ALIGN(native_iret, SYM_L_GLOBAL)
 	UNWIND_HINT_IRET_REGS
 	/*
 	 * Are we returning to a stack segment from the LDT?  Note: in
@@ -7345,21 +7478,25 @@ ENTRY(native_iret)
 #ifdef CONFIG_X86_ESPFIX64
 	/* SS(160) - RIP(128) = 32, 参考上面 handler stack 图示可知，正是 SS 的 segment
 	 * selector. 再参考 Intel SDM 3a, Figure 3-6. Segment Selector 可知，测试其 TI
-	 * bit, 代码目测处理比较繁琐，还好目前我们没有定义任何 LDT, 可忽略。*/
+	 * bit, 代码目测处理比较繁琐，还好目前我们没有定义任何 LDT, 可忽略。
+	 * 64-bit 无条件 push SS:RSP: Intel SDM 3a, 6.14.2 64-Bit Mode Stack Frame. */
 	testb	$4, (SS-RIP)(%rsp)
 	jnz	native_irq_return_ldt
 #endif
 
-.global native_irq_return_iret
-native_irq_return_iret:
+SYM_INNER_LABEL(native_irq_return_iret, SYM_L_GLOBAL)
 	/*
 	 * This may fault.  Non-paranoid faults on return to userspace are
 	 * handled by fixup_bad_iret.  These include #SS, #GP, and #NP.
 	 * Double-faults due to espfix64 are handled in do_double_fault.
 	 * Other faults here are fatal.
 	 */
-	/* 不知道我们这个 page fault case 下会有什么错误, anyway, 一条简单的 iretq 符合认知.
-	 * 可以回到 interrupted routine 继续分析了 */
+	/* 暂不理解上面 comments. Anyway, 一条简单的 iretq 符合认知.
+	 *
+	 * 因 SS:RSP 困惑了一会儿。Tip: IRET pops SS:RSP unconditionally off
+	 * the interrupt stack frame only when it is executed in 64-bit mode.
+	 * Refer to Intel SDM 3a, 6.14.3 IRET in IA-32e Mode.
+	 */
 	iretq
 ```
 
@@ -10518,7 +10655,7 @@ void __init setup_per_cpu_areas(void)
 
 #### TEST
 
-对 源操作数 和 目的操作数 做逻辑与，根据结果设置 EFLAGS 寄存器的 SF，ZF，PF 状态位，不保存逻辑与后的结果。
+对 source operand 和 destination operand 做 AND，根据结果设置 EFLAGS 寄存器的 SF，ZF，PF 状态位，不保存逻辑与后的结果。
 
 #### BT - Bit Test
 Selects the bit in a bit string at the bit-position designated by the bit offset and stores the value of the bit in the CF flag. 所以通常后面跟指令 Jnc(Jump short if not carry (CF=0)) 或 Jc(Jump short if carry (CF=1)).

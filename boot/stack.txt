@@ -1,0 +1,28 @@
+
+
+     64-bit early IDT handlder's stack
+     No privildge change, no stack switch
+     SS:RSP pushed unconditionally
+    +                    + High
+    |                    |
+    |                    |
+    |--------------------| +56
+    | SS                 |
+    |--------------------| +48
+    | RSP                |
+    +--------------------+ +40
+    | RFLAGS             |
+    +--------------------+ +32
+    | CS                 |
+    +--------------------+ +24
+    | RIP                |
+    +--------------------+ +16
+    | Error code/Dummy 0 |
+    +--------------------+ +8
+    | Vector number      |
+    +--------------------+ rsp
+    | ...                |
+    |                    |
+    |                    |
+    +                    + Low
+
