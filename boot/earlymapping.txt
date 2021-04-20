@@ -42,18 +42,18 @@ From left to right, top to down, the pages illustrated are adjacent in memory.
                        |                   |                 init_top_pgt--->+-------------------+                                                                                     |    |
                        |                   |                 (4k bytes)      |                   |                                                                                     |    |
                        |                   |                                 |                   |  +-----level2_kernel_pgt---->+-----------------+                                    |    |
-                       |                   |                                 |                   |  |     (4k bytes)            | entries not     | Because                            |    |
+                       |                   |                                 |                   |  |     (4k bytes)            | entries not[1]  | Because                            |    |
                        |                   |                                 |                   |  |                           | mapping vmlinux | ALIGN(CONFIG_PHYSICAL_START,       |    |
                        |                   |                                 |                   |  |                           |                 |       CONFIG_PHYSICAL_ALIGN)       |    |
                        +- - - - - - - - - -+                                 |                   |  |                           +- - - - - - - - -+                                    |    |
                    511 | level3_kernel_pgt |---+                             |                   |  |                           | mapping 2M page |------------------------------------+    |
 early_top_pgt + 4k---->+-------------------+   |                             |                   |  |                           +- - - - - - - - -+                                         |
-                                               |                             |                   |  |                           | mapping 2M page |-----------------------------------------+
-                                               |                             |                   |  |                           +- - - - - - - - -+
-                                               |                             |                   |  |                           | ...             |
-                                               |                             |                   |  |                           |                 |
-                                               +------->level3_kernel_pgt--->+-------------------+  |                           |                 |   +---level1_fixmap_pgt--->+------------+
-                                                         (4k bytes)          |                   |  |                           |                 |   |    (2 x 4k bytes)      |            |
+                                               |             [2]             |                   |  |                           | mapping 2M page |-----------------------------------------+
+                                               |      +---------------+      |                   |  |                           +- - - - - - - - -+
+                                               |      |               |      |- - - - - - - - - -|  |                           | ...             |
+                                               |      v               +--511-|                   |  |                           |- - - - - - - - -|
+                                               +------->level3_kernel_pgt--->+-------------------+  |                           | entries not[1]  |   +---level1_fixmap_pgt--->+------------+
+                                                         (4k bytes)          |                   |  |                           | mapping vmlinux |   |    (2 x 4k bytes)      |            |
                                                                              |                   |  |  +---level2_fixmap_pgt--->------------------+   |                        |            |
                                                                              |                   |  |  |   (4k bytes)           |                 |   |                        |            |
                                                                              |                   |  |  |                        |                 |   |                        |            |
@@ -71,3 +71,13 @@ early_top_pgt + 4k---->+-------------------+   |                             |  
                                                                                                       level2_fixmap_pgt + 4k--->+-----------------+                            |            |
                                                                                                                                                                                +------------+
 
+[1]. Kernel is assigned 1G virtual address space for its page mapping, but
+     according to KERNEL_IMAGE_SIZE, it implies that kernel memory image size
+     wont exceed 512M, although it is 1G under KASLR, that is just for address
+     randomization, as kernel memory image itself, it is the same.
+     So, a PMD will not be totally used, like head entries will not be used for
+         a. ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN) or,
+         b. KASLR
+     tail entries will not be used for small kernel memory size.
+     
+[2]. Initialized at the bottom of x86_64_start_kernel()

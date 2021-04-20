@@ -2,7 +2,7 @@
 
 Out of the extreme interest into the low level things, I have done this: analyzing Linux booting process base on X86. This is the memo record all the details about it.
 
-To get this work done, one need to know but not limited to: X86 arch, compilation, linkage, hardware details, etc. For X86 arch, the authoritative documents are [Intel® 64 and IA-32 Architectures Software Developer’s Manual](https://software.intel.com/en-us/articles/intel-sdm), it has 10 volumes, we use SDM 1, SDM 2, SDM 3a, etc to its specific volume.
+To get this work done, one need to know but not limited to: X86 arch, compilation, linkage, hardware details, etc. For X86 arch, the authoritative documents are [Intel® 64 and IA-32 Architectures Software Developer’s Manual](https://software.intel.com/en-us/articles/intel-sdm), it has 10 volumes, we use SDM 1, SDM 2, SDM 3a, etc to refer to them.
 
 ## 1st instruction after Power-up
 
@@ -2680,7 +2680,7 @@ E801 比较标准的定义：
 >AX = CX = extended memory between 1M and 16M, in K (max 3C00h = 15MB)
 BX = DX = extended memory above 16M, in 64K blocks
 
-读了几次也不太明白，因为缺少一些背景知识： memory 映射到 CPU 地址空间时，本应是连续的，但由于某些历史原因，某段空间不能用来映射 memory, 这段空间叫做 memory hole. 在 (15M - 16M )之间可能有 memory hole，后面的地址空间也可能有 memory hole, E801 最多只能处理 2 个 memory hole, 也即最多返回 2 段 memory size: 16M 之前和之后的。Simply speaking: E801 reports the amount of memory after 0xFFFFF.  Refer to 15M memory hole at:
+读了几次也不太明白，因为缺少一些背景知识： memory 映射到 CPU 地址空间时，本应是连续的，但由于某些历史原因，某段空间不能用来映射 memory, 这段空间叫做 memory hole. 在 (15M - 16M )之间可能有 ISA memory hole，后面的地址空间也可能有 memory hole, E801 最多只能处理 2 个 memory hole, 也即最多返回 2 段 memory size: before & after 16M. Simply speaking: E801 reports the amount of memory after 0xFFFFF.  Refer to 15M memory hole at:
 
   - [Memory Hole At 15M-16M – The BIOS Optimization Guide](https://www.techarp.com/bios-guide/memory-hole-15m-16m/)
   - [Memory Map (x86).Extended Memory](https://wiki.osdev.org/Memory_Map_(x86)#Extended_Memory_.28.3E_1_MiB.29)
@@ -3499,7 +3499,7 @@ Tips:
   1. processor 操作模式切换条件在 Intel SDM 3a, Figure 2-3. Transitions Among the Processor’s Operating Modes
   2. paging mode 切换条件在 Intel SDM 3a, Figure 4-1. Enabling and Changing Paging Modes
 
-#### 科普两例
+#### Two piece of knowledge
 
 代码中常看到 **identity-mapped** 字眼，what does it mean? 取自数学术语 [Identity function](https://en.wikipedia.org/wiki/Identity_function), 中文译为恒等函数。单词 identity 的主要意思是**身份**，但还有另一个意思：**一致性**，所以翻译为“恒等映射的 page”，也就是 linear address = physical address 的映射。
 
@@ -6592,7 +6592,9 @@ unsigned long __head __startup_64(unsigned long physaddr,
 	la57 = check_la57_support(physaddr);
 
 	/* Is the address too large? */
-	/* MAX_PHYSMEM_BITS & MAX_PHYSADDR_BITS 在 x86_64 下分别是 46 & 44, WHY? */
+	/* MAX_PHYSMEM_BITS & MAX_PHYSADDR_BITS 在 x86_64 下分别是 46 & 44, WHY?
+	 * 2020/9/29: 原来 MAX_PHYSADDR_BITS 没人使用，且定义错误。(竟然木有发现
+	 * 没人使用= =|)。Refer to: https://lkml.org/lkml/2020/7/23/1230. */
 	if (physaddr >> MAX_PHYSMEM_BITS)
 		for (;;);
 
@@ -6961,7 +6963,8 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 
 	clear_bss();
 
-	/* 使用内嵌汇编的方式，看起来比较复杂，TBD */
+	/* The implementation is the one of arch/x86/include/asm/page_64.h,
+	 * looks too complicated，TBD */
 	clear_page(init_top_pgt);
 
 	/*
@@ -6984,7 +6987,7 @@ asmlinkage __visible void __init x86_64_start_kernel(char * real_mode_data)
 	load_ucode_bsp();
 
 	/* set init_top_pgt kernel high mapping */
-	/* 另一个 top pgt 终于初始化了，等待使用 */
+	/* 另一个 top page table 终于初始化了，等待使用 */
 	init_top_pgt[511] = early_top_pgt[511];
 
 	x86_64_start_reservations(real_mode_data);
@@ -7037,7 +7040,9 @@ Macro __va() analysis:
 
 代码逻辑很简单: 入参物理地址加上 0xffff888000000000 得到其虚拟地址。但需知其背景知识，according to Documentation/x86/x86_64/mm.rst, under 4-level paging, the range of [ffff888000000000, ffffc87fffffffff], which is of size 64TB, is used as direct mapping of all physical memory, i.e., 虚拟地址 ffff888000000000 映射物理地址 0.
 
-在 ZO 中也看到 BUILD_BUG_ON 的定义, 但 VO 中的实现不同，VO 中的实现才是正宗的：
+#### BUILD_BUG_ON
+
+ZO 中也有定义 BUILD_BUG_ON, 但 VO 的实现不同，VO 才是正宗的。
 
 ```c
 /* include/linux/build_bug.h, 按照出镜顺序列出相关定义 */
@@ -7061,13 +7066,14 @@ Macro __va() analysis:
 #define _compiletime_assert(condition, msg, prefix, suffix) \
 	__compiletime_assert(condition, msg, prefix, suffix)
 
-/* __OPTIMIZE__ 是 C preprocessor 的 predefined macro, 与常见的 __FILE__, __LINE__
+/* __OPTIMIZE__ is predefined macro of C preprocessor, 与常见的 __FILE__, __LINE__
  * 一样，但它属于 GNU C extensions, 而后者是 C 语言定义的标准 macro. Refer:
  *     https://gcc.gnu.org/onlinedocs/cpp/Common-Predefined-Macros.html
  *
- * "__OPTIMIZE__ is defined in all optimizing compilations kernel." Kernel 默认
- * 使用 -O2 编译。
- * 只有声明，没有定义，根据 attribute 描述，是允许的
+ * "__OPTIMIZE__ is defined in all optimizing compilations kernel." Kernel defaults
+ * to -O2.
+ *
+ * 只有声明，没有定义，根据 attribute __error__ 的描述，是允许的。
  */
 #ifdef __OPTIMIZE__
 # define __compiletime_assert(condition, msg, prefix, suffix)		\
@@ -7080,8 +7086,8 @@ Macro __va() analysis:
 # define __compiletime_assert(condition, msg, prefix, suffix) do { } while (0)
 #endif
 
-/* Refer: https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html
- * Tip:
+/* Refer to https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html
+ * Tips:
  *   1. 使用此 attribute 声明的函数，若被调用，则 break build with included message.
  *   2. it is possible to leave the function undefined
  */
@@ -7255,8 +7261,15 @@ Now get back to arch/x86/kernel/idt.c for idt_setup_early_handler:
 
 ```c
 /* Must be page-aligned because the real IDT is used in a fixmap. */
-/* 参考 linker script 中 .bss section 的处理。*/
-gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;
+/* IDT 的内容。参考 linker script 中 .bss section 的处理。*/
+static gate_desc idt_table[IDT_ENTRIES] __page_aligned_bss;
+
+/* IDTR 的值，与 GDTR 格式一样，limit 在前面。
+ * 参考： Intel SDM 3a, Figure 3-11. Pseudo-Descriptor Formats */
+struct desc_ptr idt_descr __ro_after_init = {
+	.size		= IDT_TABLE_SIZE - 1,
+	.address	= (unsigned long) idt_table,
+};
 ...
 
 void __init idt_setup_early_handler(void)
@@ -7275,7 +7288,6 @@ void __init idt_setup_early_handler(void)
 #endif
 	load_idt(&idt_descr);
 }
-
 
 /* Refer to Intel SDM 3a, 6.11 IDT DESCRIPTORS for IDT entry format. */
 static void set_intr_gate(unsigned int n, const void *addr)
@@ -7300,8 +7312,6 @@ static void set_intr_gate(unsigned int n, const void *addr)
 	data.bits.type	= GATE_INTERRUPT;
 	data.bits.p	= 1;
 
-	/* idt_table 定义在 idt.c 文件头部。IDTR(idt_descr) 与 GDTR 格式一样，limit 在前面。
-	 * 参考： Intel SDM 3a, Figure 3-11. Pseudo-Descriptor Formats */
 	idt_setup_from_table(idt_table, &data, 1, false);
 }
 
@@ -7500,19 +7510,33 @@ SYM_INNER_LABEL(native_irq_return_iret, SYM_L_GLOBAL)
 	iretq
 ```
 
+idt_setup_early_handler 之后紧跟着 copy_bootdata(__va(real_mode_data)), 通过 page fault exception, directly mapping the physical memory. 又有一个问题，截至目前，EFLAGS 中的 IF 始终是 cleared 状态，为什么可以处理 page fault exception? 这又是一个基础知识不牢的问题。
+
+Check the definition of IF of EFLAGS in Intel SDM 3a, 2.3 SYSTEM FLAGS AND FIELDS IN THE EFLAGS REGISTER:
+
+>Interrupt enable (bit 9) - Controls the response of the processor to maskable hardware interrupt requests (see also: Section 6.3.2, “Maskable Hardware Interrupts”). The flag is set to respond to maskable hardware interrupts; cleared to inhibit maskable hardware interrupts. The IF flag does not affect the generation of exceptions or nonmaskable interrupts (NMI interrupts).
+
+所以，page fault exception 此时可以执行。
+
 ### start_kernel
 
 鸿蒙处辟原无姓，打破顽空须悟空~
 
-从"此"开始，也可以叫做鸿蒙，所有 sub-system 在此初始化。common sense tell us, people almost can't know all area mentioned in this function, 所以从此开始，可以选择感兴趣的 sub-system 进行分析。但不妨先看一下函数声明：
-```
-asmlinkage __visible void __init start_kernel(void)
+从"此"开始，亦可叫鸿蒙，所有 sub-system 在此初始化。
+
+Common sense tell us, people almost can't know all areas mentioned in this function, they are much more complicated than before. So, 已不适合流水方式的顺序分析, choose whatever one got interested in. But there is still something common worth analysis, like setup_arch().
+
+先看函数声明：
+
+```c
+asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 {
 }
 ```
-这里出现的几个 attribute 值的说明一下： `asmlinkage` 已在 extract_kernel 的分析中解释过；__visible 定义如下:
 
-```
+几个 attribute 分析： `asmlinkage` 已在 extract_kernel 的分析中解释过；__visible 定义如下:
+
+```c
 /* 如注释所说, __has_attribute 是 C-preprocessor 的 operator, 低于特定版本时不支持。
  * 一般 object 默认都 visible out of the current compilation unit, 这样显式使用也是
  * 为了兼容所有 corner case. */
@@ -7523,31 +7547,56 @@ asmlinkage __visible void __init start_kernel(void)
 #endif
 ```
 __init 定义如下:
-```
+```c
 #define __init		__section(.init.text) __cold  __latent_entropy __noinitretpoline
 ```
 cold, 顾名思义，很少被执行到, 显然 start_kernel 只会执行依次一次；使用 modules 的话，__noinitretpoline 定义为空；中间那个暂时忽略。
 
-面对这么庞大的函数，如果没有特定兴趣点，一时还不知如何开始，不妨随意看一下先：
-```
-asmlinkage __visible void __init start_kernel(void)
+
+
+```c
+asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
 
+	/* TBD. */
 	set_task_stack_end_magic(&init_task);
-	/* 有趣的函数，可以搜到它在 start_kernel 之上定义为空，且有 attribute “__weak__”.
-	 * 实际上，此函数只在少数 arch 中有定义，如：arm64, S390. 在 arch/ 目录下 grep 一下
-	 * 可知。x86 arch 没有定义此函数，所以将链接到 __weak__ 的那个。*/
-	smp_setup_processor_id();
-	...
 
-	/* 下面最终调用的 printk, 稍微深挖它的代码会发现也很复杂, to be analysed.
-	 * Tip: with kernel parameter "console="，这是第一条 log. */
+	/* It is defined to null before start_kernel in the same file with attribute
+	 * “__weak__”. Only arm64 & S390 truely have definition(grep under arch/). x86
+	 * doesn't have its definition, so this will linked to "__weak__" one above. */
+	smp_setup_processor_id();
+
+	/* Enabled by CONFIG_DEBUG_OBJECTS, not essential, omit. */
+	debug_objects_early_init();
+	/* TBD. */
+	cgroup_init_early();
+
+	/* For x86, it is just 'cli', which has already been done before. Probably
+	 * start_kernel is common to all arches, in case arch doesn't do it? */
+	local_irq_disable();
+	early_boot_irqs_disabled = true;
+
+	/*
+	 * Interrupts are still disabled. Do necessary setups, then
+	 * enable them.
+	 */
+	/* IIRC, this is useless for x86,  ACPI initialization will do similar work. */
+	boot_cpu_init();
+	/* Available only by CONFIG_HIGHMEM && !WANT_PAGE_VIRTUAL, the latter is
+	 * arch-specific, only defined by few arch, x86 doesn't define it, so this
+	 * function will be the one of highmem.c. TBD.*/
+	page_address_init();
+
+	/* printk(), TBD. */
 	pr_notice("%s", linux_banner);
-	/* 也是 Giant Function, X86 架构相关的 setup, 单独一节分析. 入参 command_line
-	 * 将指向 arch-specific cmd line buffer. boot_command_line 是原始的，入口代码从
-	 * boot_param 将其初始化。这也暗示了 arch 可能会改动自己的 buffer? */
+	early_security_init(); /* inessential. */
+
+	/* Jumbo Function for architecture setup, in a separate memo. command_line will
+	 * point to a arch-specific cmd line buffer. boot_command_line is the original
+	 * commnad buffer, which is initialized from boot_params in copy_bootdata.
+	 * 这也暗示了 arch 可能会改动自己的 buffer? */
 	setup_arch(&command_line);
 
 	/* 这么多 command line buffer, 各有用处，参考定义处 comments.
@@ -7577,2845 +7626,176 @@ asmlinkage __visible void __init start_kernel(void)
 }
 ```
 
-### setup_arch
+#### X86: setup_arch
 
-这是可以和 start_kernel 媲美的巨大函数，虽然他们是调用关系，但在目录层次结构上，暂且让他们同一 level. 暂且随性分析：
+A gigantic function similar to *start_kernel*. The name tells it is initialization of architecture for kernel sub-system who may depends on them. The analysis is in a [separate document](https://github.com/PinoTsao/Memo/blob/master/boot/setup_arch.md).
 
-```
-/*
- * Determine if we were loaded by an EFI loader.  If so, then we have also been
- * passed the efi memmap, systab, etc., so we should use these data structures
- * for initialization.  Note, the efi init code path is determined by the
- * global efi_enabled. This allows the same kernel image to be used on existing
- * systems (with a traditional BIOS) as well as on EFI systems.
- */
-/*
- * setup_arch - architecture-specific boot-time initializations
- *
- * Note: On x86_64, fixmaps are ready for use even before this is called.
- */
-
-void __init setup_arch(char **cmdline_p)
-{
-	/* 被 KASLR 下的 __pa_symbol 迷惑了一会儿，还特意 review 上面 VO fix KASLR address
-	 * 的相关分析，弯弯绕还是很多的= =| 无 KASLR 时容易理解，下文中单独分析 __pa_symbol
-	 * 在 KASLR 下的情况。
-	 * 注意：这里两次出现的 _text 重定位类型都是绝对地址寻址，即 S + A 类型，这个信息在下面
-	 * 的分析中很重要。__bss_stop - _text 是 VO memory image 的 size。
-	 * 第一次使用 memblock 内存管理机制。那些已被占据的 memory 被 reserve 操作记录下
-	 * physical address & size. 后面还有多处 reserve. */
-	memblock_reserve(__pa_symbol(_text),
-		 (unsigned long)__bss_stop - (unsigned long)_text);
-
-	...
-	/* 新概念 get: One Laptop Per Child. Open FirmWare. 可以略过 */
-	olpc_ofw_detect();
-	/* 64-bit mode 下，特地初始化了 #DB 和 #BP 的 handler. 一个小问题: 修改 IDT，需要
-	 * reload IDTR? */
-	idt_setup_early_traps();
-	/* 主要工作：early_identify_cpu() 初始化 boot_cpu_data. 其他见下文简单分析 */
-	early_cpu_init();
-	...
-	/* 新概念 get: https://lwn.net/Articles/412072/ */
-	jump_label_init();
-	/* ioremap concept: CPU 通过 physical address 访问 I/O device, 代码则需要
-	 * virtual address, 通过 paging 翻译出 physical address. 下文详细分析。*/
-	early_ioremap_init();
-	...
-
-	/* global variable: x86_init, defined in arch/x86/kernel/x86_init.c, with
-	 * a set of default functions for setting up standard PC hardware. For
-	 * specific platforms, such as Intel MID, Xen, they will substitute some
-	 * default functions with their specific ones, or complement the default
-	 * ones.
-	 *
-	 * OEM products may also have their specific platform setup. */
-	x86_init.oem.arch_setup();
-
-	/* Resource is managed by struct resource, which is tree-like structure,
-	 * indicating a range of address of I/O ports, physical address. Apparently,
-	 * x86_phys_bits is obtained via cpuid. So the expression is self-documented.*/
-	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
-
-	/* 将 boot_params 中来自 BIOS 的 E820 信息放到 kernel 自己的 e820_table 中，并
-	 * sanitize: 比如 sorting, removing overlap. */
-	e820__memory_setup();
-
-	/* 处理定义在 boot protocol 中的 setup data. (第一次注意到这个概念) 大致浏览可发现，
-	 * setup data 提供了 E820 extension map info, device tree block, 以及 EFI data.
-	 * SETUP_E820_EXT 存在的理由在 e820__memory_setup_extended 的注释中有描述。若有，
-	 * 则 append 到 e820_table 中
-	 *
-	 * 2 个函数: early_memremap & early_memunmap 吸引了我。理解上面 ioremap init
-	 * 函数后，这两个函数的内容就好理解了。这两个函数结合使用的含义是：setup data 中的地址
-	 * 是物理地址，需要 remap 成虚拟地址访问，使用结束则可以 unmap. Remap 时，映射到
-	 * level2_fixmap_pgt 505 号 pmd entry 下。*/
-	parse_setup_data();
-
-	/* Bunch of initialization of global variables, check it out when needed. */
-
-	/* 为何需要 2 个 command line buffer??? boot_command_line 的注释给出一点 hint,
-	 * 它是 kernel common 的 cmd buffer, 入口代码从 boot_param 将其初始化，不可改动。
-	 * Arch-specific 代码会 copy 它到自己的 buffer, *看起来*可改动。 For X86, 这
-	 * 看起来似乎没必要？ grep arch/ 可以发现，有些 arch 就是没有定义 arch-specific
-	 * command line buffer. */
-	strlcpy(command_line, boot_command_line, COMMAND_LINE_SIZE);
-	*cmdline_p = command_line;
-	...
-	/* Later in start_kernel, will be called again. A local static symbol is
-	 * responsible for it to be called once only. 之所以叫 “early”, 可以推测后面
-	 * 仍有 parse 的地方。使用了一点 trick 只 parse 几个 specific param，详见下文 */
-	parse_early_param();
-	...
-
-	/* after early param, so could get panic from serial */
-	/* 不理解上述 comments.
-	 * boot protocol 中记录的 setup data 在 memblock 内存管理机制中也要被记录。 为何
-	 * memblock reserve operation 不放在 parse_setup_data 中，节省 remap/unmap? */
-	memblock_x86_reserve_range_setup_data();
-	...
-
-	/* 上面 parse_setup_data 把 SETUP_E820_EXT 中的额外 E820 信息添到 e820_table.
-	 * 这里再次解析是更新 setup data 所在物理空间对应的 E820 信息，i.e., E820_TYPE_RAM
-	 * --> E820_TYPE_RESERVED_KERN, e820_table_kexec & e820_table 中都更新。 */
-	e820__reserve_setup_data();
-
-	/* 至今，e820 的处理包括：将 boot_param 中来自 BIOS 的信息 cp 到 kernel 空间；
-	 * 将 setup data 中 extension E820 信息(若有)加进来；解析 "mem=", 超过用户设置的
-	 * range 且类型是 RAM 的 E820 信息要删除；更新 setup data 空间在 E820 中的 type
-	 * 信息；
-	 * 这里，若需要，则再次 sanitize/update e820_table: sorting, overlap shooting. */
-	e820__finish_early_params();
-
-	/* Refer to System Management BIOS (SMBIOS) Specification at
-	 *     https://www.dmtf.org/standards/smbios
-	 *
-	 * SMBIOS 数据分 2 部分： Entry Point Structure(EPS) & Structure Table, 前者
-	 * 等于 header. 以非 EFI 环境简单描述函数内容。背景: 32-bit & 64-bit SMBIOS 都将
-	 * EPS 放在地址 [0xF0000, 0xFFFFF] 中, 且 16-byte 对齐。
-	 * 搜索该范围找到 EPS, remap 得到虚拟地址，访问其数据内容。Structure Table 中的内容
-	 * 即原来的 Desktop Management Interface(DMI) 数据。
-	 * (DMI: 2005 年以前的 spec，后来被整合入 SMBIOS)
-	 * 从 EPS 中得到 Structure Table 的物理地址(dmi_base)和长度(dmi_len), 进一步解析，
-	 * 依然需要 remap 得到虚拟地址访问其数据，因为 SMBIOS 中的地址都是物理地址。
-	 *
-	 * SMBIOS structure 格式： 4 byte long 的 structure header(1 byte type, 1 byte
-	 * length, 2 bytes handle, handle 是这个 structure 的 ID), structure 自身, 以及
-	 * 此 structure 中所用的 stringS, 附在 structure 后, 每个 string 以 NULL 结束,
-	 * 最后一个 string 有一个额外的 NULL byte. structure 中用 index 索引用到的 string,
-	 * 0 表示不引用 string, 1 表示第一个 string.
-	 *
-	 * dmi_decode 解析它关心的 structure type: 主要初始化 dmi_ident[],其中的地址直接
-	 * 来自 structure 的 string set, dmi_ident[] 中的部分信息形成 dmi_system_id.
-	 * 解析 DMI 得到 dmi_system_id，会在 console 输出，example(手动折叠):
-	 *   [    0.000000] SMBIOS 2.8 present.
-	 *   [    0.000000] DMI: QEMU Standard PC (i440FX + PIIX, 1996), BIOS \
-	 *                  rel-1.12.1-0-ga5cab58e9a3f-prebuilt.qemu.org 04/01/2014
-	 *
- 	 * 有多处 brk space allocation, brk 的详细介绍在下文。取出的 dmi 信息可能主要为了
- 	 * 构造 sysfs 下的 object?(dmi_init) */
-	dmi_setup();
-
-	/*
-	 * VMware detection requires dmi to be available, so this
-	 * needs to be done after dmi_setup(), for the boot CPU.
-	 */
-	/* 开始看到 some more interesting things, 下文详细分析 */
-	init_hypervisor_platform();
-	/* 时间相关，也很重要，TBD. */
-	tsc_early_init();
-	/* callback function name also is: probe_roms. Detailed analysis below */
-	x86_init.resources.probe_roms();
-	...
-
-	/* 检查 kernel 自身占据的地址空间在 E820 中是否是类型 E820_TYPE_RAM, 否则手动添加
-	 * 自己的地址范围到 e820_table 中 with E820_TYPE_RAM. */
-	e820_add_kernel_range();
-
-	/* trim is also a kind of sanitize. 函数内 comments 已解释的很清楚。涉及 memory
-	 * map 信息，最佳参考：https://wiki.osdev.org/Memory_Map_(x86) */
-	trim_bios_range();
-
-	/* https://en.wikipedia.org/wiki/Graphics_address_remapping_table. TBD */
-	early_gart_iommu_check();
-
-	/*
-	 * partially used pages are not usable - thus
-	 * we are rounding upwards:
-	 */
-	/* X86 架构将 memory 划分为 4Kb 的 page frame 进行管理，pfn = page frame number.
-	 * NOTE: Generally speaking, memory 并不单指 RAM. 但此处上下文提到 pfn 时，都是指
-	 * RAM 这种 memory 的 pfn.
-	 *
-	 * 扩展知识：CPU 的 max pfn 自然和最大的物理地址有关，即 physical-address width of
-	 * processor. Quick Knowledge:
-	 *   - X86_32: 32-bit max
-	 *   - X86_32 + PAE: 36-bit max
-	 *   - X86_64: 46-bit max
-	 *   - X86_64 + 5-level paging: 52-bit max
-	 *
-	 * 在 kernel 的 E820 数据中找到 E820_TYPE_RAM 类型的最大 pfn, 也即:
-	 *     max_pfn = kernel 可用 RAM 空间的最大 pfn.
-	 * 表示作为可用 RAM 物理空间的上边界。注意：至此，kernel's E820 数据包括 NUMA node.
-	 */
-	max_pfn = e820__end_of_ram_pfn();
-
-	/* update e820 for memory not covered by WB MTRRs */
-	/* 上述 & 下面函数中多处 comments 都在透露这个意思： sane BIOS 应将 E820_TYPE_RAM
-	 * 空间的 memory type 在 MTRR 中设置为 Write-Back; 否则，将 E820_TYPE_RAM 空间中
-	 * 非 WB 的 range 剔除, 若是如此，max_pfn 自然需要重新计算。*/
-	mtrr_bp_init();
-	if (mtrr_trim_uncached_memory(max_pfn))
-		max_pfn = e820__end_of_ram_pfn();
-
-	/* 哦？刚刚得到的 max_pfn 只是 possible? */
-	max_possible_pfn = max_pfn;
-	...
-
-	/* Define random base addresses for memory sections after max_pfn is
-	 * defined and before each memory section base is used. */
-	/* 见下文 KASLR 一节。*/
-	kernel_randomize_memory();
-	...
-
-#ifdef CONFIG_X86_32
-	...
-#else
-	/* 通过检查 boot cpu feature & 读取 IA32_APIC_BASE MSR 确认 CPU 是否支持 x2apic.
-	 * 记在 x2apic_mode 中，在 ACPI/APIC 初始化时等地方会用到。*/
-	check_x2apic();
-
-	/* 看起来上面 mtrr 的处理把 Yinghai Lu 也要搞崩溃了:D */
-	/* How many end-of-memory variables you have, grandma! */
-	/* need this before calling reserve_initrd */
-	/* if() 检查 max_pfn 是否 > 4G. 大于 4G 时，max_low_pfn 表示 4G 以下空间中类型是
-	 * E820_TYPE_RAM range 的最大 pfn; or else, 说明 kernel 可用 RAM 空间不超过 4G。*/
-	if (max_pfn > (1UL<<(32 - PAGE_SHIFT)))
-		max_low_pfn = e820__end_of_low_ram_pfn();
-	else
-		max_low_pfn = max_pfn;
-	/* self-documented. */
-	high_memory = (void *)__va(max_pfn * PAGE_SIZE - 1) + 1;
-#endif
-
-
-	/* Find and reserve possible boot-time SMP configuration. */
-	/* 大众情况下是：default_find_smp_config(). 为兼容 Intel MP Spec, a outdated
-	 * one, latest revision is 1.4 of 1997. 不重要，略过。 */
-	find_smp_config();
-
-	/* iSCSI, skip. */
-	reserve_ibft_region();
-
-	/* 两个函数的详细分析在下文 */
-	early_alloc_pgt_buf();
-	/* Need to conclude brk, before e820__memblock_setup(), it could use
-	 * memblock_find_in_range, could overlap with brk area. */
-	reserve_brk();
-
-	/* 在 head_64.S 的 comments 第一次看到，下面详细分析。*/
-	cleanup_highmap();
-
-    /* 分配内存限制在 1M 内， WHY??? */
-	memblock_set_current_limit(ISA_END_ADDRESS);
-	/* memblock 的 general introduction 参考： head comments of memblock.c. 看过后
-	 * 才对 setup_arch 中大量出现 memblock 操作开始理解。
-	 * e820 info 中的可用空间： E820_TYPE_RAM & E820_TYPE_RESERVED_KERN, 也要交给
-	 * memblock 管理。memblock_add_range 时会做 merge if necessary； memblock 管理
-	 * 的 range addr & size 都要对齐到 PAGE_SIZE. */
-	e820__memblock_setup();
-
-    /* 熟悉的面孔，背景知识参考上文：find_trampoline_placement() 的分析。将 BIOS region
-     * 加到 memblock.reserved 中 */
-	reserve_bios_regions();
-
-    if (efi_enabled(EFI_MEMMAP)) {
-        /* Skip efi related code for now... */
-    }
-
-	/* preallocate 4k for mptable mpc */
-	/* mpc = multi-processor configuration. mptable 被 BIOS 放在某个地址，这里通过
-	 * memblock 预分配 4k 空间，后续将 mptable 挪过去。 Purpose? 上面设置了 limit 为 1M,
-	 * 这里分配的空间应在 1M 内，待确认。*/
-	e820__memblock_alloc_reserved_mpc_new();
-
-#ifdef CONFIG_X86_CHECK_BIOS_CORRUPTION
-    /* 函数中进一步依赖 CONFIG_X86_BOOTPARAM_MEMORY_CORRUPTION_CHECK, 在我的 Fedora
-     * 30 上没有看到配置，故没有看到相应 dmesg 输出*/
-	setup_bios_corruption_check();
-#endif
-
-    /* 又为我打开了一个新世界之门：real mode trampoline, source code at arch/x86/realmode
-     * (也称作 x86 trampoline), 作用是在 SMP 系统中，BSP 唤醒其他 AP，使他们进入正常工作
-     * 模式。这里有一个 brief 的介绍：http://lastweek.io/lego/kernel/trampoline/.
-     * Simply speaking: 为 real mode 的 blob 在 real mode 的地址空间(1M 内)分配空间，
-     * 以把它放进来。这里先把分配的空间 memblock_reserve. But for term "x86
-     * trampoline", TO BE Analysed! */
-	reserve_real_mode();
-
-    /* 为特定平台做 workaround: 某些 range 不为被 kernel 使用，将它们 memblock_reserve.
-     * 目前只有 Intel SandyBridge. Skip for now. */
-	trim_platform_memory_ranges();
-	/* 被称为 low memory 的 first 64k, 也被 memblock_reserve 掉 */
-	trim_low_memory_range();
-
-    /* 下文详细分析 */
-	init_mem_mapping();
-
-	/* idt 在 start_kernel 之前已初始化(idt_setup_early_handler)，实际只初始化了
-	 * page fault 的 handler. 这里替换为一个新的 page fault handler 为什么? */
-	idt_setup_early_pf();
-
-	/*
-	 * Update mmu_cr4_features (and, indirectly, trampoline_cr4_features)
-	 * with the current CR4 value.  This may not be necessary, but
-	 * auditing all the early-boot CR4 manipulation would be needed to
-	 * rule it out.
-	 *
-	 * Mask off features that don't work outside long mode (just
-	 * PCIDE for now).
-	 * 不明白，get back to it later. mmu_cr4_features 在 init_mem_mapping ->
-	 * probe_page_size_mask 中有赋值操作。*/
-	mmu_cr4_features = __read_cr4() & ~X86_CR4_PCIDE;
-
-	/* 上次 set limit 为 1M, 这次设为 max physical address, 用意? */
-	memblock_set_current_limit(get_max_mapped());
-
-	/* Allocate bigger log buffer. 略过 */
-	setup_log_buf(1);
-
-	if (efi_enabled(EFI_BOOT)) {
-		/* SKIP... */
-	}
-
-	/* 详细分析在下文。*/
-	reserve_initrd();
-
-	/* Documentation/admin-guide/acpi/initrd_table_override.rst 介绍了此 feature.
-	 * For me, 打开了新的大门：initramfs, cpio. 理解函数 find_cpio_data 的前提： 理解
-	 * cpio archive format via `man 5 cpio`.
-	 * Tip: 此函数在 acpi_boot_table_init 初始化之前也就 make sense 了。 */
-	acpi_table_upgrade();
-
-	/* 特定 x86 platform 的初始化。                         Quick knowledge:
-	 * ScaleMP developed the versatile SMP (vSMP) architecture, a unique approach
-	 * that enables server vendors to create industry-standard, high-end x86-based
-	 * symmetric multiprocessor (SMP) systems.
-	 * "ScaleMP", a X86 server vendor，可用国内品牌“浪潮”等价理解。  */
-	vsmp_init();
-
-	/* TBD */
-	io_delay_init();
-
-	/* 通过 DMI 确认 kernel 当前是否运行在 Apple 的硬件上 */
-	early_platform_quirks();
-
-	/* Parse the ACPI tables for possible boot-time SMP configuration. */
-	/* 有数个名字带 "acpi", "init" 的函数，初看会困惑，待分析后来解惑。
-	/* 解惑: Booting 阶段的 acpi table 初始化。函数名字面意思可理解为：acpi 在 boot
-	 * 阶段的 table 初始化 */
-	acpi_boot_table_init();
-
-	/* 函数名字与其他同类函数不匹配，acpi_boot_early_init 可能比较合适。因为下方还有
-	 * acpi_boot_init. 函数字面意思可理解为： acpi 在 boot 阶段的预(early)初始化。*/
-	early_acpi_boot_init();
-
-	/* NUMA, 详见下文。*/
-	initmem_init();
-	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
-
-	/*
-	 * Reserve memory for crash kernel after SRAT is parsed so that it
-	 * won't consume hotpluggable memory.
-	 */
-	reserve_crashkernel();
-
-	memblock_find_dma_reserve();
-
-	if (!early_xdbc_setup_hardware())
-		early_xdbc_register_console();
-
-	/* Under X86_64, it is paging_init() in init_64.c */
-	x86_init.paging.pagetable_init();
-
-	kasan_init();
-
-	/* Sync back kernel address range.
-	 *
-	 * FIXME: Can the later sync in setup_cpu_entry_areas() replace
-	 * this call?	X86_32 限定，可略过。 */
-	sync_initial_page_table();
-
-	/* Intel's Trusted Execution Technology(TXT), Spec 篇幅不小，但此处初始化比较
-	 * 简单: TXT 相关数据通过 boot_params.tboot_addr 传给 kernel, kernel 将其 fixmap
-	 * 到预留的 FIX_TBOOT_BASE, then, 检查数据。*/
-	tboot_probe();
-
-	/* fixmap 预留给 vsyscall 的虚拟地址空间也 map 起来：__vsyscall_page */
-	map_vsyscall();
-
-	early_quirks();
-
-	/* Read APIC and some other early information from ACPI tables. 下文详细分析。*/
-	acpi_boot_init();
-
-	/* Intel's Simple Firmware Interface, as a lightweight method for firmware
-	 * to export static tables to OS. 用于 Intel MID's Moorestown platform. */
-	sfi_init();
-
-	/* Open Firmware 支持 device tree. OF 也是定义 firmware interface 的标准，最初
-	 * 用于 non-x86 platform. 看起来现在也可以用在 x86 上了。 NOT interested. */
-	x86_dtb_init();
-
-	/* get boot-time SMP configuration. 之前已 find 过，若有 MPTable, 则 remap
-	 * 访问 table(细节略). 使用结束则 unmap. */
-	get_smp_config();
-
-	/* Systems w/o ACPI and mptables might not have it mapped the local
-	 * APIC yet, but prefill_possible_map() might need to access it. */
-	/* 看起来只是确认拿到 APIC 地址，并确认 BSP's APIC ID & version. 拿到 APIC 的地址
-	 * 就可以 remap 到 fixmap 虚拟地址空间访问。
-	 * Tip Again: APIC 地址最终是记录在 mp_lapic_addr 中； APIC ID 是 firmware
-	 * report, 可能是不连续的！一个有趣的 macro: MAX_LOCAL_APIC, 实际指的是 ID, 不是
-	 * 数量。关于它的讨论：
-	 * http://lkml.iu.edu/hypermail/linux/kernel/1509.3/01126.html */
-	init_apic_mappings();
-
-	/* 其中的逻辑也是看起来很复杂。不支持 CPU hotplug 时，possible CPU 就是 ACPI MADT
-	 * 中所有 enabled CPU; 支持 CPU hotplug 时，那些 hot-pluggable CPU 的 slot 在
-	 * ACPI 中已被 mark as disabled CPU, 这时所有的 slot 数量表示 possible CPU. 再
-	 * 加上 kernel 自身对 CPU 数的限制(CONFIG & kernel parameter), 经过复杂逻辑，才
-	 * 得到真正 possible CPU, set into cpu mask. 待详细分析。*/
-	prefill_possible_map();
-
-	/* 涉及 NUMA, percpu, 待需要时再来分析。*/
-	init_cpu_to_node();
-
-	/* 科普 again: I/O APIC 有 2 - 3 个 "memory mapped" 32-bit register, 以及一堆
-	 * memory indexed register. 前者是 index(仅使用8-bit表示 index), data, EOI(仅在
-	 * level-trigger 模式下生效). 后者是 I/O APIC ID & version register, 以及 24 个
-	 * interrupt redirection register. I/O APIC 位于南桥 chipset.
-	 * 在 acpi_process_madt -..-> mp_register_ioapic 中已解析 I/O APIC entry 并
-	 * fixmap 其物理地址，为何这里 memblock 分配一个 page, 重新 fixmap??? 待分析～ */
-	io_apic_init_mappings();
-
-	x86_init.hyper.guest_late_init();
-
-	/* Resource tree 相关，待分析。*/
-	e820__reserve_resources();
-	e820__register_nosave_regions(max_pfn);
-
-	x86_init.resources.reserve_resources();
-
-	/* Background: 分配给 main memory(RAM) 的 CPU 地址空间并不是连续的。
-	 * Non-RAM 的 range 被称为 memory hole 或者这里的 gap. 在低 4G 空间中找一块 4M
-	 * 的 gap, 用作 PCI MMIO, 记在 pci_mem_start 中。 */
-	e820__setup_pci_gap();
-
-#ifdef CONFIG_VT
-	...
-#endif
-
-	/* default to default_banner() in paravirt.c. On my PC, it prints:
-	 *   "Booting paravirtualized kernel on bare hardware"
-	 * paravirt, an interesting topic to be learned. */
-	x86_init.oem.banner();
-
-	/* Only make sense to devicetree configured system. Skip. */
-	x86_init.timers.wallclock_init();
-
-	/* Refer Intel SDM CHAPTER 15 MACHINE-CHECK ARCHITECTURE. TBD. */
-	mcheck_init();
-
-	/* 看起来是 1st 时间相关的初始化。*/
-	register_refined_jiffies(CLOCK_TICK_RATE);
-	...
-}
-```
-
-终于可以回到 start_kernel 了，吁～.
-
-
--------- __pa_symbol --------
-```
-/* w/o KASLR 时，代码逻辑很容易理解；对 w/ KASLR 的情况详细分析一下: 将 __pa_symbol
- * 涉及的 macro 全部展开 */
-
-/* arch/x86/include/asm/page.h */
-#define __pa_symbol(x) \
-	__phys_addr_symbol(__phys_reloc_hide((unsigned long)(x)))
-
-/* arch/x86/include/asm/page_64.h */
-#define __phys_reloc_hide(x)	(x)
-
-#define __phys_addr_symbol(x) \
-	((unsigned long)(x) - __START_KERNEL_map + phys_base)
-
-/* readelf -r setup.o 可知 _text 是绝对地址寻址，so, KASLR 时，ZO 会加上 v_delta.
- * __phys_addr_symbol 完全展开是：
- *
- *   VMA + v_delta - __START_KERNEL_map + p_delta - v_delta
- * = VMA - __START_KERNEL_map + p_delta
- * = LMA + p_delta
- * = 符号的实际物理地址
- *
- * 这里的窍门是:  VMA - __START_KERNEL_map = LMA, 这一点没有快速的认识到 = =|
- */
-```
--------- early_cpu_init ---------
-
-符号 __x86_cpu_dev_start 和 __x86_cpu_dev_end 定义在 linker script 中，用来 mark 一个特殊 section 的起始和结束地址。这个 section 定义在
-
-```
-#define cpu_dev_register(cpu_devX) \
-	static const struct cpu_dev *const __cpu_dev_##cpu_devX __used \
-	__attribute__((__section__(".x86_cpu_dev.init"))) = \
-	&cpu_devX;
-```
-搜索发现，有多处使用此 macro, 基于 X86 指令集的不同 vendor 的不同 CPU 有一些自己的特殊数据和方法，以 struct cpu_dev 表示。上面的 macro 定义比较 smart, 只定义了 pointer, 指向 struct cpu_dev. 在 early_cpu_init 中则很容易访问相应的 struct cpu_dev.
-
-本函数的作用是初始化 boot_cpu_data, 尤其在 early_identify_cpu() 中初始化 boot_cpu_data.x86_capability[]:
-```
-static void __init early_identify_cpu(struct cpuinfo_x86 *c)
-{
-#ifdef CONFIG_X86_64
-	c->x86_clflush_size = 64;
-	c->x86_phys_bits = 36; /* 奇怪，36 是 PAE 下, 也是 x86_32*/
-	c->x86_virt_bits = 48;
-#else
-	...
-#endif
-
-	/* level = cpuid 术语中的 leaf number. 本函数大量使用 cpuid 指令，参考 Intel
-	 * SDM 2 中关于该指令的介绍。*/
-	c->extended_cpuid_level = 0;
-
-	/* X86_64 下直接返回 1, 表示 64-bit CPU 都支持 cpuid 指令。*/
-	if (!have_cpuid_p())
-		identify_cpu_without_cpuid(c);
-
-	/* cpuid 指令的实现涉及 paravirt 机制，interesting, TBD. 目前的了解：某些指令及
-	 * 其他操作难以虚拟化，所以使用 paravirt 机制进行虚拟化。paravirt.c 中定义了需要
-	 * paravirt 的操作： struct paravirt_patch_template pv_ops. 各虚拟化平台自行
-	 * 替换其中的 hook funtion, 比如 Xen, Vmware. 还定义了 struct pv_info pv_info.*/
-
-	/* x86_capability 的注释经常出现 pattern: "Intel-defined", "AMD-defined", 啥
-	 * 意思? Facts:
-	 *   1. feature bit 的定义可能源自 cpuid leaf, 也可能是 synthesized: 见函数
-	 *      init_speculation_control();
-	 *   2. 同一 CPUID leaf number, 不同 vendor 的返回值基本不可能完全相同；
-	 *   3. 同一 feature bit, 不同 vendor 可能将其定义在不同 CPUID leaf number 中.
-	 *   4. 更复杂情况暂未分析...
-	 * 当 whole register value 都是 feature bit 时，代码定义 word(x86_capability)
-	 * 总要是以一个 vendor 的定义为模板(因为不同 vendor 的值不同)。后面代码需要 check 某
-	 * feature 时, 从该 word 中检查，若没有，说明该 current cpu 不支持，或该 feature
-	 * 只在其他 vendor 中定义, 则走不同的 code branch 处理: mtrr_bp_init() 是一个很好
-	 * 的例子。
-	 * 详细 feature bit 参考: arch/x86/include/asm/cpufeatures.h
-	 *
-	 * Some feature bits 源于 cpuid leaf 的 whole register value; the other bits
-	 * 散落在不同的 cpuid leaf 中，将 scattered bits 集中放在一个 word 中，则该 word
-	 * 被称作 "Linux-defined bit" */
-
-	/* cyrix could have cpuid enabled via c_identify()*/
-	if (have_cpuid_p()) {
-		/* CPUID.00H & CPUID.01H */
-		cpu_detect(c);
-
-		/* 将 CPUID.00H 拿到的 Vendor Identification String，与代码定义的 struct
-		 * cpu_dev.c_ident 比对(某 cpu 竟然提供 2 个 id string)，so, kernel 将知道
-		 * 自己运行在什么 struct cpu_dev 上，保存在变量 this_cpu. */
-		get_cpu_vendor(c);
-
-		/* 获取 cpu capability, 即 CPU feature, 保存在 boot_cpu_data.x86_capability[]
-		 * 中, 后面会经常看到检查是否支持某 feature 的操作，比如 boot_cpu_has(bit).
-		 *
-		 * 人工数一下发现：有 13(共 NCAPINTS) 个 feature-bit words 来自 cpuid 返回的
-		 * 完整 register value; 4 个 Linux-defined feature-bit words 源自 scattered
-		 * bits of different cpuid 返回值及自定义 bit, 所谓"自定义"：若 cpuid 返回值中
-		 * 某 register bit set, 则 set 相应的 Linux-defined feature bit.
-		 * 唯独 2(CPUID_8086_0001_EDX) 号 feature bits word 来自小众 vendor: transmeta
-		 *
-		 * 函数中：重复了 CPUID.01H; 使用了 sub-leaf via cpuid_count(); involve gcc
-		 * builtin function: __builtin_constant_p(exp); 使用了值得分析(在下文)的
-		 * cpu_has(); 根据 feature bit 设置其他 boot_cpu_data 中相应 field. NOTE：
-		 * 可 force set/clear certain bit via cpu_caps_set[] & cpu_caps_cleared[].
-		 * 下面很快看到 force set/clear 的例子。*/
-		get_cpu_cap(c);
-		get_cpu_address_sizes(c);
-		setup_force_cpu_cap(X86_FEATURE_CPUID);
-
-		/* For Intel: early_init_intel(). Fine-tune boot_cpu_data for Intel. */
-		if (this_cpu->c_early_init)
-			this_cpu->c_early_init(c);
-
-		c->cpu_index = 0;
-		/* 看起来比较简单，为 broken virtualization software 而存在。*/
-		filter_cpuid_features(c, false);
-
-		/* 不知道有啥特殊事情不能在 c_early_init 中一并做完。只有 AMD 和其变种 HYGON 有。
-		 * 虽然叫 bootstrap process init, 但看起来 c_early_init 也只在这里使用一次而已。*/
-		if (this_cpu->c_bsp_init)
-			this_cpu->c_bsp_init(c);
-	} else {
-		setup_clear_cpu_cap(X86_FEATURE_CPUID);
-	}
-
-	setup_force_cpu_cap(X86_FEATURE_ALWAYS);
-
-	/* Background: cpu bug, 近期较有名的如 "meltdown", "spectre", etc.
-	 * 粗看分析：内置白名单数据 cpu_vuln_whitelist, 目前只通过比对 cpu vendor, family,
-	 * model, 确认 current cpu 是否在 whitelist. 对 cpu bug totally ignorant, 仅从
-	 * 代码逻辑看：所有 cpu bug 本质上都是 SPECULATION, 所以，如果 whitelist 定义某 cpu
-	 * model 是 NO_SPECULATION, 则无需 set any bug bit; SPECTRE 看起来在所有 cpu 都
-	 * 存在；其他 cpu bug 还需 MSR_IA32_ARCH_CAPABILITIES 的值配合确认。*/
-	cpu_set_bug_bits(c);
-	/* 分析完上述代码后，其余代码则变得容易理解了，省略 */
-	...
-}
-
-/* GCC builtin function, 参考其文档；REQUIRED_MASK_BIT_SET 中 involve 了一个 tricky
- * macro: BUILD_BUG_ON_ZERO, 最佳参考：
- *   https://stackoverflow.com/questions/9229601/what-is-in-c-code
- *
- * (For me)Keyword behind the trick:
- * anonymous bit-field: An unnamed bit-field structure member is useful for
- *                      padding to conform to externally imposed layouts.
-
- * REQUIRED_MASK_BIT_SET 中重复了 BUILD_BUG_ON_ZERO(NCAPINTS != 19)，在与社区的交流
- * 中理解了原因，且促成了 commit cbb1133b563a63. 但 IMHO, 我还是认为我的版本更详尽，对
- * non-native speaker 更友好: https://lkml.org/lkml/2019/8/28/60 */
-#define cpu_has(c, bit)							\
-	(__builtin_constant_p(bit) && REQUIRED_MASK_BIT_SET(bit) ? 1 :	\
-	 test_cpu_cap(c, bit))
-```
-
--------- early_ioremap_init --------
-
-fixmap 的设计有一些 tricky，需要先有一个 general idea, 才容易理解下面的代码。我们以 4-level paging 为例进行描述，即假设 PAGE_SIZE 是 4k, 1 个 PMD entry 映射 2M 空间。
-
-fixmap, 顾名思义，部分虚拟地址空间用于特定用途的mapping. 既然是 **fix**, 那么在编译时就可以确定这部分地址，或者说可以 hardcode。用于 fixmap 的初始空间不超过 4M，但初始时固定给他分配 4M, 即 2 个 PMD 的 mapping range, 参考 FIXMAP_PMD_NUM 的定义; 从 early page table 的构建也可以看出这一点：level2_fixmap_pgt 和 level1_fixmap_pgt 处的代码。fixmap 的空间范围由 [FIXADDR_START - FIXADDR_TOP + PAGE_SIZE] 表示，这段空间以 PAGE_SIZE 为单位划分，使用 index number 索引 page. index 定义在 enum fixed_addresses 中。重点是，使用 index 索引 fixmap 空间时，是**逆向**的, 也就是说 index 0 索引的地址是 FIXADDR_TOP, 而 max index 索引 FIXADDR_START. 从 FIXMAP_PMD_TOP 定义的 comment 可以看出**逆向**这一点: downwards.
-
-不同情况下，enum fixed_addresses 中的 index 数不同，也即需要的 fixmap 空间 size 不同，所以 FIXADDR_START 的值根据它的定义计算而来。
-
-With the general idea, 来看代码:
-```
-static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
-...
-
-void __init early_ioremap_init(void)
-{
-	pmd_t *pmd;
-
-	/* 这里引出核心设计。需要先阅读下文 fix_to_virt & 其他的详细分析。
-	 * 看完了下面的分析，也就可以理解 BUILD_BUG_ON 中的 condition 不可以为 TRUE. */
-#ifdef CONFIG_X86_64
-	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
-#else
-	...
-#endif
-	/* 完全理解第一行代码后，此函数的内容就容易理解了。FIX_BTMAP_BEGIN 到 FIX_BTMAP_END
-	 * 中的所有 pages 又被划分为 slot per 64 pages. 将 slot address 记在 slot_virt[]
-	 * 中，现在尚不知用途，let's wait to see. */
-	early_ioremap_setup();
-
-	/* 找到 FIX_BTMAP_BEGIN 对应的 virtual address, 再找到对应的 pmd entry. */
-	pmd = early_ioremap_pmd(fix_to_virt(FIX_BTMAP_BEGIN));
-	/* bm_pte 是一个 4k size 的 page table. 刚找到的 pmd entry *pmd* 将指向它 */
-	memset(bm_pte, 0, sizeof(bm_pte));
-	pmd_populate_kernel(&init_mm, pmd, bm_pte);
-
-	/* Tips: head_64.S 中构建 early page table 时，已对 fixmap 空间作了部分初始化，见:
-	 * level2_fixmap_pgt 处代码，那里的代码初始化了 506, 507 两个 pmd entry. 以正常
-	 * 情况(w/ CONFIG_X86_VSYSCALL_EMULATION)为例： 507 号 pmd entry 用于 vsyscall
-	 * emulation mapping; 506 号 pmd entry 用于 [FIX_DBGP_BASE - FIX_BTMAP_END)
-	 * 的 mapping.
-	 * 而地址 [FIX_BTMAP_END - FIX_BTMAP_BEGIN] 没有在 head_64 中初始化，显然，它需要
-	 * 505 号 pmd entry, 上面的代码就是相应的页表初始化。*/
-
-	/*
-	 * The boot-ioremap range spans multiple pmds, for which
-	 * we are not prepared:
-	 */
-	/* 宏 __FIXADDR_TOP 仅在 CONFIG_X86_32 时有效，它的存在仅仅是因为 BUILD_BUG_ON 中
-	 * 需要它的值做 if 判断。变量 __FIXADDR_TOP 定义在别的文件中，仅编译当前文件时无法
-	 * 知道该变量的值，链接时才能知道。而 attribute __error__() 的使用，需要在编译时知道
-	 * if(__FIXADDR_TOP) 中的值，所以这里定义的宏，与它同名变量的值一样。
-	 * 另外，这也暗示了一个 tip: 同名的 variable 和 macro, 编译时，优先使用 macro.
-	 * 下方的 demo 程序模仿了 CONFIG_X86_32 环境，可用于验证测试上述结论。
-	 *
-	 * FIX_BTMAP_BEGIN 和 FIX_BTMAP_END 索引的虚拟地址必须在同一个 PMD entry 中.
-	 * 详细分析在 FIX_BTMAP_BEGIN 的定义处，共 3 种情况。 */
-#define __FIXADDR_TOP (-PAGE_SIZE)
-	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
-		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
-#undef __FIXADDR_TOP
-
-	/* 如果 FIX_BTMAP_BEGIN 和 FIX_BTMAP_END 不在同一个 PMD 中，就一堆 printk.
-	 * 上面已有 BUILD_BUG_ON 作 enforcement, 这里需要吗? 还以为可以发 patch 删掉，研究
-	 * 了一大圈，发现并不是完全没有意义，因为 BUILD_BUG_ON 仅是使用 GCC 的 attribute
-	 * __error__, 而现在 kernel 还要支持 clang, clang 中并没有这个功能，即它在 clang
-	 * 下没用，这时如果发生了这个错误，下面的 printk 可以提供一些有用信息 */
-	if (pmd != early_ioremap_pmd(fix_to_virt(FIX_BTMAP_END))) {
-		WARN_ON(1);
-		/* 一堆 printk，略过 */
-	}
-}
-
-/* As general idea said, 逆向的映射, index 0 => FIXADDR_TOP */
-#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
-
-/*
- * 'index to address' translation. If anyone tries to use the idx
- * directly without translation, we catch the bug with a NULL-deference
- * kernel oops. Illegal ranges of incoming indices are caught too.
- */
-static __always_inline unsigned long fix_to_virt(const unsigned int idx)
-{
-	/* 核心内容都在 __end_of_fixed_addresses 所属的 enum 中。需要先 理解 enum 的定义 */
-	/* 看完 enum 定义后，自然 index 不能超过定义的 max value. */
-	BUILD_BUG_ON(idx >= __end_of_fixed_addresses);
-	return __fix_to_virt(idx);
-}
-
-/* enumeration definition 被 numerous #ifdef 包裹，看起来费劲，so, appropriately
- * simplified code would help analyzing & understanding its core design.
- *
- * 配置 CONFIG_X86_VSYSCALL_EMULATION 时，表明部分 fixmap 地址空间用于 vsyscall.
- * 目前不理解 vsyscall 不影响对本段代码的理解。需要先看下文 FIXADDR_TOP, VSYSCALL_ADDR
- * 的分析。      计算可知, VSYSCALL_PAGE = 511.
- *
- * (看完下面其他代码分析后，再来看下面这段的总结)
- * 可以看出，w/ CONFIG_X86_VSYSCALL_EMULATION 时，2 个 PMD entry(2M) 中，后者(高地址)
- * 用于 vsyscall 映射，前者(低地址)作其他用途；w/o CONFIG_X86_VSYSCALL_EMULATION 时，
- * 后者(高地址)直接作其他用途。*/
-enum fixed_addresses {
-	...
-#ifdef CONFIG_X86_VSYSCALL_EMULATION
-	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
-#endif
-
-	/* 一般情况下，CONFIG_X86_VSYSCALL_EMULATION 默认 y, 所以 FIX_DBGP_BASE = 512,
-	 * 指向 PMD entry(2M) 中的最末 page. */
-	FIX_DBGP_BASE,
-	FIX_EARLYCON_MEM_BASE,
-	...
-	/* 看到 APIC, 开始悟到一些： APIC 有很多寄存器 */
-#ifdef CONFIG_X86_LOCAL_APIC
-	FIX_APIC_BASE,	/* local (CPU) APIC) -- required for SMP or not */
-#endif
-
-#ifdef CONFIG_X86_IO_APIC
-	FIX_IO_APIC_BASE_0,
-	FIX_IO_APIC_BASE_END = FIX_IO_APIC_BASE_0 + MAX_IO_APICS - 1,
-#endif
-
-	...
-
-#ifdef CONFIG_ACPI_APEI_GHES
-	/* Used for GHES mapping from assorted contexts */
-	FIX_APEI_GHES_IRQ,
-	FIX_APEI_GHES_NMI,
-#endif
-
-	__end_of_permanent_fixed_addresses,
-
-	/*
-	 * 512 temporary boot-time mappings, used by early_ioremap(),
-	 * before ioremap() is functional.
-	 * (为什么是 a single pgd? WHY not pmd?)
-	 * If necessary we round it up to the next 512 pages boundary so
-	 * that we can have a single pgd entry and a single pte table:
-	 */
-	 /* 下面这个巨长的 expression, 可能只有数学小王子能轻松看懂，笔者只能简化分析。
-	  * PTRS_PER_PTE = 1024 only in CONFIG_X86_32 w/o PAE, 其他情况下都 = 512.
-	  * 条件：
-	  *    x ^ (x + 0x1FF)
-	  *	   &
-	  *	   0xfffffc00(PTRS_PER_PTE=1024) 或 0xfffffe00(PTRS_PER_PTE=512)
-	  *
-	  * PTRS_PER_PTE = 1024, 即 -PTRS_PER_PTE = 0xfffffc00 时:
-	  * Condition Expression result = TRUE (if x > 511); FALSE (if x <= 511).
-	  * If TRUE(x > 511):   FIX_BTMAP_END 向上对齐到 TOTAL_FIX_BTMAPS, 这时，
-	  *                     FIX_BTMAP_END 要么 index 下一个(逆向) PMD entry(4M) 中
-	  *                     最末 page, 要么 index 当前 PMD entry(4M) 中 512 号 entry.
-	  * If FALSE(x <= 511): FIX_BTMAP_END = x.
-	  *
-	  * PTRS_PER_PTE = 512, 即 -PTRS_PER_PTE = 0xfffffe00 时:
-	  * Condition Expression result *always* = TRUE.
-	  * FIX_BTMAP_END 向上对齐到 TOTAL_FIX_BTMAPS, 即 FIX_BTMAP_END index
-	  * 下一个(逆向) PMD entry(2M) 中的最末 page.
-	  *
-	  * "round it up to next 512 pages boundary if necessary" finally make
-	  * sense: if index x > 511 */
-#define NR_FIX_BTMAPS		64 /* 看起来像 long 的 bit 数 */
-#define FIX_BTMAPS_SLOTS	8  /* 需要 512 个 4k mapping */
-#define TOTAL_FIX_BTMAPS	(NR_FIX_BTMAPS * FIX_BTMAPS_SLOTS)
-	FIX_BTMAP_END =
-	 (__end_of_permanent_fixed_addresses ^
-	  (__end_of_permanent_fixed_addresses + TOTAL_FIX_BTMAPS - 1)) &
-	 -PTRS_PER_PTE
-	 ? __end_of_permanent_fixed_addresses + TOTAL_FIX_BTMAPS -
-	   (__end_of_permanent_fixed_addresses & (TOTAL_FIX_BTMAPS - 1))
-	 : __end_of_permanent_fixed_addresses,
-
-	/* 了解了 fixmap 空间是逆向索引，就明白为何 enum 中 FIX_BTMAP_END 定义在前，而
-	 * FIX_BTMAP_BEGIN 在后面，END, BEGIN 是虚拟地址的角度。
-	 *
-	 * [Tip] 由上面表达式的分析可知，有 3 种情况:
-	 *   1. (PTRS_PER_PTE = 1024 && FIX_BTMAP_END <= 511), then FIX_BTMAP_BEGIN
-	 *      < 1023, so FIX_BTMAP_END & FIX_BTMAP_BEGIN 在同一个 PMD entry(4M) 中。
-	 *   2. (PTRS_PER_PTE = 1024 && FIX_BTMAP_END > 511), FIX_BTMAP_END 对齐 512,
-	 *      意味着它要么 index 当前 PMD entry(4M) 中的 512 号 entry, 要么下一个(逆向)
-	 *      PMD entry 中的最末 page, 总之 FIX_BTMAP_BEGIN 还是和它在同一个 PMD entry 中
-	 *   3. (PTRS_PER_PTE = 512), FIX_BTMAP_END 总是 512 aligned(TOTAL_FIX_BTMAPS),
-	 *      即总是 index 下一个(逆向) PMD entry(2M) 中最末 page, 所以 FIX_BTMAP_BEGIN
-	 *      也总是 index 下一个(逆向) PMD entry(2M) 中第一个 page, i.e., 这两个 page
-	 *      _END, _BEGIN index 的 page 在同一个 pmd entry 中。
-	 *      函数中会 enforce 这一条件。*/
-	FIX_BTMAP_BEGIN = FIX_BTMAP_END + TOTAL_FIX_BTMAPS - 1,
-
-	...
-
-	__end_of_fixed_addresses
-};
-
-/* 若无上文 general idea 的背景知识，很理解此定义。
- *
- * 以 4-level paging 为例，即 PAGE_SIZE = 4k, PMD_SHIFT = 21. 简单心算可知
- * expression value = VSYSCALL_ADDR + 2M - 4k, 大约是地址 -8M 减去 4k 的位置。目地
- * 是 index 0 => FIXADDR_TOP */
-#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
-			 PAGE_SIZE)
-
-/* 参考 Documentation/x86/x86_64/mm.rst: 地址 ffffffffff600000 起始的 4k 用于 map
- * legacy vsyscall ABI. 而这个表达式转换后就是 ffffffffff600000, 即 -10M. */
-#define VSYSCALL_ADDR (-10UL << 20)
-```
-用于验证 __FIXADDR_TOP 相关结论的 demo program(仅编译: `gcc -c xx.c -o x.o`):
-```
-extern unsigned long __FIXADDR_TOP;
-#define FIXADDR_TOP     ((unsigned long)__FIXADDR_TOP)
-//int __FIXADDR_TOP = 1;
-
-extern void nocompiling(void) __attribute__((__error__("NO compile on purpose")));
-
-int main()
-{
-//#define __FIXADDR_TOP 0
-    if (FIXADDR_TOP)
-        nocompiling();
-//#undef __FIXADDR_TOP
-
-    return 0;
-}
-```
-注意：自己调整代码细节进行验证。
-
--------- e820__memory_setup() --------
-```
-/*
- * Calls e820__memory_setup_default() in essence to pick up the firmware/bootloader
- * E820 map - with an optional platform quirk available for virtual platforms
- * to override this method of boot environment processing:
- */
-/* 用意比较明显，特定 platform 可能在这步可能会有特殊处理，可以 override default function */
-void __init e820__memory_setup(void)
-{
-	char *who;
-
-	/* This is a firmware interface ABI - make sure we don't break it: */
-	BUILD_BUG_ON(sizeof(struct boot_e820_entry) != 20);
-
-	/* defined to be e820__memory_setup_default by default. Got sanitized E820
-	 * map info. Then copy it to _kexec and _firmware. */
-	who = x86_init.resources.memory_setup();
-
-	memcpy(e820_table_kexec, e820_table, sizeof(*e820_table_kexec));
-	memcpy(e820_table_firmware, e820_table, sizeof(*e820_table_firmware));
-
-	/* Log can be seen with "console=" kernel parameter */
-	pr_info("BIOS-provided physical RAM map:\n");
-	e820__print_table(who);
-}
-
-/*
- * Pass the firmware (bootloader) E820 map to the kernel and process it:
- */
-/* boot_params 中的 E820 信息，在 boot/ 的 real mode 代码中有显式的获取过一次，但 ZO，
- * 以及目前为止的 VO 代码中未看到有获取，所以推断: 32-bit or 64-bit boot protocol 时，
- * boot loader 负责获取此信息，the conclusion can also be derived from original
- * comments above. */
-char *__init e820__memory_setup_default(void)
-{
-	char *who = "BIOS-e820";
-
-	/*
-	 * Try to copy the BIOS-supplied E820-map.
-	 *
-	 * Otherwise fake a memory map; one section from 0k->640k,
-	 * the next section from 1mb->appropriate_mem_k
-	 */
-	if (append_e820_table(boot_params.e820_table, boot_params.e820_entries) < 0) {
-		u64 mem_size;
-
-		/* Compare results from other methods and take the one that gives more RAM: */
-		if (boot_params.alt_mem_k < boot_params.screen_info.ext_mem_k) {
-			mem_size = boot_params.screen_info.ext_mem_k;
-			who = "BIOS-88";
-		} else {
-			mem_size = boot_params.alt_mem_k;
-			who = "BIOS-e801";
-		}
-
-		e820_table->nr_entries = 0;
-		e820__range_add(0, LOWMEMSIZE(), E820_TYPE_RAM);
-		e820__range_add(HIGH_MEMORY, mem_size << 10, E820_TYPE_RAM);
-	}
-
-	/* We just appended a lot of ranges, sanitize the table: */
-	/* BIOS-E820 来的信息可能是不健全的(range overlap), so got to sanitize it.
-	 * Achieve the goal via algorithm, implemented in this function, described
-	 * in the comments above its definition. Just read the comments, no need
-	 * spend time on it for now. */
-	e820__update_table(e820_table);
-
-	return who;
-}
-
-/* Among the call-chain of  E820 processing, I encounter for the 1st time the
- * branch predication statement:likely(). Interesting topic, let's take a look.
- * In my configuration, it is defined as following, which is GCC built-in function.
- *
- *   Refer: https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html
- */
-# define likely(x)	__builtin_expect(!!(x), 1)
-# define unlikely(x)	__builtin_expect(!!(x), 0)
-
-/* */
-```
------------ parse_early_param -> parse_early_options -----------
-
-```
-void __init parse_early_options(char *cmdline)
-{
-	/* 这里的入参 pattern 隐含了一个 trick，使得解析 cmdline 字符串而来的参数最终进入
-	 * do_early_param 中处理。*/
-	parse_args("early options", cmdline, NULL, 0, 0, 0, NULL,
-		   do_early_param);
-}
-
-/* Check for early params. */
-/* 可以看出，early parsing 只是处理所有 mark 为 "early" 的参数，以及参数 "console" &
- * "earlycon". */
-static int __init do_early_param(char *param, char *val,
-				 const char *unused, void *arg)
-{
-	const struct obs_kernel_param *p;
-
-	for (p = __setup_start; p < __setup_end; p++) {
-		if ((p->early && parameq(param, p->str)) ||
-		    (strcmp(param, "console") == 0 &&
-		     strcmp(p->str, "earlycon") == 0)
-		) {
-			if (p->setup_func(val) != 0)
-				pr_warn("Malformed early option '%s'\n", param);
-		}
-	}
-	/* We accept everything at this stage. */
-	return 0;
-}
-```
-__setup_start & __setup_end 是定义在 linker script 中的符号，用于 mark section(.init.setup) 的起始和结束地址。此 section 的定义方式是：
-```
-#define __setup_param(str, unique_id, fn, early)			\
-	static const char __setup_str_##unique_id[] __initconst		\
-		__aligned(1) = str; 					\
-	static struct obs_kernel_param __setup_##unique_id		\
-		__used __section(.init.setup)				\
-		__attribute__((aligned((sizeof(long)))))		\
-		= { __setup_str_##unique_id, fn, early }
-```
-先定义字符数组容纳参数 name string, 然后定义 struct obs_kernel_param，放在 section(.init.setup) 中。
-
---------- dmi_setup ---------
-
---------- init_hypervisor_platform ---------
-
-```
-static const __initconst struct hypervisor_x86 * const hypervisors[] =
-{
-#ifdef CONFIG_XEN_PV
-	&x86_hyper_xen_pv,
-#endif
-#ifdef CONFIG_XEN_PVHVM
-	&x86_hyper_xen_hvm,
-#endif
-	&x86_hyper_vmware,
-	&x86_hyper_ms_hyperv,
-#ifdef CONFIG_KVM_GUEST
-	&x86_hyper_kvm,
-#endif
-#ifdef CONFIG_JAILHOUSE_GUEST
-	&x86_hyper_jailhouse,
-#endif
-#ifdef CONFIG_ACRN_GUEST
-	&x86_hyper_acrn,
-#endif
-};
-
- void __init init_hypervisor_platform(void)
-{
-	const struct hypervisor_x86 *h;
-
-	/* 进入此函数可观察到，x86 支持的 hypervisor 平台列表定义在 hypervisors[]. 每个
-	 * hypervisor 都有自己的 detect 函数。TBD: 分析 KVM's & XEN's. 未来分析虚拟化
-	 * 时在详细研究下面的代码。 */
-	h = detect_hypervisor_vendor();
-
-	if (!h)
-		return;
-
-	copy_array(&h->init, &x86_init.hyper, sizeof(h->init));
-	copy_array(&h->runtime, &x86_platform.hyper, sizeof(h->runtime));
-
-	x86_hyper_type = h->type;
-	x86_init.hyper.init_platform();
-}
-```
-
------------- probe_roms---------------
-
-看起来是一个新世界。一些设备，比如显卡，也有自己的 firmware. 所以我们常说的 BIOS, 也被称作 system BIOS, 而显卡的 firmware 也被称作 [Video BIOS](https://en.wikipedia.org/wiki/Video_BIOS)。了解[显卡 rom 的 memory map](https://wiki.osdev.org/Memory_Map_(x86)#ROM_Area) 是理解下面的代码的关键。
-
-另外，从代码看，device rom 的 format 是 spec 的，但没有找到 authoritative source. 在[《PCI System Architecture》](http://www.informit.com/store/pci-system-architecture-9780201309744) 一书的 chapter 20: Expansion ROMS 中，找到 a piece of info of a code image format.
-
-Code image 包含 4 个 components: ROM header, ROM data structure, Run-time code, Initialization code. 此处代码 focus on ROM header.
-
-ROM image 开头是 ROM header, first 2 bytes is called ROM Signature: must contain 0xAA55, identifying this as a device ROM. This has always been the signature used for a device ROM in any PC-compatible machine.
-
-![rom signature](romsig.png)
-
-ROM signature 后，the 3rd byte 表示: overall size of the image(in 512 byte increments).
-
-![rom signature](afteromsig.png)
-
-[这篇](https://en.wikipedia.org/wiki/BIOS#Initialization) 对整个流程做了 general description.
-
-With the knowledge of background above, Let's get back to code:
-
-```
-void __init probe_roms(void)
-{
-	const unsigned char *rom;
-	unsigned long start, length, upper;
-	unsigned char c;
-	int i;
-
-	/* video rom */
-	/* 根据上面 rom's memory map 可知: 0xC0000 是 video BIOS 的起始地址，0xC8000 用于
-	 * 其他设备 rom(firmware), 这也许就是 adapter 的含义。一共 8k 的 range, 以 2k 的
-	 * step size 检查 video BIOS, 虽然不明白为什么是 2k step size.*/
-	upper = adapter_rom_resources[0].start;
-	for (start = video_rom_resource.start; start < upper; start += 2048) {
-		/* 只是对 __va() 的简单封装，上文有分析过，涉及 page fault 中断服务。
-		 * 拿到 video BIOS 所在物理地址对应的虚拟地址，才可以在代码中访问它 */
-		rom = isa_bus_to_virt(start);
-		/* 读取 first 2 bytes of ROM. 调用了实现复杂的 probe_kernel_address, TBD.*/
-		if (!romsignature(rom))
-			continue;
-
-		video_rom_resource.start = start;
-
-		if (probe_kernel_address(rom + 2, c) != 0)
-			continue;
-
-		/* 0 < length <= 0x7f * 512, historically */
-		length = c * 512;
-
-		/* if checksum okay, trust length byte */
-		/* ROM checksum 机制忘记在哪儿看到，很简单：ROM 中所有 byte value 相加等于 0，
-		 * 说明 ROM 是 OK 的。*/
-		if (length && romchecksum(rom, length))
-			video_rom_resource.end = start + length - 1;
-
-		/* 这才是真正的重点, TBD. */
-		request_resource(&iomem_resource, &video_rom_resource);
-		break;
-	}
-
-	/* 处理完 video rom, 将其结束地址对齐到 2k boundary. */
-	start = (video_rom_resource.end + 1 + 2047) & ~2047UL;
-	if (start < upper)
-		start = upper;
-
-	/* system rom */
-	/* 对其他的 ROM 也 request resource. system_rom_resource 是预定义的全局变量，描述
-	 * [0xf0000 - 0xfffff], 即我们常说的 BIOS 的位置(也叫 Motherboard BIOS)。*/
-	request_resource(&iomem_resource, &system_rom_resource);
-	upper = system_rom_resource.start;
-
-	/* 都是外设的 ROM，代码却做了区分，extension ROM VS adapter ROM, 暂不了解二者区别。*/
-
-	/* check for extension rom (ignore length byte!) */
-	rom = isa_bus_to_virt(extension_rom_resource.start);
-	if (romsignature(rom)) {
-		length = resource_size(&extension_rom_resource);
-		if (romchecksum(rom, length)) {
-			request_resource(&iomem_resource, &extension_rom_resource);
-			upper = extension_rom_resource.start;
-		}
-	}
-
-	/* check for adapter roms on 2k boundaries */
-	for (i = 0; i < ARRAY_SIZE(adapter_rom_resources) && start < upper; start += 2048) {
-		rom = isa_bus_to_virt(start);
-		if (!romsignature(rom))
-			continue;
-
-		if (probe_kernel_address(rom + 2, c) != 0)
-			continue;
-
-		/* 0 < length <= 0x7f * 512, historically */
-		length = c * 512;
-
-		/* but accept any length that fits if checksum okay */
-		if (!length || start + length > upper || !romchecksum(rom, length))
-			continue;
-
-		adapter_rom_resources[i].start = start;
-		adapter_rom_resources[i].end = start + length - 1;
-		request_resource(&iomem_resource, &adapter_rom_resources[i]);
-
-		start = adapter_rom_resources[i++].end & ~2047UL;
-	}
-}
-
-int request_resource(struct resource *root, struct resource *new)
-{
-	struct resource *conflict;
-
-	conflict = request_resource_conflict(root, new);
-	return conflict ? -EBUSY : 0;
-}
-
-/* 开始涉及读写锁的操作，值的研究，TBD. */
-struct resource *request_resource_conflict(struct resource *root, struct resource *new)
-{
-	struct resource *conflict;
-
-	write_lock(&resource_lock);
-	conflict = __request_resource(root, new);
-	write_unlock(&resource_lock);
-	return conflict;
-}
-
-```
-------------- mtrr_bp_init -------------
-
-Memory Type Range Registers(MTRR) 的权威介绍在 Intel SDM 3a, chapter 11.11，它与 Page Attribute Table(PAT) 机制配合管理 memory type, 所以也需要了解 PAT at Intel SDM 3a, chapter 11.12. 所以我们在代码中看到，只有 MTRR enabled 下，才会初始化 PAT(mtrr_bp_pat_init).
-
-MTRR quick start:
-
->A mechanism for associating memory types with physical address ranges in system memory, allow processor optimize operations for different memory such as RAM, ROM, frame-buffer memory, memory-mapped I/O devices. Up to 96 memory ranges can be defined, 88 among them are fixed ranges which are for the 1st Megabytes, the rest are for variable ranges. Following a hardware reset, all the fixed and variable MTRRs are disabled, make all physical memory uncacheable. Typically, firmware, BIOS for example, will configure the MTRRs. MTRR supports 5 memory types via 8-bit: Uncacheable(UC) 00H, Write Combining(WC) 01H, Write-through(WT) 04H, Write-protected(WP) 05H, Writeback(WB) 06H. Region's base address & size in MTRR must be 4K aligned.  MTRR feature is identified via CPUID, in case the CPU support it, additional info will be available in 64-bit read-only IA32_MTRRCAP MSR.
-
-> MTRR is configured via three groups of registers: IA32_MTRR_DEF_TYPE MSR, fixed-range MTRRs, and variable range MTRRs.  IA32_MTRR_DEF_TYPE sets the default properties of the regions of physical memory that are not encompassed by MTRRs.
-
-A [simple reference](https://www.kernel.org/doc/html/latest/x86/mtrr.html) for MTRR usage in Linux kernel
-
-PAT quick start:
-> PAT is a companion feature to the MTRRs, MTRR maps memory type to regions of physical address space, while PAT maps memory types to pages within linear address space. PAT extends the function of PCD & PWT bit of page table to allow 6(5 of MTRR, a new Uncached(UC-)) types to be assigned dynamically to pages of linear address. With PAT feature, PAT bit of page-table or page-directory entry works with PCD, PWT bit, to define the memory type for the page. NOTE: PAT bit exist only when entry maps to page frame. PAT involves 2 kinds of encoding: Memory type encoding used to program IA32_PAT MSR[1]; PAT+PCD+PWT encoding as the index to PAT entry of IA32_PAT MSR[2];
-
-  1. Intel SDM 3a: Table 11-10. Memory Types That Can Be Encoded With PAT.
-  2. Intel SDM 3a: Table 11-11. Selection of PAT Entries with PAT, PCD, and PWT Flags.
-
-In case of any type conflicts(inside MTRR or between MTRR & PAT, etc): CPU choose the conservative memory type.
-
-Programming MTRR 和 IA32_PAT MSR 是需要一些考虑的。MSR 属于 CPU，SMP 中，每个 CPU 都有 MTRR & PAT MSR，因此需要保证其值在所有 CPU 上的一致性。这也许就是 mtrr_bp_pat_init 中看起来不相关的复杂操作的原因。参考：11.11.8 MTRR Considerations in MP Systems, 11.12.4 Programming the PAT.
-
-Variable Range MTRR 中 region range 的计算目前还没明白，暂且记下其 mask 计算原则：
-> Address_Within_Range AND PhysMask = PhysBase AND PhysMask
-
-CPUID_1_EDX 是 Intel-defined CPU features, MTRR feature bit 定义在其中。但对于 AMD 及其他 vendor, 并不是这样，比如(如代码所示) AMD 的 MTRR 定义在 X86_FEATURE_K6_MTRR, etc.
-
-可能是因为 MTRR 寄存器众多，操作复杂，为 MTRR 操作专门定义了 struct mtrr_ops. Intel 使用 *generic_mtrr_ops*, 其他 vendor 有各自的 struct mtrr_ops. 仅从代码看，原来 AMD 只支持 2 个 variable range MTRR? 但 AMD SPEC 说支持 8 个.
-
-get_mtrr_state(), 顾名思义，获取 MTRR MSR 中的信息： Fixed-range, Variable-range, default type, MTRR 是否 enable, etc. 仅是读取 MSR value 到内部结构，并未进一步处理.
-
-PAT 初始化 via mtrr_bp_pat_init --> pat_init: 构造 IA32_PAT MSR 的内容 & 写入。IA32_PAT MSR 在 CPU reset 后的 default value 不是 0, refer: [1].  如果 IA32_PAT MSR = 0，说明 PAT is disabled explicitly. 使用 PAT MSR value 初始化 "cache mode": __init_cache_modes(), 未知领域，TBD.
-
-  1. Intel SDM 3a, Table 11-12. Memory Type Setting of PAT Entries Following a Power-up or Reset.
-
-不知为何需要 mtrr_cleanup(kernel parameter **disable_mtrr_cleanup** 透露出那么一点信息). cleanup 的逻辑也很不理解，如果 valid variable ranges 都是 WB 或者 WB+UC, 则不需要 cleanup, WHY??? cleanup 后的值写回 MTRR MSR. 操作复杂，暂略过。
-
-------------- mtrr_trim_uncached_memory -------------
-
-MTRR 的初始化(mtrr_bp_init) 看起来其实都是为了本函数。函数 comments 值的思考：本函数的存在是因为 Buggy BIOS 没有合理设置 MTRR?, What's the reasonable setup? 理论上，firmware 可以任意设置 MTRR，也就是说，整个 RAM 空间可以任意设置 memory type, 但从 comments 看，Linux kernel 要求自己使用的所有 memory 必须是 WB 类型，Why enforcement?
-
-这篇关于 caching/MBRR/PAT 的很好[科普](https://lwn.net/Articles/282250/) 能够解答上述部分疑问： memory 相对于 CPU 很慢，所以 caching 很必要！不同类型的 memory 使用场景不同，需要合理的 memory type，或曰 caching mode. sane BIOS 应通过 MTRR 设置 regular memory(RAM 就是很常规的 memory) 为 cacheable, I/O memory 为 non-cacheable. memory type 冲突时, no matter between MTRR & PAT, or in MTRR itself, the conservative type will be chosen. 所以可以 deduce: 进入 Linux kernel 后，为了性能，kernel 希望所有可用 RAM 是 cacheable, 又因为可能的 type conflict, 为灵活使用 PAT, 所以希望 MTRR 设置的 caching mode 是 WB.
-
-WTRR 和 E820 之间关系? E820_TYPE_RAM 表示 kernel 可用的 RAM 空间，kernel 需要它是 Write-Back 类型，若 buggy BIOS 未将可用 RAM 空间设置为 WB，则 trim 掉这部分空间。
-
-```
-/* mtrr_trim_uncached_memory - trim RAM not covered by MTRRs
- * @end_pfn: ending page frame number
- *
- * Some buggy BIOSes don't setup the MTRRs properly for systems with certain
- * memory configurations.  This routine checks that the highest MTRR matches
- * the end of memory, to make sure the MTRRs having a write back type cover
- * all of the memory the kernel is intending to use.  If not, it'll trim any
- * memory off the end by adjusting end_pfn, removing it from the kernel's
- * allocation pools, warning the user with an obnoxious message. */
-int __init mtrr_trim_uncached_memory(unsigned long end_pfn)
-{
-	unsigned long i, base, size, highest_pfn = 0, def, dummy;
-	mtrr_type type;
-	u64 total_trim_size;
-	/* extra one for all 0 */
-	int num[MTRR_NUM_TYPES + 1];
-
-	/*
-	 * Make sure we only trim memory on machines that
-	 * support the Intel MTRR architecture:
-	 */
-	/* Skip analysis of self-documented code, which is easy.
-	 * Noticeable points: 本函数仅针对 Intel MTRR Arch; Intel SDM 3a, 11.11.2.1,
-	 * IA32_MTRR_DEF_TYPE MSR: Intel 推荐 default to UC, 省略的代码中有 check 这点。
-	 * 省略的代码还包括：
-	 * 因为初始化时有 mtrr cleanup, 所以重新遍历 variable range MSR, 得到 range 信息：
-	 * base address, size, type; 找到 MTRR_TYPE_WRBACK range 中的最大 pfn, 暗示了
-	 * E820_TYPE_RAM 必为 MTRR_TYPE_WRBACK; Info: kvm/qemu 没有设置 MTRR. */
-
-	/* Check entries number: */
-	/* 遍历 range_state[],记录每个 memory type 的 range 数到 num[]。Buggy BIOS 设置
-	 * region size = 0? num[] 定义的 comments finally make sense. */
-	memset(num, 0, sizeof(num));
-	for (i = 0; i < num_var_ranges; i++) {
-		type = range_state[i].type;
-		if (type >= MTRR_NUM_TYPES)
-			continue;
-		size = range_state[i].size_pfn;
-		if (!size)
-			type = MTRR_NUM_TYPES;
-		num[type]++;
-	}
-
-	/* No entry for WB? */
-	if (!num[MTRR_TYPE_WRBACK])
-		return 0;
-
-	/* Check if we only had WB and UC: 若有效 range 中只有 WB & UC 则继续处理其他
-	 * memory type; 不然 return */
-	if (num[MTRR_TYPE_WRBACK] + num[MTRR_TYPE_UNCACHABLE] !=
-		num_var_ranges - num[MTRR_NUM_TYPES])
-		return 0;
-
-	memset(range, 0, sizeof(range));
-	nr_range = 0;
-
-	/* mtrr_tom2 相关代码，AMD 专属，略过。*/
-
-	/* 此函数做了如下事情：
-	 * 1. 遍历 range_state[] 挑出 MTRR_TYPE_WRBACK 的 range, merge overlapped
-	 *    ranges, 放到全局变量 struct range range[RANGE_NUM];
-	 * 2. 再次遍历 range_state[] 挑出 MTRR_TYPE_UNCACHABLE & MTRR_TYPE_WRPROT 的
-	 *    range, 检查是否和 1. 中结果 struct range range[RANGE_NUM] overlap, 若有，
-	 *    则 take out UC 和 WP 的区域：从 1. 中结果减去 overlap range.
-	 *    (仅限地址 1M 以上的 range， 1M 内是 fixed range.)
-	 * 3. Sort struct range range[RANGE_NUM].
-	 * 返回值 nr_range 表示上述处理后的剩余 range number.
-	 *
-	 * Q: Why treat WRPROT as UNCACHEABLE in commit dd5523552c2897e3?
-	 * A: 目前唯一有参考意义的：Intel SDM 3a, Table 11-2. Memory Types and Their
-	 *    Properties 中 "Cacheable" 一列，WP 不是纯粹的 cacheable 属性 */
-	nr_range = x86_get_mtrr_mem_range(range, nr_range, 0, 0);
-
-	/* x86_get_mtrr_mem_range 后，现在 struct range range[RANGE_NUM] 中的数据是从
-	 * MTRR 视角定义的， sanitized 的 RAM 物理地址 ranges(MTRR_TYPE_WRBACK 类型);
-	 * 入参 end_pfn 是从 E820 视角定义的 RAM 最大 pfn, 可以相信二者交集的 ranges 肯定
-	 * 是 RAM. 取交集是通过在 e820_table 中 trim 掉交集之外的 range(E820_TYPE_RAM
-	 * --> E820_TYPE_RESERVED) 来完成。
-	 */
-
-	/* Check the head: */
-	total_trim_size = 0;
-	if (range[0].start)
-		total_trim_size += real_trim_memory(0, range[0].start);
-
-	/* Check the holes: */
-	for (i = 0; i < nr_range - 1; i++) {
-		if (range[i].end < range[i+1].start)
-			total_trim_size += real_trim_memory(range[i].end,
-							    range[i+1].start);
-	}
-
-	/* Check the top: */
-	i = nr_range - 1;
-	if (range[i].end < end_pfn)
-		total_trim_size += real_trim_memory(range[i].end,
-							 end_pfn);
-
-	if (total_trim_size) {
-		pr_warn("WARNING: BIOS bug: CPU MTRRs don't cover all of memory, losing %lluMB of RAM.\n",
-			total_trim_size >> 20);
-
-		if (!changed_by_mtrr_cleanup)
-			WARN_ON(1);
-
-		pr_info("update e820 for mtrr\n");
-		e820__update_table_print();
-
-		return 1;
-	}
-
-	return 0;
-}
-
-```
------------ early_alloc_pgt_buf & reserve_brk -----------
-
-有意思的函数，短小，但包含了很多新知识, especially for me: .brk section. LWN 上有一篇关于 special section 的[课外阅读](https://lwn.net/Articles/531148/)
-
-```
-/*
- * By default need 3 4k for initial PMD_SIZE,  3 4k for 0-ISA_END_ADDRESS.
- * With KASLR memory randomization, depending on the machine e820 memory
- * and the PUD alignment. We may need twice more pages when KASLR memory
- * randomization is enabled.
- */
-#ifndef CONFIG_RANDOMIZE_MEMORY
-#define INIT_PGD_PAGE_COUNT      6
-#else
-#define INIT_PGD_PAGE_COUNT      12
-#endif
-#define INIT_PGT_BUF_SIZE	(INIT_PGD_PAGE_COUNT * PAGE_SIZE)
-
-/* All above are non-sense to me for now, get back to it later. And the
- * following code doesn't make sense either, until you understand the analysis
- * below. So，先跳过 code 看分析先。 */
-
-RESERVE_BRK(early_pgt_alloc, INIT_PGT_BUF_SIZE);
-void  __init early_alloc_pgt_buf(void)
-{
-	unsigned long tables = INIT_PGT_BUF_SIZE;
-	phys_addr_t base;
-
-	/* __pa() 在上文中已分析过 */
-	base = __pa(extend_brk(tables, PAGE_SIZE));
-
-	/* 可以看出，pgt_buf_* 几个变量的单位是 pfn. */
-	pgt_buf_start = base >> PAGE_SHIFT;
-	pgt_buf_end = pgt_buf_start;
-	pgt_buf_top = pgt_buf_start + (tables >> PAGE_SHIFT);
-}
-
-/* linker script 中定义了 symbol: __brk_base & __brk_limit, 用来 mark brk section
- * 的 boundary. 实际使用这段 section 空间时，则使用：_brk_start & _brk_end 来标记.
- * 所以，规划的空间实际使用多少，要看此函数被调用多少次。简单搜索发现，dmi & xen 是 dominant
- * user.
- * 入参 align 表示申请空间的起始地址对齐要求 */
-void * __init extend_brk(size_t size, size_t align)
-{
-	size_t mask = align - 1;
-	void *ret;
-
-	/* 若 _brk_start 为 0，表示 brk section 不再接受新的 allocation request. */
-	BUG_ON(_brk_start == 0);
-	/* 必须对齐到 power of 2, 如 2, 4, 8，而 6 则不行。*/
-	BUG_ON(align & mask);
-
-	/* _brk_end 是上次 allocation 后的结束地址，其 alignment 可能和现在不同。*/
-	_brk_end = (_brk_end + mask) & ~mask;
-	BUG_ON((char *)(_brk_end + size) > __brk_limit);
-
-	/* 起始地址已对齐，then, just do it. */
-	ret = (void *)_brk_end;
-	_brk_end += size;
-
-	memset(ret, 0, size);
-
-	return ret;
-}
-```
-extend_brk() 只是 allocate brk 空间，而理解 brk section 的设计需从 linker script 开始：
-```
-	. = ALIGN(PAGE_SIZE);
-	.brk : AT(ADDR(.brk) - LOAD_OFFSET) {
-		__brk_base = .;
-		. += 64 * 1024;		/* 64k alignment slop space */ /* typo? slope : slop */
-		*(.brk_reservation)	/* areas brk users have reserved */
-		__brk_limit = .;
-	}
-```
-内容很简单: 定义 output section ".brk", input section 是 *.brk.reservation, 且虚拟地址空间额外留出 64k(why? Seem like guardian); 搜索 input section 名字可发现其 usage:
-```
-/* Reserve space in the brk section.  The name must be unique within
- * the file, and somewhat descriptive.  The size is in bytes.  Must be
- * used at file scope.
- *
- * (This uses a temp function to wrap the asm so we can pass it the
- * size parameter; otherwise we wouldn't be able to.  We can't use a
- * "section" attribute on a normal variable because it always ends up
- * being @progbits, which ends up allocating space in the vmlinux
- * executable.) */
-#define RESERVE_BRK(name,sz)						\
-	static void __section(.discard.text) __used notrace		\
-	__brk_reservation_fn_##name##__(void) {				\
-		asm volatile (						\
-			".pushsection .brk_reservation,\"aw\",@nobits;" \
-			".brk." #name ":"				\
-			" 1:.skip %c0;"					\
-			" .size .brk." #name ", . - 1b;"		\
-			" .popsection"					\
-			: : "i" (sz));					\
-	}
-```
-恰好，early_alloc_pgt_buf 函数上面出现了这个 macro.
-
-借此机会，终于理解见过多次的 assembly directive: `.pushsection`, `.popsection`.  Background: Assembly 中，每一行可执行代码和数据必属于某一个 section. Imagine a scenario: 你正在写 assembly, 并且正在写 .text 中的代码，突然下面一段代码想放在另一个 section 中，这段代码后就恢复到 .text, 这时就需要`.pushsection` & `.popsection`. 以此 macro 中的 assembly 为例：push 当前 section 到 section stack 暂存，后面的 code 放入 .brk_reservation section； 使用完毕，pop 暂存的 section, 恢复。
-
-看着代码，恍惚中又冒出一个问题：RESERVE_BRK 定义了 static 函数，其中都是 inline assembly, 这个函数好像没有被 reference, 其中的 assembly 怎么执行到的? 分析后发现是一个非常基础的问题。Strictly speaking, 编译的过程是：pre-process, compile, assemble, link. compile 得到 assembly 文件，然后 assembler 会 parse 到这段代码，生成的 .o 文件中自然会有 .brk_reservation section; link 时按照 script 指导，将所有 .o 中的 .brk_reservation section 输出到 vmlinux 的 .brk section.
-
-但这里仍有一个 trick: "__used" 帮助实现目的：
-
-	#define __used                          __attribute__((__used__))
-
-参考 [GCC 文档](https://gcc.gnu.org/onlinedocs/gcc/Common-Function-Attributes.html#index-used-function-attribute)的解释:
->code must be emitted for the function even if it appears that the function is not referenced
-
-内核使用 "-O2" 优化，RESERVE_BRK 定义的 static 函数又没人调用，可想而知它可能会 GCC 优化掉，attribute `__used__` 使其免于被优化掉。
-
-另外，再来看这段汇编代码，并没有真正的 code, 仅是 label & directive: label 定义 symbol, 在符号表中可见； `.skip` 开辟入参 sz 指定的空间并填充 0; `.size` 将刚定义的 symbol 的 size 设置为 sz, 这体现在 ELF symbol table 中的 size field. 但注意：RESERVE_BRK 的作用只是在 image 中 reserve 指定 size 的空间，容易看出优点是，通过 macro 预留 brk 空间变得很灵活。但这并不意味着所有 reserve 的空间都会使用，这里只是“规划/plan”一下。使用的事情要回头看 extend_brk().
-
-如 reserve_brk 调用处的 comments 所说：need to conclude brk. 代码足够 self-documented:
-```
-static void __init reserve_brk(void)
-{
-	if (_brk_end > _brk_start)
-		memblock_reserve(__pa_symbol(_brk_start),
-				 _brk_end - _brk_start);
-
-	/* Mark brk area as locked down and no longer taking any
-	   new allocations */
-	_brk_start = 0;
-}
-```
-
------------- cleanup_highmap ------------
-
-To be honest, 这个函数的 comments 对于 non-native speaker, for me at least, is not friendly. OK, I am going to 拆文解字： cleanup 什么? highmap 又是什么?
-
-highmap: take X86_64 for example, 其 kernel 起始虚拟地址被安排为 __START_KERNEL_map = 0xffffffff80000000, 这个地址在 64 bit mode 下算是比较高的地址，所以称为 highmap.
-
-cleanup: 很远的上文中曾说过，kernel 的虚拟地址空间被安排 [__START_KERNEL_map, __START_KERNEL_map + KERNEL_IMAGE_SIZE], 物理地址空间安排在 [0, KERNEL_IMAGE_SIZE]. 但实际中，kernel 起始地址还需要 ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN). 明显 kernel image size 远远不太可能填满安排的空间。在 head_64.S 中构建页表时，使用的如下代码：
-```
-NEXT_PAGE(level2_kernel_pgt)
-	PMDS(0, __PAGE_KERNEL_LARGE_EXEC, KERNEL_IMAGE_SIZE/PMD_SIZE)
-```
-(代码详细分析回看上文，这里只给 conclusion)依然从 __START_KERNEL_map <--> 0 开始 mapping. Obviously, 由于 ALIGN 导致前面 n 个 pmds 其实是无效 mapping，即 invalid pmds.
-
-In the meanwhile, 虽然 kernel 的实际 memory image size 是 (_end-_text), 但尾部的 .brk section 却是很可能**未完全使用**，_brk_end 表示真正的 end virtual address of kernel, 所以，已 mapping 的 range [_brk_end, _end] 也是无意义的。 这两个 range 的 pmds 都是 cleanup 的对象。
-
-理解这个背景知识，主要代码就好理解了，不赘述。
-
-```
-/* The head.S code sets up the kernel high mapping:
- *
- *   from __START_KERNEL_map to __START_KERNEL_map + size (== _end-_text)
- *
- * phys_base holds the negative offset to the kernel, which is added
- * to the compile time generated pmds. This results in invalid pmds up
- * to the point where we hit the physaddr 0 mapping.
- *
- * We limit the mappings to the region from _text to _brk_end.  _brk_end
- * is rounded up to the 2MB boundary. This catches the invalid pmds as
- * well, as they are located before _text: */
-void __init cleanup_highmap(void)
-{
-	unsigned long vaddr = __START_KERNEL_map;
-	unsigned long vaddr_end = __START_KERNEL_map + KERNEL_IMAGE_SIZE;
-	unsigned long end = roundup((unsigned long)_brk_end, PMD_SIZE) - 1;
-	pmd_t *pmd = level2_kernel_pgt;
-
-	/* Native path, max_pfn_mapped is not set yet. Xen has valid max_pfn_mapped
-	 * set in arch/x86/xen/mmu.c:xen_setup_kernel_pagetable().
-	 * 暂未看到 max_pfn_mapped 相关代码. To be analysed. */
-	if (max_pfn_mapped)
-		vaddr_end = __START_KERNEL_map + (max_pfn_mapped << PAGE_SHIFT);
-
-	for (; vaddr + PMD_SIZE - 1 < vaddr_end; pmd++, vaddr += PMD_SIZE) {
-		if (pmd_none(*pmd))
-			continue;
-		if (vaddr < (unsigned long) _text || vaddr > end)
-			set_pmd(pmd, __pmd(0));
-	}
-}
-```
-
------------- init_mem_mapping ------------
-
-memblock.memory 管理着所有 kernel 可用 RAM 物理地址空间，此函数将它们 direct page map 到虚拟地址空间。回忆一下：虚拟地址 PAGE_OFFSET 用于 direct mapping of all physical memory, 对于 4-level paging, all physcial memory = 64T. Refer: Documentation/x86/x86_64/mm.rst.
-
-推理：
-
-4-level paging 时，X86 CPU's max **virtual** address width = 48(32+16) bits = 256T, then, 64T = 46 bits, 即 max **physical** address width = 46 bits = 64T, 恰好是 mm.rst 所说 direct mapping 的 size.
-
-5-level paging 时，由 feature name "la57" 可知 max **virtual** address width = 57(48+9) bits. Max **physical** address width = 52 bits = 4PB, 看起来比 mm.rst 中所说的留给 direct mapping 的 虚拟地址空间 size: 32PB 小，WHY? 也许没有为什么?
-
-上述推理 arguments 可在 Intel's <5-Level Paging and 5-Level EPT> white pager's chapter 2.2.1 找到证据。
-```
-void __init init_mem_mapping(void)
-{
-	unsigned long end;
-
-	pti_check_boottime_disable(); /* 暂略过 */
-	/* 探测 CPU 支持的 page size. X86_64 (我认为)都支持 2M & 1G, 4K 是默认，不用 probe.
-	 * direct_gbpages 初始值由 CONFIG_X86_DIRECT_GBPAGES 确定。
-	 * 上述 conclusion 也是加打印后发现，被自己笨哭TAT. */
-	probe_page_size_mask();
-	setup_pcid();
-
-	/* end 表示最大的 RAM 物理地址 */
-#ifdef CONFIG_X86_64
-	end = max_pfn << PAGE_SHIFT;
-#else
-	end = max_low_pfn << PAGE_SHIFT;
-#endif
-
-	/* the ISA range is always mapped regardless of memory holes */
-	/* 虚拟地址 PAGE_OFFSET 起的 64TB(4-level paging) 空间用于 direct mapping cpu
-	 * 的寻址空间，即物理地址空间。1st 1M 内，conventional memory(640k) 后的地址用于
-	 * 映射 rom 等非 RAM 空间, 这即 comments 中的所说的 memory holes.
-	 * 其中调用一个难读的函数: split_mem_range，maintainer 也认为它是 garbage(
-	 * https://lkml.org/lkml/2019/3/24/332)。也浪费了我许多时间，后面详述。*/
-	init_memory_mapping(0, ISA_END_ADDRESS);
-
-	/* Init the trampoline, possibly with KASLR memory offset */
-	init_trampoline();
-
-	/*
-	 * If the allocation is in bottom-up direction, we setup direct mapping
-	 * in bottom-up, otherwise we setup direct mapping in top-down.
-	 */
-	if (memblock_bottom_up()) {
-		unsigned long kernel_end = __pa_symbol(_end);
-
-		/*
-		 * we need two separate calls here. This is because we want to
-		 * allocate page tables above the kernel. So we first map
-		 * [kernel_end, end) to make memory above the kernel be mapped
-		 * as soon as possible. And then use page tables allocated above
-		 * the kernel to map [ISA_END_ADDRESS, kernel_end).
-		 */
-		memory_map_bottom_up(kernel_end, end);
-		memory_map_bottom_up(ISA_END_ADDRESS, kernel_end);
-	} else {
-		memory_map_top_down(ISA_END_ADDRESS, end);
-	}
-
-#ifdef CONFIG_X86_64
-	if (max_pfn > max_low_pfn) {
-		/* can we preseve max_low_pfn ?*/
-		max_low_pfn = max_pfn;
-	}
-#else
-	early_ioremap_page_table_range_init();
-#endif
-
-	load_cr3(swapper_pg_dir);
-	__flush_tlb_all();
-
-	x86_init.hyper.init_mem_mapping();
-
-	early_memtest(0, max_pfn_mapped << PAGE_SHIFT);
-}
-
-/*
- * Setup the direct mapping of the physical memory at PAGE_OFFSET.
- * This runs before bootmem is initialized and gets pages directly from
- * the physical memory. To access them they are temporarily mapped.
- */
-/*
- * Tip：物理地址按 4k 划分 page frame, 意味着在内存管理时，看到的物理 range 的起始地址 &
- * size 都是 4k 对齐的。所以现在可以大胆相信，入参是 4k 对齐的。
- *
- * 此函数目的是 direct page mapping 入参的 RAM physical address range. Range 可大
- * 可小，怎么 mapping? Strategy: 尽可能使用 big page size(X86_64 支持 4k, 2M, 1G).
- * 所以第一步 split_mem_range 将入参 RAM range 分为几段，然后 mapping，然后 xxx?
- *
- * 初看 split_mem_range 几遍仍不懂，遂 google 函数名，有所得，但仍不懂。可见 importance
- * of narrative ability. 下有详细分析其分段机制。 */
-unsigned long __ref init_memory_mapping(unsigned long start,
-					       unsigned long end)
-{
-	/* NR_RANGE_MR =5 under x86_64, why? Details at analysis of split_mem_range */
-	struct map_range mr[NR_RANGE_MR];
-	unsigned long ret = 0;
-	int nr_range, i;
-
-	/* pr_debug 的内容正常情况下不出现 dmesg 中，想看这个打印的 prerequisites:
-	 *   1. CONFIG_DYNAMIC_DEBUG=y, &
-	 *   2. file compiled with -DDEBUG: CFLAGS_[filename].o := -DDEBUG
-	 *      (https://www.kernel.org/doc/local/pr_debug.txt)
-	 */
-	pr_debug("init_memory_mapping: [mem %#010lx-%#010lx]\n",
-	       start, end - 1);
-
-	memset(mr, 0, sizeof(mr));
-	/* 之前理解的困惑点：不知道 init_memory_mapping 会被多次调用，函数中加打印后才知道。
-	 * 费了好大劲儿，终于看懂了这个函数TAT，见下文。*/
-	nr_range = split_mem_range(mr, 0, start, end);
-
-	/* 拿到 split ranges, 可以 page table mapping 了。mapping code 太复杂，下文只能
-	 * 先简略分析。 */
-	for (i = 0; i < nr_range; i++)
-		ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
-						   mr[i].page_size_mask);
-
-	/* 记录已 mapped pfn*/
-	add_pfn_range_mapped(start >> PAGE_SHIFT, ret >> PAGE_SHIFT);
-
-	return ret >> PAGE_SHIFT;
-}
-
-/* 上面提到，本函数将 split 入参 RAM 的 physical address range 为几段. Simply:
- *   1. [0  - 2M] 以 4k page 映射
- *   2. [2M - 1G] 以 2M page 映射
- *   3. [1G - end]以 1G page 映射
- * 这也是 google 可知的 conclusion. BUT, 这太粗糙，笔者作为 newbie 很难理解。So, here
- * is the details.
- *
- * Tips:
- *   1. 代码以 pfn 表示 range 的起始地址 & 结束地址, page frame = 4k.
- *   2. 下面分析中的[range] 中的数字表示地址
- *   3. (最重要!!!)RAM 在 cpu 物理地址空间中不是连续的。知识点可能知道，但，比如我，通常并
- *      没有意识到，此处强调这点。
- *
- * 我们以实际数字举例进行代码分析 split 过程，目的是覆盖所有 split 代码。
- *
- * 假设 start = 1M, range(size) = 2G + 2M + 4K, 即 end = 0x100000 + 0x80000000 +
- * 0x200000 + 0x4000 = 2G + 3M + 4K, 根据上述 conclusion 可知:
- *   - [1M - 2M] 以 4K page 映射
- *   - [2M - 1G] 以 2M page 映射
- *   - [1G - 2G] 以 1G page 映射
- * 但 range 中还剩下零头的 2M + 4K 呢?
- *   - [2G - 2G+2M] 以 2M page 映射
- *   - [2G+2M - 2G+3M+4K] 以 4K page 映射
- * 这是覆盖所有 split 代码的示例, 共 5 个 memory range, 即 NR_RANGE_MR 的值。
- *
- * Time for the code, see if match my conclusion */
-static int __meminit split_mem_range(struct map_range *mr, int nr_range,
-				     unsigned long start,
-				     unsigned long end)
-{
-	unsigned long start_pfn, end_pfn, limit_pfn;
-	unsigned long pfn;
-	int i;
-
-	/* 简单计算知, limit_pfn = 0x80304. 这么多 pfn 变量，初看很容易迷惑，limit 表示入参
-	 * 整个 range 的上限，下面常拿来做判断用；start & end 用来 mark split 出的 range;
-	 * 最朴实的 "pfn" 用来保存各种计算结果用。*/
-	limit_pfn = PFN_DOWN(end);
-
-	/* head if not big page alignment ? */
-	pfn = start_pfn = PFN_DOWN(start); // 0x100
-#ifdef CONFIG_X86_32
-	/* SKIP */
-#else /* CONFIG_X86_64 */
-	end_pfn = round_up(pfn, PFN_DOWN(PMD_SIZE));//0x200
-#endif
-	if (end_pfn > limit_pfn)
-		end_pfn = limit_pfn;
-	if (start_pfn < end_pfn) {
-		/* 地址 [1M - 2M] 的 page_size_mask 为 0, 表示 4k page size? */
-		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn, 0);
-		pfn = end_pfn;//0x200
-	}
-
-	/* big page (2M) range */
-	start_pfn = round_up(pfn, PFN_DOWN(PMD_SIZE));//0x200, 2M
-#ifdef CONFIG_X86_32
-	/* SKIP */
-#else /* CONFIG_X86_64 */
-	end_pfn = round_up(pfn, PFN_DOWN(PUD_SIZE));//0x40000, 1G
-	if (end_pfn > round_down(limit_pfn, PFN_DOWN(PMD_SIZE)))
-		end_pfn = round_down(limit_pfn, PFN_DOWN(PMD_SIZE));
-#endif
-
-	if (start_pfn < end_pfn) {
-		/* 地址 [2M - 1G] 使用 2M page 映射. */
-		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn,
-				page_size_mask & (1<<PG_LEVEL_2M));
-		pfn = end_pfn; //0x40000, 1G
-	}
-
-#ifdef CONFIG_X86_64
-	/* big page (1G) range */
-	start_pfn = round_up(pfn, PFN_DOWN(PUD_SIZE));//0x40000, 1G
-	end_pfn = round_down(limit_pfn, PFN_DOWN(PUD_SIZE));//0x80000, 2G
-	if (start_pfn < end_pfn) {
-		/* 地址 [1G - 2G] 可用 2M 或 1G page size 映射. */
-		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn,
-				page_size_mask &
-				 ((1<<PG_LEVEL_2M)|(1<<PG_LEVEL_1G)));
-		pfn = end_pfn;//0x80000, 2G
-	}
-
-	/* tail is not big page (1G) alignment */
-	/* 下面是零头 2M + 4K 的处理 */
-	start_pfn = round_up(pfn, PFN_DOWN(PMD_SIZE));//0x80000, 2G
-	end_pfn = round_down(limit_pfn, PFN_DOWN(PMD_SIZE));//0x80200, 2G + 2M
-	if (start_pfn < end_pfn) {
-		/* 地址 [2G - 2G+2M] 使用 2M page size 映射*/
-		nr_range = save_mr(mr, nr_range, start_pfn, end_pfn,
-				page_size_mask & (1<<PG_LEVEL_2M));
-		pfn = end_pfn;
-	}
-#endif
-
-	/* tail is not big page (2M) alignment */
-	/* 零头中的 2M 处理完了，只剩下 4K */
-	start_pfn = pfn;//0x80200, 2G + 2M
-	end_pfn = limit_pfn;//0x80304, 2G + 3M + 4K
-	nr_range = save_mr(mr, nr_range, start_pfn, end_pfn, 0);
-
-	/* 所以，split range 的 style 是  page */
-
-	/* 此函数 comments 也不 friendly.
-	 * split 出的 memory ranges，判断相邻 range 是否可合并 & 使用更大 page size, if
-	 * yes, then just do it. 合并的 style 是向中心更大 page size shrink， 即
-	 * (4K --> 2M --> 1G <-- 2M <-- 4K)
-	 *
-	 * 判断 split range 是否支持更高 page size(2M 和 1G), 将结果标记在 page_size_mask.
-	 * 判断方式：将 range 扩展到更高 page size 的边界，若 expanded physical address
-	 * range 还在 memblock.memory 中, 说明支持该 page size, 因为 memblock.memory
-	 * 表示系统可用的 RAM 空间。
-	 *
-	 * 上面分析 split process 时以 [1M - 2G+3M+4k] 为例，不适用于此 adjust 函数的分析。
-	 * 假设入参 range 是 [0 - 2G], 则 split 为 [0 - 2M](4k page), [2M - 1G](2M page),
-	 * [1G - 2G](1G page), 前 2 个 range 自然可合并为 [0 - 1G](1G page).	 */
-	if (!after_bootmem)
-		adjust_range_page_size_mask(mr, nr_range);
-
-	/* try to merge same page size and continuous */
-	/* 若相邻 range 有相同的 page_size_mask, 则可合并 */
-	for (i = 0; nr_range > 1 && i < nr_range - 1; i++) {
-		unsigned long old_start;
-		if (mr[i].end != mr[i+1].start ||
-		    mr[i].page_size_mask != mr[i+1].page_size_mask)
-			continue;
-		/* move it */
-		old_start = mr[i].start;
-		memmove(&mr[i], &mr[i+1],
-			(nr_range - 1 - i) * sizeof(struct map_range));
-		mr[i--].start = old_start;
-		nr_range--;
-	}
-
-	/* 终于分析完了 split, 好复杂精巧阿阿阿 = =|*/
-
-	for (i = 0; i < nr_range; i++)
-		pr_debug(" [mem %#010lx-%#010lx] page %s\n",
-				mr[i].start, mr[i].end - 1,
-				page_size_string(&mr[i]));
-
-	return nr_range;
-}
-
-/*
- * Create page table mapping for the physical memory for specific physical
- * addresses. Note that it can only be used to populate non-present entries.
- * The virtual and physical addresses have to be aligned on PMD level
- * down. It returns the last physical address mapped.
- */
-unsigned long __meminit
-kernel_physical_mapping_init(unsigned long paddr_start,
-			     unsigned long paddr_end,
-			     unsigned long page_size_mask)
-{
-	return __kernel_physical_mapping_init(paddr_start, paddr_end,
-					      page_size_mask, true);
-}
-
-static unsigned long __meminit
-__kernel_physical_mapping_init(unsigned long paddr_start,
-			       unsigned long paddr_end,
-			       unsigned long page_size_mask,
-			       bool init)
-{
-	bool pgd_changed = false;
-	unsigned long vaddr, vaddr_start, vaddr_end, vaddr_next, paddr_last;
-
-	/* 这些变量名乍看和 split 函数中的 pfn 变量的 style 很像。 __va() 上文已分析。*/
-	paddr_last = paddr_end;
-	vaddr = (unsigned long)__va(paddr_start);
-	vaddr_end = (unsigned long)__va(paddr_end);
-	vaddr_start = vaddr;
-
-	for (; vaddr < vaddr_end; vaddr = vaddr_next) {
-		/* physical address -> virtual address -> PGD entry. PGD entry maps 512G. */
-		pgd_t *pgd = pgd_offset_k(vaddr);
-		p4d_t *p4d;
-
-		/* 下一个 PGD entry 对应的 virtual address. */
-		vaddr_next = (vaddr & PGDIR_MASK) + PGDIR_SIZE;
-
-		/* recursive 的进行 page table mapping 比较繁琐，暂不分析，知道它做什么即可。*/
-
-		if (pgd_val(*pgd)) {
-			/* 若 PGD entry 已 mapping, 找到它指向下一级 page table 的虚拟地址(p4d).
-			 * 进入下一级 page table(p4d) 的处理 */
-			p4d = (p4d_t *)pgd_page_vaddr(*pgd);
-			paddr_last = phys_p4d_init(p4d, __pa(vaddr),
-						   __pa(vaddr_end),
-						   page_size_mask,
-						   init);
-			continue;
-		}
-
-		/* 若 PGD entry 未 mapping, 分配 4k 用于它的下级 page directory table, 同样
-		 * 进行 recursive mapping 的动作。
-		 * brk 又出场了。Simply speaking, 若 early_alloc_pgt_buf() 中预留给 page
-		 * table 的 brk buffer 用尽了，则通过 memblock 分配； or else, 使用 brk 的
-		 * 预留空间分配。分配的 buffer 清零后返回其 virtual address. */
-		p4d = alloc_low_page();
-		paddr_last = phys_p4d_init(p4d, __pa(vaddr), __pa(vaddr_end),
-					   page_size_mask, init);
-
-		/* *_populate_init() 在本文件头部以 macro: DEFINE_POPULATE 的方式定义，难怪
-		 * grep 不到。我们分析的条件下(init && !l5)，实际函数 = p4d_populate_safe, 将
-		 * PGD entry 填充一下。*/
-		spin_lock(&init_mm.page_table_lock);
-		if (pgtable_l5_enabled())
-			pgd_populate_init(&init_mm, pgd, p4d, init);
-		else
-			p4d_populate_init(&init_mm, p4d_offset(pgd, vaddr),
-					  (pud_t *) p4d, init);
-
-		spin_unlock(&init_mm.page_table_lock);
-		pgd_changed = true;
-	}
-
-	if (pgd_changed)
-		sync_global_pgds(vaddr_start, vaddr_end - 1);
-
-	return paddr_last;
-}
-
-struct range pfn_mapped[E820_MAX_ENTRIES];
-int nr_pfn_mapped;
-
-/* 已 page mapped 的 pfn 要记录在 pfn_mapped[] */
-static void add_pfn_range_mapped(unsigned long start_pfn, unsigned long end_pfn)
-{
-	/* 将 Newly page mapped pfn range 加到 pfn_mapped[]. 先要判断 new pfn range
-	 * 是否 overlap with pfn ranges in pfn_mapped[], merge them if yes. 注意，
-	 * add/merge 过程中没有 sort. Range 中竟有 end 为 0 的可能???
-	 * 判断重叠用的变量 common_start & common_end 较巧妙，start > end 说明两个 pfn
-	 * ranges 不重叠. BTW, 最后特意将 pfn_mapped[nr_pfn_mapped] 抹零表示结束。*/
-	nr_pfn_mapped = add_range_with_merge(pfn_mapped, E820_MAX_ENTRIES,
-					     nr_pfn_mapped, start_pfn, end_pfn);
-
-	/* 数组有效元素中可能有 end 为 0 的 range, 便是 clean/sort 存在的意义。clean 掉
-	 * end = 0 的 range(of course invalid)。目标: ranges, 从小到大，no overlapping.
-	 * clean 算法：从前找到第一个 end = 0 range, 从后找到第一个 end != 0 range， 交换，
-	 * 并将 invalid range(end = 0) 的 start 也抹零。返回值是 valid range 数。*/
-	nr_pfn_mapped = clean_sort_range(pfn_mapped, E820_MAX_ENTRIES);
-
-	/* 也终于见到这两个 max mapped pfn 变量的赋值。*/
-	max_pfn_mapped = max(max_pfn_mapped, end_pfn);
-
-	if (start_pfn < (1UL<<(32-PAGE_SHIFT)))
-		max_low_pfn_mapped = max(max_low_pfn_mapped,
-					 min(end_pfn, 1UL<<(32-PAGE_SHIFT)));
-}
-
-```
-init_memory_mapping 终于算 conclude.
-
------------ reserve_initrd -----------
-```
-#ifdef CONFIG_BLK_DEV_INITRD
-/* 目的：使用 direct page mapped 的虚拟地址访问 initrd. direct page mapping 在上面
- * 刚完成。 Tip: setup_arch 函数开始的地方调用了 early_reserve_initrd(), 将 ramdisk
- * 占据的物理 RAM 空间记录在 memblock.reserved. */
-static void __init reserve_initrd(void)
-{
-	/* Assume only end is not page aligned */
-	/* 从 bootparam 中拿到 ramdisk 的 physical address & size. */
-	u64 ramdisk_image = get_ramdisk_image();
-	u64 ramdisk_size  = get_ramdisk_size();
-	u64 ramdisk_end   = PAGE_ALIGN(ramdisk_image + ramdisk_size);
-	u64 mapped_size;
-
-	if (!boot_params.hdr.type_of_loader ||
-	    !ramdisk_image || !ramdisk_size)
-		return;		/* No initrd provided by bootloader */
-
-	initrd_start = 0;
-
-	/* 经过 setup_arch 中前面的处理， 目前 memblock.memory 中保存着 kernel 可用的所有
-	 * RAM 物理地址信息。重点：这些 RAM 空间可能是 non-continuous. 遍历(Iterate)计算
-	 * 所有可用 RAM 的 size, 因为刚刚在虚拟地址空间已做 direct mapping, 所以这里变量名
-	 * 叫 "mapped_size".
-	 * 知识点：若 ramdisk size 大于可用 RAM size 的一半, 则 too large to handle. */
-	mapped_size = memblock_mem_size(max_pfn_mapped);
-	if (ramdisk_size >= (mapped_size>>1))
-		panic("initrd too large to handle, "
-		       "disabling initrd (%lld needed, %lld available)\n",
-		       ramdisk_size, mapped_size>>1);
-
-	printk(KERN_INFO "RAMDISK: [mem %#010llx-%#010llx]\n", ramdisk_image,
-			ramdisk_end - 1);
-
-	/* init_mem_mapping 中记录了已 directly mapped 的 RAM pfn ranges. 若 ramdisk
-	 * 所在 pfn range 在上述 ranges 中，则可直接通过 __va() 用虚拟地址访问(虽然这里直接
-	 * 展开了 __va())；*/
-	if (pfn_range_is_mapped(PFN_DOWN(ramdisk_image),
-				PFN_DOWN(ramdisk_end))) {
-		/* All are mapped, easy case */
-		/* Easy indeed, 记下 ramdisk 的虚拟地址即可。这应是正常情况的 code path, 推理：
-		 * BIOS is not aware of ramdisk, 它被 boot loader 加载到 E820_TYPE_RAM
-		 * 类型的物理地址空间, 该类型空间被 memblock 管理, 且在上面的函数中被 direct
-		 * mapping.*/
-		initrd_start = ramdisk_image + PAGE_OFFSET;
-		initrd_end = initrd_start + ramdisk_size;
-		return;
-	}
-
-	/* Or else, 在 memblock.memory 中分配物理空间，将 ramdisk copy 过来。这分配的空间
-	 * 自然不能再被 kernel 任意使用，所以 mark it in memblock.reserved. 同样记录 newly
-	 * allocated 空间的虚拟地址。*/
-	relocate_initrd();
-
-	/* So, ramdisk 原来占据的 RAM 空间可以在 memblock.reserved 中释放了。*/
-	memblock_free(ramdisk_image, ramdisk_end - ramdisk_image);
-}
-#else
-	...
-#endif
-```
-
------------ acpi_boot_table_init -----------
-
-这是ACPI初始化的第一个函数。有多个 ACPI init 函数，他们的名字让人困惑，现在开始 demystify. 这里的 **boot** 强调这是 OS booting 阶段的初始化，和 later initialization 有什么不同呢？TBD.
-```
-acpi_boot_table_init()
-{
-	/* 特定型号的 PC 不支持 acpi, 或 acpi 中的部分功能，被 blacklisted 在
-	 * acpi_dmi_table, 通过 DMI 信息识别这些 PC.*/
-	dmi_check_system(acpi_dmi_table);
-
-	/* If acpi_disabled, bail out */
-	/* 若 acpi 被 disable, 就用不着数量庞大的 ACPI 代码了，省事儿了，这是 bail out 的含义。
-	 * 此刻正要初始化 ACPI，什么情况下会 acpi_disabled?
-	 *  1. 特定型号的 PC: acpi_dmi_table 中第一项
-	 *  2. acpi=off, kernel parameter */
-	if (acpi_disabled)
-		return;
-
-	/* Initialize the ACPI boot-time table parser. */
-	if (acpi_table_init()) {
-		disable_acpi();
-		return;
-	}
-
-	/* Simple Boot Flag Table: 别处定义的 Industry spec, simply reserved by ACPI.
-	 * 下笔时最新版本是 2.1. 很简单，找到 table, 用 handler 处理一下。
-	 * Quick knowledge:
-	 * On PC-AT BIOS computer, a BOOT register is defined in main CMOS memory.
-	 * (typically accessed through I/O ports 70h/71h on Intel Architecture platforms)
-	 * The location of the BOOT register in CMOS is indicated by a BOOT table
-	 * found via the ACPI RSDT table.
-	 * 是一个 OS 通知 firmware 的机制, 在 CMOS 中的 1-byte register 写数据, firmware
-	 * 运行时检查其中的 bit. */
-	acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf);
-
-	/* blacklist may disable ACPI entirely */
-	/* 又是特定型号 and/or 特定版本 BIOS 的 ACPI 不能正常工作. Besides, 还有其他 ACPI
-	 * 兼容性的 check, 忽略。*/
-	if (acpi_blacklisted()) {
-		if (acpi_force) {
-			printk(KERN_WARNING PREFIX "acpi=force override\n");
-		} else {
-			printk(KERN_WARNING PREFIX "Disabling ACPI support\n");
-			disable_acpi();
-			return;
-		}
-	}
-}
-
-/* acglobal.h */
-ACPI_GLOBAL(struct acpi_table_list, acpi_gbl_root_table_list);
-
-/* Tip: 此函数位于 driver/acpi/table.c. 如函数名所说， table initialization.  */
-int __init acpi_table_init(void)
-{
-	acpi_status status;
-
-	/* kernel parameter: acpi_force_table_verification */
-	if (acpi_verify_table_checksum) {
-		pr_info("Early table checksum verification enabled\n");
-		acpi_gbl_enable_table_validation = TRUE;
-	} else {
-		pr_info("Early table checksum verification disabled\n");
-		acpi_gbl_enable_table_validation = FALSE;
-	}
-
-	/* kernel 内部用 struct acpi_table_desc 来描述一个 ACPI table. Linux kernel
-	 * 静态分配了 root table array, 其他 OS 未必。ACPI 内部用 acpi_gbl_root_table_list
-	 * 管理 root table array.
-	 * 首先自然是寻找 rsdp, for x86, it is via function: x86_default_get_root_pointer,
-	 * 原来这个 callback 是个空函数，自从 team member 的 patch 进去后，就可通过它的快捷
-	 * 方式拿到 rsdp.
-	 * 寻找 rsdp 的过程也很简单，按照 spec 说明即可。对 BIOS 来说: EBDA 的 first 1k, or
-	 * BIOS read-only memory space [0xE0000h, 0xFFFFF). 代码在 get_rsdp_addr().
-	 * 值得注意的是：后面的地址在 BIOS ROM memory，不仅 ACPI table, SMBIOS 也可能在这里，
-	 * 所以这隐约透露的信息：这些 table data 并不是 BIOS 动态生成，而是事先准备好，与 BIOS
-	 * firmware build 在一起，烧进 BIOS ROM, 这些内容可能被 memory shadow 到 RAM 中。
-	 * 若快捷方式中没有 rsdp, acpi 就自己动手找(acpi_find_root_pointer)，仍然要用到
-	 * fixmap 中的 __early_ioremap, 将待搜寻物理地址 map 为虚拟地址才好访问，访问结束
-	 * unmap.  实际代码过程比较复杂，暂无需深究。
-	 * 找到 rsdp 后按部就班解析各 tables(acpi_tb_parse_root_table), 可以想象因为都是
-	 * 物理地址，需要 map 为虚拟地址才能读取 memory. 过程依然繁琐，也无需深究。*/
-	status = acpi_initialize_tables(initial_tables, ACPI_MAX_TABLES, 0);
-	if (ACPI_FAILURE(status))
-		return -EINVAL;
-	/* initrd 带来的 ACPI tables 也要初始化到 ACPI 内部管理数据结构。*/
-	acpi_table_initrd_scan();
-
-	/* 吐槽：不得不说，acpi 的代码写的太太繁琐了！想找到变量赋值的地方要绕很久！*/
-
-	/* ACPI 中有 validate/invalidate table 的概念，其实是 ACPI 管理 table reference
-	 * 的机制。Simply speaking: 使用 table 时，通过其虚拟地址访问，table reference count
-	 * ++； 使用结束需显式释放: count--, count 为 0 时表示无人使用它，将 unmap 其虚拟地址。
-	 * 好像这里是 early use ACPI, 所以要释放？以后会将 ACPI table 映射到永久使用区域？
-	 *
-	 * table 的虚拟地址记录在 acpi_table_desc.pointer, IIRC, 此地址在 fixmap 区域。*/
-
-	/* acpi_apic_instance 是 kernel parameter, default to 0. Quick reference:
-	 * 2: use 2nd APIC table, if available; 1,0: use 1st APIC table. */
-	check_multiple_madt();
-	return 0;
-}
-```
------------ early_acpi_boot_init -----------
-
-第二个 acpi init 函数。
-```
-int __init early_acpi_boot_init(void)
-{
-	/* If acpi_disabled, bail out */
-	if (acpi_disabled)
-		return 1;
-
-	/* Process the Multiple APIC Description Table (MADT), if present */
-	early_acpi_process_madt();
-
-	/* Hardware-reduced ACPI mode initialization: */
-	/* 这个 indicator bit 在 FADT.flags: ACPI_FADT_HW_REDUCED. 上面 acpi_table_init
-	 * 初始化内部 table array 时，已对 FADT 解析并初始化了 acpi_gbl_reduced_hardware.
-	 * 看过 acpi_generic_reduced_hw_init 发现, HPET 是 ACPI hardware? */
-	acpi_reduced_hw_init();
-
-	return 0;
-}
-
-/* 变量名顾名思义：从 ACPI 表中读来的 local APIC 地址。*/
-#ifdef CONFIG_X86_LOCAL_APIC
-static u64 acpi_lapic_addr __initdata = APIC_DEFAULT_PHYS_BASE;
-#endif
-
-/* Time to 解析 MADT.*/
-static void __init early_acpi_process_madt(void)
-{
-#ifdef CONFIG_X86_LOCAL_APIC
-	int error;
-
-	/* For x86, 此时要从 MADT 中找到 APIC 寄存器的基地址。由 Intel SDM 3a, 10.4.1
-	 * 可知，其物理地址 defaults to APIC_DEFAULT_PHYS_BASE, 但新型 Intel CPU 支持将
-	 * 该地址 relocate. 该地址存在 IA32_APIC_BASE MSR 中。
-	 * acpi_parse_madt 读取 MADT header 中 APIC 的物理地址放在 acpi_lapic_addr 中。
-	 * 但 MADT 中 structure entry “Local APIC Address Override” 可覆写此地址。
-	 * Tips: MADT header 中的地址是 32-bit, Override 中的地址是 64-bit; 只可以有一个
-	 * "Local APIC Address Override Structure", 若有 override structure, 则必须
-	 * 使用 override 的地址。
-	 * 代码繁琐，只有函数 register_lapic_address 值得一看。*/
-	if (!acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)) {
-
-		/* Parse MADT LAPIC entries */
-		/* 返回值的变量名 confusing, 返回的是处理的 structure entry 数。*/
-		error = early_acpi_parse_madt_lapic_addr_ovr();
-		if (!error) {
-			acpi_lapic = 1; /* 说明 ACPI 中有正确的 lapic 信息? */
-			/* find_smp_config -> xx -> smp_scan_config 已 set, if present. */
-			smp_found_config = 1;
-		}
-		if (error == -EINVAL) {
-			/* Dell Precision Workstation 410, 610 come here. */
-			printk(KERN_ERR PREFIX
-			       "Invalid BIOS MADT, disabling ACPI\n");
-			disable_acpi();
-		}
-	}
-#endif
-}
-
-/* 入参是从 ACPI 中读出的 APIC base address */
-void __init register_lapic_address(unsigned long address)
-{
-	mp_lapic_addr = address;
-
-	/* x2apic_mode 在 check_x2apic 已初始化。
-	 * 根据 APIC 是否支持 x2apic mode, 有2个情况：
-	 *   - 不支持 x2apic： APIC registers are accessed via mapped to physical
-	 *     address; then, registers are accessed in code via virtual address
-	 *     of page-mapping.
-	 *     fixmap 区域已为 APCI 预留 virtual address range: FIX_APIC_BASE.
-	 *
-	 *   - 支持 x2apic: register 都是 MSR. 通过指令 wrmsr/rdmsr 访问，不需 memory map.
-	 *
-	 *  Refer: Intel SDM 3a, 10.12.1.2 x2APIC Register Address Space
-	 */
-	if (!x2apic_mode) {
-		set_fixmap_nocache(FIX_APIC_BASE, address);
-		apic_printk(APIC_VERBOSE, "mapped APIC to %16lx (%16lx)\n",
-			    APIC_BASE, address);
-	}
-
-	/* 这个变量名有讲究，因为 MADT 中也有 APIC ID，但目前不清楚它和硬件根据拓扑初始化来的
-	 * apic id 有何不同，理论上他们应该相等，but if not? 这里取自 boot cpu 的 APIC ID
-	 * register, 由不同的 apic driver extract actual ID from register value.
-	 * Refer: Intel SDM 3a, Figure 10-6. Local APIC ID Register;
-	 *                      Figure 10-7. Local APIC Version Register
-	 *
-	 * 埋个问题：目前看到 3 个 APIC ID: Power on 时硬件初始化，根据拓扑得到 initial APIC
-	 * ID; cpuid 指令也可以得到 APIC ID； ACPI/MADT 中也有 APIC ID。三者的关系？
-	 * 目前已知： cpuid 指令得到的是 initial APIC ID; 硬件初始化得到 initial ID 写入
-	 * APIC ID 寄存器， 但可以更改。 Refer: Intel SDM 3a, 10.4.6 Local APIC ID */
-	if (boot_cpu_physical_apicid == -1U) {
-		boot_cpu_physical_apicid  = read_apic_id();
-		boot_cpu_apic_version = GET_APIC_VERSION(apic_read(APIC_LVR));
-	}
-}
-```
------------ initmem_init -----------
-
-initmem_init 根据 32-bit or 64-bit, NUMA 架构 or not, 实现各不相同。现代系统上 NUMA 一般是默认 Yes, 所以我们分析 64-bit + NUMA 下的实现。
-
-```
-void __init initmem_init(void)
-{
-	x86_numa_init();
-}
-
-/**
- * x86_numa_init - Initialize NUMA
- *
- * Try each configured NUMA initialization method until one succeeds.  The
- * last fallback is dummy single node config encompassing whole memory and
- * never fails.
- */
-void __init x86_numa_init(void)
-{
-	if (!numa_off) {
-#ifdef CONFIG_ACPI_NUMA
-		/* OS 只有通过 ACPI(SRAT & SLIT) 才知道硬件上的 NUMA 拓扑 */
-		if (!numa_init(x86_acpi_numa_init))
-			return;
-#endif
-
-#ifdef CONFIG_AMD_NUMA
-	/* Old style AMD Opteron NUMA detection, SKIP */
-#endif
-	}
-
-	numa_init(dummy_numa_init);
-}
-
-static int __init numa_init(int (*init_func)(void))
-{
-	int i;
-	int ret;
-
-	/* 初始化似乎多余？因为声明处已初始化。*/
-	for (i = 0; i < MAX_LOCAL_APIC; i++)
-		set_apicid_to_node(i, NUMA_NO_NODE);
-
-	/* 清零各 bitmask 变量。后两个变量等同于二维指针 */
-	nodes_clear(numa_nodes_parsed);
-	nodes_clear(node_possible_map);
-	nodes_clear(node_online_map);
-
-	/* struct numa_meminfo 的定义很简单。NR_NODE_MEMBLKS 的定义看起来 Linux 认为一个
-	 * numa node 最多有 2 个 memblock region? 但 E820_MAX_ENTRIES 认为有 3 个 range.*/
-	memset(&numa_meminfo, 0, sizeof(numa_meminfo));
-
-	/* 初始化所有 regions' node number 为 MAX_NUMNODES. */
-	WARN_ON(memblock_set_node(0, ULLONG_MAX, &memblock.memory,
-				  MAX_NUMNODES));
-	WARN_ON(memblock_set_node(0, ULLONG_MAX, &memblock.reserved,
-				  MAX_NUMNODES));
-
-	/* In case that parsing SRAT failed. Clear 所有 region's MEMBLOCK_HOTPLUG flag??? */
-	WARN_ON(memblock_clear_hotplug(0, ULLONG_MAX));
-
-	/* numa_distance[] 中的数据来自 SLIT's matrix entry, 表示 node 之间距离。
-	 * 但是，似乎没必要 reset 嘛？初始化之前还有人 set 它吗？ */
-	numa_reset_distance();
-
-	/* ACPI's SRAT & SLIT 初始化，见下文 */
-	ret = init_func();
-	if (ret < 0)
-		return ret;
-
-	/*
-	 * We reset memblock back to the top-down direction
-	 * here because if we configured ACPI_NUMA, we have
-	 * parsed SRAT in init_func(). It is ok to have the
-	 * reset here even if we did't configure ACPI_NUMA
-	 * or acpi numa init fails and fallbacks to dummy
-	 * numa init.
-	 */
-	memblock_set_bottom_up(false);
-
-	/* SRAT 中 memory affinity 的信息放在 numa_meminfo 中，现在 sanitize?
-	 * 删除不在 memblock 中的 range, merge 相邻 range. */
-	ret = numa_cleanup_meminfo(&numa_meminfo);
-	if (ret < 0)
-		return ret;
-
-	/* 不支持 NUMA node 的 hardware 可以打开 NUMA_EMU, debug NUMA 用。默认关闭? Skip.*/
-	numa_emulation(&numa_meminfo, numa_distance_cnt);
-
-	/* sanitized numa_meminfo 注册到 memblock 中 */
-	ret = numa_register_memblks(&numa_meminfo);
-	if (ret < 0)
-		return ret;
-
-	for (i = 0; i < nr_cpu_ids; i++) {
-		int nid = early_cpu_to_node(i);
-
-		if (nid == NUMA_NO_NODE)
-			continue;
-		if (!node_online(nid))
-			numa_clear_node(i);
-	}
-	numa_init_array();
-
-	return 0;
-}
-
-/* 解析 ACPI 中 NUMA 相关的 table: SRAT & SLIT. */
-int __init x86_acpi_numa_init(void)
-{
-	int ret;
-
-	/* Parse SRAT & SLIT. Details as following. */
-	ret = acpi_numa_init();
-	if (ret < 0)
-		return ret;
-	return srat_disabled() ? -EINVAL : 0;
-}
-
-/* drivers/acpi/numa.c */
-int __init acpi_numa_init(void)
-{
-	int cnt = 0;
-
-	if (acpi_disabled)
-		return -EINVAL;
-
-	/* Should not limit number with cpu num that is from NR_CPUS or nr_cpus=
-	 * SRAT cpu entries could have different order with that in MADT.
-	 * So go over all cpu entries in SRAT to get apicid to node mapping. */
-	/* Kernel 配置的 cpu 数目(config 或 parameter) 不应限制这里 SRAT 的解析。也有
-	 * 道理，因为这二者完全不相关，OS 自己不会知道当前系统上的 cpu 数量。*/
-
-	/* SRAT: System Resource Affinity Table */
-	/* SRAT handler acpi_parse_srat does nothing but get acpi_srat_revision.
-	 * Leave all the work to following subtable handler.
-	 * SRAT 的 subtable 中只定义了 4 种 structure: 3 CPU & 1 memory*/
-	if (!acpi_table_parse(ACPI_SIG_SRAT, acpi_parse_srat)) {
-		struct acpi_subtable_proc srat_proc[3];
-
-		/* 此初始化函数位于 drivers/acpi, 所有 system 通用，所以 sub-table handler
-		 * 覆盖所有 possible CPU, 当前 CPU 只可能是其中一种。
-		 * GICC(Generic Interrupt Controller CPU) 属于 ARM.
-		 *
-		 * Sub-table is easy，以 ACPI_SRAT_TYPE_CPU_AFFINITY 为例，列出了 APIC ID
-		 * & ID 所属 proximity domain ID.
-		 * PXM ID 是 ACPI 的定义(32-bit), kernel 对应的定义是 numa node ID(MAX_NUMNODES),
-		 * 所以 kernel 要将二者 map 起来，这是 handler 要做的。Obviously, ACPI's
-		 * 32-bit PXM ID should not be great than kernel's MAX_NUMNODES. PXM ID
-		 * 与 numa node ID 互相 mapping: pxm_to_node_map[] & node_to_pxm_map[].
-		 * Mapping 的初始化也简单：对于每一个 PXM ID, nodes_found_map 中 first unset
-		 * bit's index 即是对应的 numa node ID. 一个 PXM ID 对应一个 numa node ID,
-		 * 所以变量 nodes_found_map 的名中的 found 是 find from ACPI 之意.
-		 *
-		 * 同时，SRAT 中的 APIC ID(逻辑CPU) 也要 map 到 kernel 的 numa node ID:
-		 * __apicid_to_node[]. Mapping 后 set numa_nodes_parsed, 表示此 numa
-		 * node ID 上已经 parse 过 APIC ID?
-		 * NOTE: 一个 PXM/numa node 上可有多个逻辑 CPU, 即 APIC ID!!!
-		 *
-		 * In other words: kernel 用 numa node ID 来 identify ACPI 中的 PXM ID;
-		 * SRAT 中每个 APIC ID 也属于 kernel 中确定的某 numa node id.*/
-		memset(srat_proc, 0, sizeof(srat_proc));
-		srat_proc[0].id = ACPI_SRAT_TYPE_CPU_AFFINITY;
-		srat_proc[0].handler = acpi_parse_processor_affinity;
-		srat_proc[1].id = ACPI_SRAT_TYPE_X2APIC_CPU_AFFINITY;
-		srat_proc[1].handler = acpi_parse_x2apic_affinity;
-		srat_proc[2].id = ACPI_SRAT_TYPE_GICC_AFFINITY;
-		srat_proc[2].handler = acpi_parse_gicc_affinity;
-
-		acpi_table_parse_entries_array(ACPI_SIG_SRAT,
-					sizeof(struct acpi_table_srat),
-					srat_proc, ARRAY_SIZE(srat_proc), 0);
-
-		/* Turn to parse memory affinity. Its sub-table is easy too, certain
-		 * physical address range belongs to a PXM; and a flag told range's
-		 * property: the memory under the range is hotpluggable? or is volatile?
-		 *
-		 * 同样，SRAT 中的 memory range 也要 map 到 kernel's numa node ID.
-		 * Get node ID from PXM ID via the same routine as above, then store
-		 * into numa_meminfo, easy, no need for verbiage. 而且，parsing 结束同样
-		 * 会 set numa_nodes_parsed 一下。
-		 * 此外，若 memory range is hot pluggable, mark it in memblock region's
-		 * flag. 重要！会再次 evaluate max_possible_pfn, 看起来之前的 evaluation
-		 * 只是在机器的默认 node 上，或者说那个 unpluggable node 上。*/
-		cnt = acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
-					    acpi_parse_memory_affinity, 0);
-	}
-
-	/* After processing SRAT, now kernel is aware: concrete APIC IDs & memory
-	 * ranges that a numa node has. */
-
-	/* SLIT: System Locality Information Table */
-	/* distance 意味着 memory latency, ACPI 中用一个 byte 表示它。0xFF 表示 2 个
-	 * node 间不可达; node 自己到自己的距离是 10. 所以 distance 有效范围是 [10 - 255).
-	 * slit_valid() 根据 ACPI spec 对 matrix  做了简单验证：
-	 *   1. 自己到自己的 distance 必须是 LOCAL_DISTANCE;
-	 *   2. PXM 之间的距离必须大于 LOCAL_DISTANCE;
-	 *
-	 * SLIT parsing 的目的：拿到 matrix entry 中的 value, set 到 numa_distance[],
-	 * 并将 system locality number/PXM number? 记在 numa_distance_cnt 中。
-	 * 有必要再次分析 numa_alloc_distance, 因为产生了和 474aeffd88b8 一样的想法，但它
-	 * 又被 b678c91aefa7 revert.
-	 *
-	 * Documentation/vm/numa.rst 说：若 node 中没有 memory, Linux kernel 将 hide
-	 * this node for physical cell(ACPI PXM). 看来有 memory 的 node 才被 kernel
-	 * 看作真 numa node.  */
-	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
-
-	if (cnt < 0)
-		return cnt;
-	else if (!parsed_numa_memblks)
-		return -ENOENT;
-	return 0;
-}
-
-```
-
------------- acpi_boot_init ------------
-
-前两个 acpi boot 初始化函数和这个函数距离有点远，我们一次性把 ACPI 初始化分析完。
-
-```
-int __init acpi_boot_init(void)
-{
-	/* those are executed after early-quirks are executed */
-	dmi_check_system(acpi_dmi_table_late);
-
-	/* If acpi_disabled, bail out	 */
-	if (acpi_disabled)
-		return 1;
-
-	/* 重复了，已发 patch. Wait to see. */
-	acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf);
-
-	/* set sci_int and PM timer address. FADT 在 acpi_boot_table_init - x - x -
-	 * -> acpi_tb_parse_fadt 已解析过，且将内容 copy 到 local 变量 acpi_gbl_FADT,
-	 * 并做了格式转换。 acpi_parse_fadt 中只是使用 acpi_gbl_FADT.
-	 * NOTE: FADT 针对 ARM 和 IA-PC 分别定义了 2-byte long flag(ARM_BOOT_ARCH,
-	 * IAPC_BOOT_ARCH); PM timer 位于 I/O address space. */
-	acpi_table_parse(ACPI_SIG_FADT, acpi_parse_fadt);
-
-	/* Process the Multiple APIC Description Table (MADT), if present */
-	/* 涉及太多中断相关的知识，待有时间详细分析，目前只有简要分析。*/
-	acpi_process_madt();
-
-	/* HPET Quick Knowledge: HPET spec 独立于 ACPI spec, 所有这类 spec 在
-	 * https://uefi.org/acpi 中可找到。历史原因 HPET 在不同的 spec 中可能有不同的名字，
-	 * 如：IA-PC HPET, Event timers, MultiMedia timer(MMT or MM timer).
-	 * What is a timer? refer to the combination of a Counter, Comparator, and
-	 * Match Register. The Comparator compares the contents of the Match
-	 * Register against the value of a free running up-counter. When the output
-	 * of the up-counter equals the value in the match register an interrupt
-	 * is generated. IA-PC HPET Architecture allows up to 32 compare/match
-	 * registers per counter. Each of the 32 comparators can output an interrupt.
-	 *
-	 * 简而言之，Spec 定义最多有 8 个 timer block, one timer block 最多产生 32 个
-	 * timer interrupt(或者说有 32 个 timer), 当我们说 "HPET" 时，通常指一个 timer
-	 * block. Timer block memory map 到物理地址空间，CPU 可直接寻址， 一个 timer block
-	 * (HPET)的 registers 占据 1k 空间， base address is 4k aligned, registers are
-	 * 64-bit/8-byte aligned.
-	 * ACPI table 中只有一个 HPET table, 描述一个 HPET; 若系统中有多个 HPET, 其他 HPET
-	 * 的信息在 ACPI namespace 中描述，SPEC 给的理由是：Only one HPET table is needed
-	 * in order to boot strap the OS.
-	 * HPET table 描述信息: Hardware Rev ID, timer 数量 in 1st timer block's,
-	 * base address, register block ID/HPET number/sequence number(0 - 7?).
-	 * 看起来有点奇怪，为什么是 "1st" HPET? HPET table 是 1st HPET 吗？
-	 * 1 个 HPET 提供的 timer(32 max) 应足够 kernel 使用，以 Intel ICH9 为例，它提供
-	 * 4 个 timer. HPET 位于南桥 chipset 上，同样以 Intel ICH9 为例，它的 base address
-	 * 配置为 0xFED00000. 至此，我想可以 make an assumption: 目前所有 PC 都只有 1 个
-	 * HPET, 位于地址 0xFED00000, 提供 3 或多个 timer, HPET table 用来描述它的信息。 */
-	acpi_table_parse(ACPI_SIG_HPET, acpi_parse_hpet);
-	/* Boot Graphics Resource Table, UEFI 限定。*/
-	if (IS_ENABLED(CONFIG_ACPI_BGRT))
-		acpi_table_parse(ACPI_SIG_BGRT, acpi_parse_bgrt);
-
-	if (!acpi_noirq)
-		x86_init.pci.init = pci_acpi_init;
-
-	/* Do not enable ACPI SPCR console by default */
-	/* Serial Port Console Redirection Table */
-	acpi_parse_spcr(earlycon_acpi_spcr_enable, false);
-	return 0;
-}
-
-/* 之前已 early_acpi_process_madt. */
-static void __init acpi_process_madt(void)
-{
-#ifdef CONFIG_X86_LOCAL_APIC
-	int error;
-
-	/* acpi_parse_madt 中的干货仅是 MADT header 初始化 acpi_lapic_addr. Early
-	 * process MADT 时还会额外解析 Local APIC Address Override Structure, 若有此
-	 * structure, 这里 acpi_lapic_addr 岂不是可能再次 override? 很快找到答案：该变量只
-	 * 暂存 ACPI 读来的地址，最终通过 register_lapic_address() 记录在 mp_lapic_addr. */
-	if (!acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)) {
-		/* Parse MADT LAPIC entries. 见下面详细分析 */
-		error = acpi_parse_madt_lapic_entries();
-		if (!error) {
-			/* early process 时已 set, 这里 set 应是无 override structure 的情况。*/
-			acpi_lapic = 1;
-
-			/* Parse MADT IO-APIC entries	 */
-			/* 细节在下文。*/
-			mutex_lock(&acpi_ioapic_lock);
-			error = acpi_parse_madt_ioapic_entries();
-			mutex_unlock(&acpi_ioapic_lock);
-			if (!error) {
-				acpi_set_irq_model_ioapic();
-
-				smp_found_config = 1;
-			}
-		}
-
-		if (error == -EINVAL) {
-			/*
-			 * Dell Precision Workstation 410, 610 come here.
-			 */
-			printk(KERN_ERR PREFIX
-			       "Invalid BIOS MADT, disabling ACPI\n");
-			disable_acpi();
-		}
-	} else {
-		/*
- 		 * ACPI found no MADT, and so ACPI wants UP PIC mode.
- 		 * In the event an MPS table was found, forget it.
- 		 * Boot with "acpi=off" to use MPS on such a system.
- 		 */
-		if (smp_found_config) {
-			printk(KERN_WARNING PREFIX
-				"No APIC-table, disabling MPS\n");
-			smp_found_config = 0;
-		}
-	}
-
-	/*
-	 * ACPI supports both logical (e.g. Hyper-Threading) and physical
-	 * processors, where MPS only supports physical.
-	 */
-	if (acpi_lapic && acpi_ioapic)
-		printk(KERN_INFO "Using ACPI (MADT) for SMP configuration "
-		       "information\n");
-	else if (acpi_lapic)
-		printk(KERN_INFO "Using ACPI for processor (LAPIC) "
-		       "configuration information\n");
-#endif
-	return;
-}
-
-/* parse ACPI 中 APIC 相关信息 */
-static int __init acpi_parse_madt_lapic_entries(void)
-{
-	int count;
-	int x2count = 0;
-	int ret;
-	struct acpi_subtable_proc madt_proc[2];
-
-	if (!boot_cpu_has(X86_FEATURE_APIC))
-		return -ENODEV;
-
-	/* Parse ACPI_MADT_TYPE_LOCAL_SAPIC first?
-	 * SAPIC = Streamlined APIC: An advanced APIC commonly found on Intel
-	 * Itanium TM Processor Family-based 64-bit systems. Soga, SAPIC 和
-	 * APIC/X2APIC 不会同时存在，因为他们是不同 CPU arch 上的 APIC. So, if NO SAPIC,
-	 * check APIC/X2APIC, 逻辑没问题。
-	 *
-	 * SAPIC sub-table 中有多个 id field, 初看很困惑。EID 是 Extension ID 的缩写,
-	 * ID & EID 一起描述 SAPIC 的 APIC ID, 这是硬件拓扑范畴的 ID; 同时, SAPIC 在
-	 * ACPI namespace 还有 ACPI processor ID 和 ACPI Processor UID Value, 表示某
-	 * CPU 在 ACPI namespace 中的 ID, 看起来应该只用其中之一，而且前者在 ACPI Spec
-	 * 中标记为 deprecated. 但代码处理中, SAPIC 与 APIC/X2APIC 不同，使用了前者，APIC
-	 * & X2APIC structure 中根本都没有前者 ID.
-	 *
-	 * (APIC ID & APIC's ACPI ID) 经 acpi_register_lapic -> generic_processor_info
-	 * 映射得到 kernel 视角的 logical CPU number. 细节见下文。
-	 */
-	count = acpi_table_parse_madt(ACPI_MADT_TYPE_LOCAL_SAPIC,
-				      acpi_parse_sapic, MAX_LOCAL_APIC);
-
-	if (!count) {
-		/* 确认不是 Itanium, then, process the other possibilities.
-		 * NOTE: 支持 x2APIC arch 的 CPU 可以工作在 x2APIC mode 或 xAPIC mode 下，
-		 * 注意这些术语(arch VS mode)间的 subtle difference. Q: 一个 CPU package
-		 * 的不同 logical CPU 是否可分别处于两个不同 mode？直觉是 NO.  参考：
-		 *   1. Intel SDM 3a, chapter 10.3.
-		 *   2. x86_x64体系探索及编程(邓志), 18.1.2 APIC 体系的版本
-		 *
-		 * APIC VS xAPIC VS x2APIC: 最显著的不同可能是他们的 ID length，参考 Intel
-		 * SDM 3a, Figure 10-6. Local APIC ID Register.
-		 * 但 ACPI_MADT_TYPE_LOCAL_APIC 看起来可以 cover both APIC & xAPIC.
-		 *
-		 * APIC/X2APIC sub-table 很简单，干货只是 APIC ID & ACPI processor UID,
-		 * sub-table handler 获得他们后，处理同 SAPIC: acpi_register_lapic -->
-		 * generic_processor_info. 细节见下文。
-		 * NOTE: CONFIG_X86_X2APIC 决定 Kernel 是否支持 x2APIC. */
-		memset(madt_proc, 0, sizeof(madt_proc));
-		madt_proc[0].id = ACPI_MADT_TYPE_LOCAL_APIC;
-		madt_proc[0].handler = acpi_parse_lapic;
-		madt_proc[1].id = ACPI_MADT_TYPE_LOCAL_X2APIC;
-		madt_proc[1].handler = acpi_parse_x2apic;
-		ret = acpi_table_parse_entries_array(ACPI_SIG_MADT,
-				sizeof(struct acpi_table_madt),
-				madt_proc, ARRAY_SIZE(madt_proc), MAX_LOCAL_APIC);
-		if (ret < 0) {
-			printk(KERN_ERR PREFIX
-					"Error parsing LAPIC/X2APIC entries\n");
-			return ret;
-		}
-
-		count = madt_proc[0].count;
-		x2count = madt_proc[1].count;
-	}
-
-	if (!count && !x2count) {
-		printk(KERN_ERR PREFIX "No LAPIC entries present\n");
-		/* TBD: Cleanup to allow fallback to MPS */
-		return -ENODEV;
-	} else if (count < 0 || x2count < 0) {
-		printk(KERN_ERR PREFIX "Error parsing LAPIC entry\n");
-		/* TBD: Cleanup to allow fallback to MPS */
-		return count;
-	}
-
-	/* Check if NMI connects to LINT1 of LAPIC or not, if not, just print
-	 * warning. 简而言之： NMI 应该连接到 LINT1 pin.
-	 *
-	 * Take ACPI_MADT_TYPE_LOCAL_APIC_NMI for example, ACPI spec says:
-	 * Each Local APIC NMI connection requires a separate Local APIC NMI
-	 * structure. For example, if the platform has 4 processors with ID 0-3 and
-	 * NMI is connected LINT1 for processor 3 and 2, two Local APIC NMI entries
-	 * would be needed in the MADT. */
-	x2count = acpi_table_parse_madt(ACPI_MADT_TYPE_LOCAL_X2APIC_NMI,
-					acpi_parse_x2apic_nmi, 0);
-	count = acpi_table_parse_madt(ACPI_MADT_TYPE_LOCAL_APIC_NMI,
-				      acpi_parse_lapic_nmi, 0);
-	if (count < 0 || x2count < 0) {
-		printk(KERN_ERR PREFIX "Error parsing LAPIC NMI entry\n");
-		/* TBD: Cleanup to allow fallback to MPS */
-		return count;
-	}
-	return 0;
-}
-
-/* 简约分析 to get the point. */
-int generic_processor_info(int apicid, int version)
-{
-	/* nr_cpu_ids 初始化自 CONFIG_NR_CPUS, 也可被修改 via parameter "nr_cpus".
-	 * 表示 kernel 支持的最大 CPU 数。 */
-	int cpu, max = nr_cpu_ids;
-
-	/* boot_cpu_physical_apicid (之前)在 early_acpi_parse_madt_lapic_addr_ovr --
-	 * --> register_lapic_address 已由 APIC ID register 初始化。在本文分析条件下
-	 * (X86_64 & SMP), it is not set in phys_cpu_present_map.
-	 * (之后的start_kernel 的 time_init 在 UniProcessor 情况下会 set.) */
-	bool boot_cpu_detected = physid_isset(boot_cpu_physical_apicid,
-				phys_cpu_present_map);
-
-	/* Skip 无关紧要 codes. */
-
-	/* If boot cpu has not been detected yet, then only allow up to
-	 * nr_cpu_ids - 1 processors and keep one slot free for boot cpu.
-	 * 进入此函数注册 apicid 时，若发现:
-	 *   1. boot_cpu_physical_apicid is not set in phys_cpu_present_map, AND
-	 *   2. 已注册的 num_processors > max config value, AND
-	 *   3. 入参 apicid 也不是 boot_cpu_physical_apicid
-	 * 则需在 phys_cpu_present_map 给 boot cpu 留个位置。disabled_cpus 表示 kernel
-	 * 不能使用的 CPU 数目. "留个位置"就是不处理入参 apicid, 把它当作 disabled_cpu.
-	 */
-	if (!boot_cpu_detected && num_processors >= nr_cpu_ids - 1 &&
-	    apicid != boot_cpu_physical_apicid) {
-	    /* nr_cpu_ids 的值和 ACPI MADT 中 local APIC entry 数可能不同，若 ACPI MADT
-	     * 中 entry 数 > kernel 支持的数目，则不支持多余 CPUs, 将他们计入 disabled_cpus.
-	     * 所以 "thiscpu" is evaluated like this, 表示 CPU index.
-	     * 本函数中多处定义 thiscpu, 看起来冗余，仅 debug 用。*/
-		int thiscpu = max + disabled_cpus - 1;
-
-		pr_warning(
-			"APIC: NR_CPUS/possible_cpus limit of %i almost"
-			" reached. Keeping one slot for boot cpu."
-			"  Processor %d/0x%x ignored.\n", max, thiscpu, apicid);
-
-		disabled_cpus++;
-		return -ENODEV;
-	}
-
-	/* 逻辑同上，不赘述。*/
-	if (num_processors >= nr_cpu_ids) {
-		int thiscpu = max + disabled_cpus;
-
-		pr_warning("APIC: NR_CPUS/possible_cpus limit of %i "
-			   "reached. Processor %d/0x%x ignored.\n",
-			   max, thiscpu, apicid);
-
-		disabled_cpus++;
-		return -EINVAL;
-	}
-
-	/* 逻辑很明显, BSP 要作为第一个 kernel logical CPU ID: 0, 其他的依次递增。
-	 * NOTE: "logical cpuid" 是 kernel 定义的 CPU 编号(纯软件视角)，与 APIC ID 有
-	 * 1:1 映射关系 via cpuid_to_apicid[].
-	 */
-	if (apicid == boot_cpu_physical_apicid) {
-		/* x86_bios_cpu_apicid is required to have processors listed
-		 * in same order as logical cpu numbers. Hence the first
-		 * entry is BSP, and so on.
-		 * boot_cpu_init() already hold bit 0 in cpu_present_mask for BSP. */
-		/* 上面注释暂时不懂，TBD. */
-		cpu = 0;
-
-		/* Logical cpuid 0 is reserved for BSP. */
-		cpuid_to_apicid[0] = apicid;
-	} else {
-		cpu = allocate_logical_cpuid(apicid);
-		if (cpu < 0) {
-			disabled_cpus++;
-			return -EINVAL;
-		}
-	}
-
-	/* SKIP Validate version code */
-
-	if (apicid > max_physical_apicid)
-		max_physical_apicid = apicid;
-
-	/* 一个物理 CPU 在不同 context 下有不同的 ID 定义:
-	 *   1. First, 它在硬件拓扑上有 APIC ID;
-	 *   2. Then, 它在 ACPI namespace 中有 ACPI processor ID;
-	 *   3. At last, 它在 Linux kernel 中有 logical CPU ID.
-	 * ID 之间互相映射，比如这里，还有 caller: acpi_register_lapic 处理返回值的操作。
-	 * PERCPU, TBD.
-	 */
-#if defined(CONFIG_SMP) || defined(CONFIG_X86_64)
-	early_per_cpu(x86_cpu_to_apicid, cpu) = apicid;
-	early_per_cpu(x86_bios_cpu_apicid, cpu) = apicid;
-#endif
-	/* Skip X86_32 code. */
-
-	/* 至此，已确定一个 APIC ID 在 kernel 中的 logical CPU ID.
-	 * 首次看到 cpu mask 的 assignment, 所以 cpu mask 其实是 logical CPU ID mask */
-	set_cpu_possible(cpu, true);
-	physid_set(apicid, phys_cpu_present_map);
-	set_cpu_present(cpu, true);
-	num_processors++;
-
-	return cpu;
-}
-
-/* Parse IOAPIC related entries in MADT returns 0 on success, < 0 on error */
-static int __init acpi_parse_madt_ioapic_entries(void)
-{
-	int count;
-	/* Skip 不重要的 code. */
-
-	/* if "noapic" boot option, don't look for IO-APICs */
-	/* kernel parameter "noapic" 指的是不要使用 IO-APIC, 但这个名字也太名不副实了？*/
-	if (skip_ioapic_setup) {
-		printk(KERN_INFO PREFIX "Skipping IOAPIC probe "
-		       "due to 'noapic' option.\n");
-		return -ENODEV;
-	}
-
-	/* Quick knowledge: 系统中可能有一或多个 I/O APIC, each I/O APIC resides at a
-	 * unique address, address 指的应是 direct register 中的 index register 的
-	 * memory address. 每个 I/O APIC chip 对应 ACPI MADT 中一个 I/O APIC Structure.
-	 *
-	 * IO-APIC structure 的处理也很复杂，在 mp_register_ioapic. Kernel 用 struct
-	 * ioapic 描述一个 I/O APIC, 用 nr_ioapics 表示它的数目，该函数的主要作用是初始化
-	 * 相应的 struct ioapic(ioapics[MAX_IO_APICS]).
-	 *
-	 * 术语的不同：kernel 用 struct ioapic.nr_registers 描述 I/O APIC's redirection
-	 * table 中 redirection register 的数目，并被它为 IRQ routing register.
-	 */
-	count = acpi_table_parse_madt(ACPI_MADT_TYPE_IO_APIC, acpi_parse_ioapic,
-				      MAX_IO_APICS);
-	if (!count) {
-		printk(KERN_ERR PREFIX "No IOAPIC entries present\n");
-		return -ENODEV;
-	} else if (count < 0) {
-		printk(KERN_ERR PREFIX "Error parsing IOAPIC entry\n");
-		return count;
-	}
-
-	/* 下面的内容超出了知识边界，待回头继续分析。Go back. */
-	count = acpi_table_parse_madt(ACPI_MADT_TYPE_INTERRUPT_OVERRIDE,
-				      acpi_parse_int_src_ovr, nr_irqs);
-	if (count < 0) {
-		printk(KERN_ERR PREFIX
-		       "Error parsing interrupt source overrides entry\n");
-		/* TBD: Cleanup to allow fallback to MPS */
-		return count;
-	}
-
-	/*
-	 * If BIOS did not supply an INT_SRC_OVR for the SCI
-	 * pretend we got one so we can set the SCI flags.
-	 * But ignore setting up SCI on hardware reduced platforms.
-	 */
-	if (acpi_sci_override_gsi == INVALID_ACPI_IRQ && !acpi_gbl_reduced_hardware)
-		acpi_sci_ioapic_setup(acpi_gbl_FADT.sci_interrupt, 0, 0,
-				      acpi_gbl_FADT.sci_interrupt);
-
-	/* Fill in identity legacy mappings where no override */
-	mp_config_acpi_legacy_irqs();
-
-	count = acpi_table_parse_madt(ACPI_MADT_TYPE_NMI_SOURCE,
-				      acpi_parse_nmi_src, nr_irqs);
-	if (count < 0) {
-		printk(KERN_ERR PREFIX "Error parsing NMI SRC entry\n");
-		/* TBD: Cleanup to allow fallback to MPS */
-		return count;
-	}
-
-	return 0;
-}
-```
-
-### KASLR
-KASLR 的主要工作：随机化 kernel 自身所在 physical & virtual address, 在 ZO 完成，并在 VO 入口代码对 page table 中 kernel 所在 range 进行修正，适配 ZO 中的随机化结果。 Besides，还有一部分 kernel 使用的数据虚拟空间(kaslr_regions[])需要随机化，这似乎?是最后的随机化处理。从 Documentation/x86/x86_64/mm.rst 中可以看出，kaslr_regions[] 列出的 range 后都有 reserve unused hole, 这看起来似乎就是为了 prepare for KASLR. 函数分析忽略 5-level paging 的情况。但此函数似乎只做了简单的数学计算，得到 region 随机化后的新 base address.
-
-```
-/* Initialize base and padding for each memory region randomized with KASLR */
-void __init kernel_randomize_memory(void)
-{
-	size_t i;
-	unsigned long vaddr_start, vaddr;
-	unsigned long rand, memory_tb;
-	struct rnd_state rand_state;
-	unsigned long remain_entropy;
-	unsigned long vmemmap_size;
-
-	/* 待随机化的 virtual address range 的起点 = direct mapping 的起始地址 */
-	vaddr_start = pgtable_l5_enabled() ? __PAGE_OFFSET_BASE_L5 : __PAGE_OFFSET_BASE_L4;
-	vaddr = vaddr_start;
-
-	/*
-	 * These BUILD_BUG_ON checks ensure the memory layout is consistent
-	 * with the vaddr_start/vaddr_end variables. These checks are very
-	 * limited....
-	 */
-	BUILD_BUG_ON(vaddr_start >= vaddr_end);
-	BUILD_BUG_ON(vaddr_end != CPU_ENTRY_AREA_BASE);
-	BUILD_BUG_ON(vaddr_end > __START_KERNEL_map);
-
-	/* boot protocol.loadflags 中 bit 1: KASLR_FLAG 仅是 Kernel 内部使用，ZO 用它
-	 * 来告诉 VO 关于 KASLR 的状态。这里就用到了。Refer: Documentation/x86/boot.rst */
-	if (!kaslr_memory_enabled())
-		return;
-
-	/* 各 memory range 的定义都在 Documentation/x86/x86_64/mm.rst. Direct mapping
-	 * 整个物理地址空间，所以是 MAX_PHYSMEM_BITS.*/
-	kaslr_regions[0].size_tb = 1 << (MAX_PHYSMEM_BITS - TB_SHIFT);
-	kaslr_regions[1].size_tb = VMALLOC_SIZE_TB;
-
-	/* Update Physical memory mapping to available and
-	 * add padding if needed (especially for memory hotplug support). */
-	/* 看起来是说，为 memory hotplug 预留的虚拟地址空间，也要被随机化 */
-	BUG_ON(kaslr_regions[0].base != &page_offset_base);
-	memory_tb = DIV_ROUND_UP(max_pfn << PAGE_SHIFT, 1UL << TB_SHIFT) +
-		CONFIG_RANDOMIZE_MEMORY_PHYSICAL_PADDING;
-
-	/* Adapt phyiscal memory region size based on available memory */
-	/* 术语使用实在让人困惑。memory_tb 由 max_pfn 计算得来，表示 RAM 的 size. 当我们说
-	 * direct mapping 时，是指 RAM 空间的 page mapping, kaslr_regions[0].size_tb
-	 * 初始化用的 MAX_PHYSMEM_BITS, 表示所有 CPU physical address space.
-	 * 由于有 memory hole, 即 RAM 物理地址空间不是连续的，max_pfn 应该大于实际的 RAM size.
-	 * 但看起来不 care memory hole, 就用 max_pfn 表示 RAM 最大地址。
-	 * 现在, kaslr_regions[0].size_tb 表示 RAM size. */
-	if (memory_tb < kaslr_regions[0].size_tb)
-		kaslr_regions[0].size_tb = memory_tb;
-
-	/* Calculate the vmemmap region size in TBs, aligned to a TB boundary. */
-	/* 原来 vmemmap 空间是用来存放 struct page 数据结构的？ 描述 RAM size 的 size_tb
-	 * 的 unit 由 TB 转为 page frame number. 看来 RAM page frame 与 struct page
-	 * 是 1:1 映射关系。但 vmemmap 的 size 应该不超过 1TB? mm.rst 中预留的就是 1TB.
-	 * 参考阅读：Documentation/vm/memory-model.rst */
-	vmemmap_size = (kaslr_regions[0].size_tb << (TB_SHIFT - PAGE_SHIFT)) *
-			sizeof(struct page);
-	kaslr_regions[2].size_tb = DIV_ROUND_UP(vmemmap_size, 1UL << TB_SHIFT);
-
-	/* Calculate entropy available between regions */
-	/* KASLR 代码注释中常出现 "entropy", 不理解。就代码逻辑看，remain_entropy 表示：
-	 * mm.rst 中给 kaslr_regions[] 预留的虚拟地址空间中，未被占用的部分，即剩余 size. */
-	remain_entropy = vaddr_end - vaddr_start;
-	for (i = 0; i < ARRAY_SIZE(kaslr_regions); i++)
-		remain_entropy -= get_padding(&kaslr_regions[i]);
-
-	/* Get one randomized number set. */
-	prandom_seed_state(&rand_state, kaslr_get_random_long("Memory"));
-
-	for (i = 0; i < ARRAY_SIZE(kaslr_regions); i++) {
-		unsigned long entropy;
-
-		/* Select a random virtual address using the extra entropy available. */
-		/* entropy 以 byte 为单位表示一段未占用空间 size. */
-		entropy = remain_entropy / (ARRAY_SIZE(kaslr_regions) - i);
-		/* randomized number set => an unsigned long integer. */
-		prandom_bytes_state(&rand_state, &rand, sizeof(rand));
-		/* For 4-level paging, PUD_MASK 表示低 30 bit 是 0, 高位是 1. A PUD entry
-		 * covers 1G space. Entropy 现在表示以 GB 为单位的 size.
-		 * OK, now we get, 各 region 地址增加随机 GB. */
-		entropy = (rand % (entropy + 1)) & PUD_MASK;
-		vaddr += entropy; /* vaddr 表示当前 region 的 new base address. */
-		*kaslr_regions[i].base = vaddr;
-
-		/* Jump the region and add a minimum padding based on
-		 * randomization alignment. */
-		/* 这注释写的真像中国人。Region 的 new base + 它的 size 后向上对齐到 GB 边界，
-		 * 即是 next region 的 base.*/
-		vaddr += get_padding(&kaslr_regions[i]);
-		vaddr = round_up(vaddr + 1, PUD_SIZE);
-		remain_entropy -= entropy;
-	}
-}
-
-```
 ### spinlock
 
-early_pfn_to_nid() 中有早期的 spinlock 操作，TBD.
+early_pfn_to_nid() 中有早期的 spinlock 操作，TBD. Kernel initialization 中很少使用 spinlock, take *init_mm.page_table_lock* for example to analyse how it is implemented.
+
+spinlock data structure is as following:
+
+```c
+typedef struct spinlock {
+	union {
+		struct raw_spinlock rlock;
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+...
+#endif
+	};
+} spinlock_t;
+
+typedef struct raw_spinlock {
+	arch_spinlock_t raw_lock;
+
+#ifdef CONFIG_DEBUG_SPINLOCK
+	...
+#endif
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	...
+#endif
+} raw_spinlock_t;
+
+typedef struct qspinlock {
+	union {
+		atomic_t val;
+
+		/*
+		 * By using the whole 2nd least significant byte for the
+		 * pending bit, we can allow better optimization of the lock
+		 * acquisition for the pending bit holder.
+		 */
+#ifdef __LITTLE_ENDIAN
+		struct {
+			u8	locked;
+			u8	pending;
+		};
+		struct {
+			u16	locked_pending;
+			u16	tail;
+		};
+#else
+		/* X86 is little endian. */
+#endif
+	};
+} arch_spinlock_t;
+
+typedef struct {
+	int counter;
+} atomic_t;
+```
+
+Now let's see how it is initialized in the example:
+
+```c
+take struct mm_struct init_mm = {
+	...
+	.page_table_lock =  __SPIN_LOCK_UNLOCKED(init_mm.page_table_lock),
+	...
+};
+
+/* The frequently seen way to define a spinlock. */
+#define DEFINE_SPINLOCK(x)	spinlock_t x = __SPIN_LOCK_UNLOCKED(x)
+
+#define __SPIN_LOCK_UNLOCKED(lockname) \
+	(spinlock_t) __SPIN_LOCK_INITIALIZER(lockname)
+
+#define __SPIN_LOCK_INITIALIZER(lockname) \
+	{ { .rlock = ___SPIN_LOCK_INITIALIZER(lockname) } }
+
+#define ___SPIN_LOCK_INITIALIZER(lockname)	\
+	{					\
+	.raw_lock = __ARCH_SPIN_LOCK_UNLOCKED,	\
+	SPIN_DEBUG_INIT(lockname)		\
+	SPIN_DEP_MAP_INIT(lockname) }
+
+#define	__ARCH_SPIN_LOCK_UNLOCKED	{ { .val = ATOMIC_INIT(0) } }
+
+#define ATOMIC_INIT(i) { (i) }
+```
+
+How spinlock is locked. The implementation depends on different conditions. In **kernel/Kconfig.locks**:
+
+```makefile
+config INLINE_SPIN_LOCK
+        def_bool y
+        depends on !GENERIC_LOCKBREAK && ARCH_INLINE_SPIN_LOCK
+```
+
+**arch/x86/Kconfig** doesn't select **ARCH_INLINE_SPIN_LOCK** & doesn't have GENERIC_LOCKBREAK too, while some others do, like **arch/arm64/Kconfig**, **arch/powerpc/Kconfig**. So the lock implementation should be the one in **spinlock.c**:
+
+```c
+static __always_inline void spin_lock(spinlock_t *lock)
+{
+	raw_spin_lock(&lock->rlock);
+}
+
+#define raw_spin_lock(lock)	_raw_spin_lock(lock)
+
+/* spinlock.c */
+#ifndef CONFIG_INLINE_SPIN_LOCK
+void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
+{
+	__raw_spin_lock(lock);
+}
+EXPORT_SYMBOL(_raw_spin_lock);
+#endif
+
+static inline void __raw_spin_lock(raw_spinlock_t *lock)
+{
+	preempt_disable();
+	spin_acquire(&lock->dep_map, 0, 0, _RET_IP_);
+	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
+}
+
+#define spin_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+
+#define lock_acquire_exclusive(l, s, t, n, i)		lock_acquire(l, s, t, 0, 1, n, i)
+
+void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+			  int trylock, int read, int check,
+			  struct lockdep_map *nest_lock, unsigned long ip)
+{
+	unsigned long flags;
+
+	trace_lock_acquire(lock, subclass, trylock, read, check, nest_lock, ip);
+
+	if (!debug_locks)
+		return;
+
+	if (unlikely(!lockdep_enabled())) {
+		/* XXX allow trylock from NMI ?!? */
+		if (lockdep_nmi() && !trylock) {
+			struct held_lock hlock;
+
+			hlock.acquire_ip = ip;
+			hlock.instance = lock;
+			hlock.nest_lock = nest_lock;
+			hlock.irq_context = 2; // XXX
+			hlock.trylock = trylock;
+			hlock.read = read;
+			hlock.check = check;
+			hlock.hardirqs_off = true;
+			hlock.references = 0;
+
+			verify_lock_unused(lock, &hlock, subclass);
+		}
+		return;
+	}
+
+	raw_local_irq_save(flags);
+	check_flags(flags);
+
+	lockdep_recursion_inc();
+	__lock_acquire(lock, subclass, trylock, read, check,
+		       irqs_disabled_flags(flags), nest_lock, ip, 0, 0);
+	lockdep_recursion_finish();
+	raw_local_irq_restore(flags);
+}
+
+```
 
 ### PERCPU variable
 
@@ -10642,7 +8022,7 @@ void __init setup_per_cpu_areas(void)
 
 ## APPENDIX
 
-### 常见汇编指令快速参考
+### Quick reference of instructions
 
 #### CMP
 
