@@ -114,7 +114,7 @@ repeat:
 
 All allocation finally go to memblock_alloc_range_nid() --> memblock_find_in_range_node() --> __memblock_find_range_bottom_up() or __memblock_find_range_top_down() --> for_each_free_mem_range() --..--> __next_mem_range().
 
-Traditionally, memblock only allocate memory in top-down way, as NUMA emerged, bottom-up allocation is implemented.
+memblock only allocate memory in top-down way before, as NUMA emerged, bottom-up allocation is implemented.
 
 The first memblock allocation takes place in e820__memblock_alloc_reserved_mpc_new() which has range limitation of 1M.
 

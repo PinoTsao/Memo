@@ -1,20 +1,22 @@
 # x86 NUMA
 
-Non-uniform memory access(NUMA) 的介绍参考：
+Refer to introduction of Non-uniform memory access(NUMA) at:
 
-  1. [wikipedia](https://en.wikipedia.org/wiki/Non-uniform_memory_access)
+  1. [NUMA on wikipedia](https://en.wikipedia.org/wiki/Non-uniform_memory_access)
   2. Documentation/vm/numa.rst
   3. man 7 numa
 
-从 term 名字 & manual 可以看出，它强调的是 memory, 所以
+According to the acronym itself & the manual, NUMA emphasizes on memory, that is why *Documentation/vm/numa.rst* says:
 
 >Linux on X86 will "hide" any node representing a physical cell that has no memory attached, and reassign any CPUs attached to that cell to a node representing a cell that does have memory.
 
-In other words, 对 Linux kernel 来说，有 memory 的 node 才是真 node.
+In other words, to Linux kernel, node with memory is genuine.
 
-题外话： CPU & Memory hotplug 是通过 hotpluggable Node 完成，并不是(笔者)原以为的直插。[这里](https://lwn.net/Articles/84089/)的定义中， Node 和 NUMA Node 并不完全一致，但自从 NUMA node is hotpluggable 后，**个人推测**业界 CPU & Memory hotplug 的实现都是通过 NUMA Node. 二者定义中的细微差别应是: NUMA system 不止一条 system bus.(CPU 到 Memory 的连接是一条 system bus.)
+>NOTE:
 
-真实世界的 NUMA capable motherboard：
+>CPU & Memory hotplug 是通过 hot-pluggable Node 完成，并非(笔者原以为的)直插 CPU or memory. [这里](https://lwn.net/Articles/84089/)的定义中， Node 和 NUMA Node 并不完全一致，但自从 NUMA node is hotpluggable 后，**个人推测**业界 CPU & Memory hotplug 的实现都是通过 NUMA Node. Subtle difference between two definition: NUMA system 不止一条 system bus.(CPU 到 Memory 的连接是一条 system bus.)
+
+NUMA capable motherboard in realy world:
 
 ![NUMA Node](numanode.png)
 
@@ -22,9 +24,9 @@ In other words, 对 Linux kernel 来说，有 memory 的 node 才是真 node.
 
 ## NUMA Initialization
 
-NUMA 是 hardware 的设计，一个 NUMA node 上有"几个 CPU" & "多少 memory" 的信息只有 firmware 才知道。 On modern computing system, 这些信息通过 ACPI's SRAT & SLIT传递给 Linux kernel.
+NUMA is information of hardware topology. Only firmware(or vendor) knows about the details: How many CPU &  memory a specific node. On modern PC, these info is passed OS via ACPI's SRAT & SLIT.
 
-X86 上 NUMA 的初始化在 setup_arch --> initmem_init. For NUMA+X86_64, initmem_init 的实现是 arch/x86/mm/numa_64.c 中的这位，我们只分析它:
+In case hardware & Linux kernel support NUMA, its initialization on X86 is thru: setup_arch --> initmem_init. For NUMA+X86_64, initmem_init 的实现是 arch/x86/mm/numa_64.c 中的这位，我们只分析它:
 
 ```
 void __init initmem_init(void)
@@ -36,7 +38,7 @@ void __init initmem_init(void)
  * last fallback is dummy single node config encompassing whole memory and
  * never fails. */
 /* According to comments above & a glance at function body, 可看出 NUMA 的初始化
- * 分 3 种不同方式: common X86, AMD-specific, NO NUMA(1 个 node).
+ * 分 3 种不同方式: common X86, AMD-specific, NO NUMA(emulate 1 node).
  *
  * What is AMD-specific?
  * AMD 在其第一款 64 bit CPU, Opteron of 2003, 最先支持 NUMA. According to head
@@ -45,8 +47,9 @@ void __init initmem_init(void)
  * NUMA 的初始设计不通过 ACPI table 传递 NUMA 信息。随着 Intel 开始支持 NUMA in late
  * 2007, 大家开始一致使用 ACPI table 的方式传递 NUMA 信息。
  *
- * In case CPU arch provided NUMA info failed to initialize NUMA in kernel,
- * kernel 有理由认为当前系统没有 NUMA, 把所有 CPU&memory 当作一个 dummy node.
+ * In case both platform & kernel support NUMA but failed to initialize NUMA due to
+ * corrupted SRAT or SLIT data, it make sense that Linux kernel regard that all CPU
+ * & memory belongs to dummy node.
  */
 void __init x86_numa_init(void)
 {
@@ -75,42 +78,46 @@ static int __init numa_init(int (*init_func)(void))
 	int i;
 	int ret;
 
-	/* MAX_LOCAL_APIC 实际指 ID, 不是数量， refer:
+	/* MAX_LOCAL_APIC denotes the max APIC ID, NOT the max CPU number kernel support.
+	 * Refer to:
 	 *     http://lkml.iu.edu/hypermail/linux/kernel/1509.3/01126.html
 	 *
-	 * 背景 tips:
+	 * Tips:
 	 *   1. 一个 APIC ID 对应一个 CPU, 一个 CPU 对应一个 NODE. CPU 的 APIC ID
 	 *      (register/ACPI 中各有一份)可能 non-contiguous;
 	 *   2. MAX_NUMNODES <-- NODES_SHIFT <-- CONFIG_NODES_SHIFT 的定义关系?
 	 *      autoconf.h 不是为 .c 直接 #include 用, 而 MAX_NUMNODES 方便直接使用。
+	 *
 	 * Node 管理与 CPU 一样使用 bitmap --> mask 的形式。
-	 * 此初始化似乎多余？因为声明处已初始化。 */
+	 * 此初始化似乎多余？因为声明处已初始化。
+	 */
 	for (i = 0; i < MAX_LOCAL_APIC; i++)
 		set_apicid_to_node(i, NUMA_NO_NODE);
 
 	/* node_states[NR_NODE_STATES] 定义处，元素 N_POSSIBLE 的初始化(NODE_MASK_ALL)
 	 * 有些 tricky: 因 MAX_NUMNODES 可能不是 BITS_PER_LONG 的整数倍, 所以使用
 	 * BITMAP_LAST_WORD_MASK set bitmap 中剩余 bit.
-	 * enum node_states 的定义值得分析, 看起来和 memory zone 相关，TBD
-	 * 清零各 nodemask 变量 */
+	 * enum node_states 的定义值得分析, 看起来和 memory zone 相关，TBD.
+	 *
+	 * Clear all nodemask variables.
+	 */
 	nodes_clear(numa_nodes_parsed);
 	nodes_clear(node_possible_map);
 	nodes_clear(node_online_map);
 
-	/* 从 NR_NODE_MEMBLKS 的定义看, Linux 认为一个 NUMA node 最多有 2 个 memblock
-	 * region; 但从 E820_MAX_ENTRIES 的定义看， Linux 认为一个 NUMA node 最多有 3 个
-	 * range.  WHY??? Tip: E820_MAX_ENTRIES 的 comments 说，NUMA 的 E820 信息只有
-	 * EFI 才能传给 kernel, legacy BIOS can't. */
+	/* According to NR_NODE_MEMBLKS, it consider a NUMA node has 2 memory ranges
+	 * at most; But according to E820_MAX_ENTRIES，it consider a NUMA node has 3
+	 * ranges at most.  WHY?
+	 */
 	memset(&numa_meminfo, 0, sizeof(numa_meminfo));
 
-	/* MAX_NUMNODES = 无效 */
 	WARN_ON(memblock_set_node(0, ULLONG_MAX, &memblock.memory,
 				  MAX_NUMNODES));
 	WARN_ON(memblock_set_node(0, ULLONG_MAX, &memblock.reserved,
 				  MAX_NUMNODES));
 
 	/* In case that parsing SRAT failed. */
-	/* 此刻不知道 memblock.memory 中哪儿个 region 是 hotpluggable. */
+	/* memblock.memory is not aware of region hot-pluggable attribute. */
 	WARN_ON(memblock_clear_hotplug(0, ULLONG_MAX));
 
 	/* numa_distance[] 中的数据来自 SLIT's matrix entry, 表示 node 之间距离。
@@ -196,8 +203,8 @@ int __init acpi_numa_init(void)
 	 * SRAT cpu entries could have different order with that in MADT.
 	 * So go over all cpu entries in SRAT to get apicid to node mapping. */
 
-	/* Kernel 配置的 cpu 数目(config 或 parameter) 不应限制这里 SRAT 的解析，因为
-	 * 这二者完全不相关，OS 自己不会知道当前系统上的 cpu 数量。*/
+	/* Kernel 配置的 CPU 数目(config 或 parameter) 不应限制 SRAT 的解析，因为
+	 * 二者完全不相关，前者表示支持的数量，后者表中是 APIC ID. */
 
 	/* SRAT: System Resource Affinity Table */
 	/* SRAT handler acpi_parse_srat does nothing but get acpi_srat_revision.
@@ -211,21 +218,23 @@ int __init acpi_numa_init(void)
 		 * GICC(Generic Interrupt Controller CPU) 属于 ARM.
 		 *
 		 * Sub-table 的主要内容是 APIC ID & 它对应的 proximity domain ID. PXM ID
-		 * 是 ACPI 术语(32-bit), 对应 kernel 使用的逻辑 NUMA ID(MAX_NUMNODES),
-		 * sub-table handler 将二者映射起来，也将 APIC ID 与 逻辑 NUMA ID 映射起来。
-		 * Kernel 限制 PXM ID 到 MAX_NUMNODES, 若 ACPI 定义的 PXM ID > MAX_NUMNODES,
-		 * 则 NUMA 初始化失败！ 注意 "数目(count)" 与"ID" 的区别。
+		 * 是 ACPI 术语(32-bit), 对应 kernel 使用的逻辑 NUMA node ID(MAX_NUMNODES),
+		 * sub-table handler 将二者映射，也将 APIC ID 与 逻辑 NUMA node ID 映射。
+		 * Kernel 限制 max PXM ID 为 MAX_NUMNODES, 若 ACPI's PXM ID > MAX_NUMNODES,
+		 * 则该 PXM 不会被 mapped with a node ID, i.e., kernel 不使用它。
+		 * 注意 "数目(count)" 与"ID" 的区别。
 		 *
 		 * ACPI's PXM ID 与 kernel's 逻辑 NUMA ID 通过: pxm_to_node_map[] &
 		 * node_to_pxm_map[] 互相 mapping: 对每一个 PXM ID, nodes_found_map 中
 		 * first unset bit's index 即是对应的逻辑 NUMA ID. PXM ID 与 逻辑 NUMA ID
 		 * 一一对应。 APIC ID 与 kernel 逻辑 NUMA ID 通过 __apicid_to_node[] 映射.
 		 *
-		 * nodes_found_map 与 numa_nodes_parsed 看起来功能一模一样，区别？前者是
+		 * nodes_found_map 与 numa_nodes_parsed 看起来功能一样，区别？前者是
 		 * driver/acpi 内部使用，后者是 x86 内部使用。
 		 * NOTE: 一个 PXM/NUMA node 上可有多个逻辑 CPU, 即 APIC ID.
 		 *
-		 * In other words: kernel 用逻辑 NUMA ID 来 identify ACPI 中的 PXM ID. */
+		 * In general: kernel 用逻辑 NUMA ID 来 identify ACPI 中的 PXM ID.
+		 */
 		memset(srat_proc, 0, sizeof(srat_proc));
 		srat_proc[0].id = ACPI_SRAT_TYPE_CPU_AFFINITY;
 		srat_proc[0].handler = acpi_parse_processor_affinity;
@@ -240,26 +249,27 @@ int __init acpi_numa_init(void)
 
 		/* Memory affinity sub-table provides following topology info:
 		 *   1. physical address range and its PXM;
-		 *   2. whether or not the memory range is hotpluggable.
+		 *   2. whether or not the memory range is hot-pluggable.
 		 *
 		 * 同样，SRAT 中的 memory range 也要 map 到 kernel's 逻辑 NUMA ID.
 		 * Get kernel's 逻辑 NUMA ID from ACPI‘s PXM ID via the same routine
 		 * as above, then store range info into numa_meminfo. Parsing 结束也会
-		 * set numa_nodes_parsed 一下。 Besides, 若 memory range is hotpluggable,
+		 * set numa_nodes_parsed 一下。 Besides, 若 memory range is hot-pluggable,
 		 * mark it in memblock region's flag. parsed_numa_memblks 记录 memory
 		 * affinity sub-table 数。
 		 * NOTE: 会再次 evaluate max_possible_pfn according to each memory range,
-		 * 看来可能 NUMA memory 信息与 E820 不一致。之前的 evaluation 基于 E820. */
+		 * 看来可能 NUMA memory 信息与 E820 不一致。之前的 evaluation 基于 E820.
+		 */
 		cnt = acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
 					    acpi_parse_memory_affinity, 0);
 	}
 
 	/* After processing SRAT, kernel is aware about the following relationship:
-	 *   1. kernel's 逻辑 NUMA ID <--> ACPI's PXM
+	 *   1. kernel's 逻辑 NUMA ID <--> ACPI's PXM ID
 	 *   2. APIC ID --> kernel's 逻辑 NUMA ID
 	 *   3. memory range --> kernel's 逻辑 NUMA ID
-	 * 所以， MAX_LOCAL_APIC & MAX_NUMNODES 都是对 ID 的限制，而不是 number! ID 可能
-	 * 是不连续的！但 ACPI driver 分配 "逻辑 NUMA ID" 的策略是连续的。
+	 * 所以， MAX_LOCAL_APIC & MAX_NUMNODES 都是对 ID 的限制，而不是 number, ID 可能
+	 * 不连续的！但 ACPI driver 分配的 "逻辑 NUMA ID" 是连续的。
 	 */
 
 	/* SLIT: System Locality Information Table */
@@ -267,8 +277,8 @@ int __init acpi_numa_init(void)
 	 * memory latency, SLIT 中用一个 byte 表示它。0xFF 表示 2 个 node/PXM domain 间
 	 * 不可达; SLIT 定义 node/PXM domain 自己到自己的距离是 10. 所以 Relative distance
 	 * 的有效范围是 [10 - 255). NOTE: 为什么用矩阵形式? 因为 node[i->j] 的距离可能 ！=
-	 * node [j->i] 的距离。另：SLIT 中有 PXM domain 的数量信息，所以理论上 PXM ID 的
-	 * 范围就是 [0 - MAX ID].
+	 * node [j->i] 的距离。另：SLIT 中有 PXM domain 的数量信息，所以理论上 PXM ID 从 0
+	 * 开始且连续.
 	 * slit_valid() 根据 ACPI spec 对 matrix 做简单验证：
 	 *   1. PXM 自己到自己的 distance 必须是 LOCAL_DISTANCE;
 	 *   2. PXM 之间的距离必须 > LOCAL_DISTANCE;
@@ -287,8 +297,7 @@ int __init acpi_numa_init(void)
 	 * numa_meminfo 中记录的逻辑 NUMA ID 是包含 CPU & memory 的 sane PXM domain.
 	 * 代码的做法: 取 numa_nodes_parsed 的 *copy*, 根据 numa_meminfo 中的 nid
 	 * set *copy*, 最终根据 copy 中 NUMA ID 来分配 numa_distance[] 使用的 memory.
-	 * (真的没有那种只有 memory 的 node 吗???)
-	 * 因为 SLIT 中 PXM ID 是连续的，所以正常情况下，kernel's 逻辑 NUMA ID 也应连续。
+	 * (没有只有 memory 的 node 吗?)
 	 */
 	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
 
@@ -333,7 +342,8 @@ int __init numa_cleanup_meminfo(struct numa_meminfo *mi)
 	/* merge neighboring / overlapping entries */
 	/* numa_meminfo 中 entry order 和 SRAT 一致。这里判断的组合：nid x range overlap
 	 * 所以有 4 condition: 1. nid 相同 + overlap; 2. nid 相同 + !overlap;
-	 *                    3. nid 不同 + overlap; 4. nid 不同 + !overlap; */
+	 *                    3. nid 不同 + overlap; 4. nid 不同 + !overlap;
+	 */
 	for (i = 0; i < mi->nr_blks; i++) {
 		struct numa_memblk *bi = &mi->blk[i];
 
@@ -346,7 +356,8 @@ int __init numa_cleanup_meminfo(struct numa_meminfo *mi)
 			if (bi->end > bj->start && bi->start < bj->end) {
 				/* (相邻 range 重叠 & nid 不同) = NUMA 初始化失败. 看来 Linux 不
 				 * 接受："不同 node 之间有 memory range 重叠" 这样 insane 的情况。
-				 * 排除 3rd condition. */
+				 * 排除 3rd condition.
+				 */
 				if (bi->nid != bj->nid) {
 					/* SKIP pr_err */
 					return -EINVAL;
@@ -422,12 +433,10 @@ static int __init numa_register_memblks(struct numa_meminfo *mi)
 	if (WARN_ON(nodes_empty(node_possible_map)))
 		return -EINVAL;
 
-	/* 根据 sanitized NUMA memory info, set Node ID into memblock.memory's
-	 * region.
-	 * Worth NOTE: NUMA memory(RAM) range info 与 E820/memblock.memory block
-	 * (RAM too) range info 可能不完美吻合， i.e., 对某 physical memory range,
-	 * 我认为二者(NUMA & E820)来的信息应完美吻合(sane behavior)，但实际并不是。所以才有
-	 * 下面 在numa_meminfo_cover_memory 中的处理。*/
+	/* 根据 sanitized NUMA memory info, set Node ID into memblock.memory's region.
+	 * NOTE: NUMA memory(RAM) range info 与 E820/memblock.memory (RAM too) range info
+	 * 可能不完美一致。Refer to comments of numa_meminfo_cover_memory().
+	 */
 	for (i = 0; i < mi->nr_blks; i++) {
 		struct numa_memblk *mb = &mi->blk[i];
 		memblock_set_node(mb->start, mb->end - mb->start,
@@ -622,16 +631,20 @@ void __init init_cpu_to_node(void)
 ```
 ## NUMA 相关之 CPU 初始化
 
-NUMA 初始化中常遇到 CPU ID 的概念，这是完全理解 NUMA code 的 prerequisite 知识之一。本节提到的 "CPU 初始化"具体是指 CPU ID 或者说 "系统 CPU 数量"的初始化。与 NUMA 一样，这类 CPU 信息只有 firmware 知道，firmware 通过 ACPI MADT 将此信息告知 OS.
+Here "CPU 初始化" is about "CPU ID" or "CPU number". The concept of "CPU ID" is frequently seen in NUMA initialization, it is one of prerequisite to fully understand NUMA code. The same as NUMA, it is firmware who tell the info of CPU ID to OS via ACPI MADT.
 
-"CPU ID", 从 hardware 角度来说是指其 APIC ID； 从 software(Linux kernel) 角度来说是指自身内部定义逻辑 ID. 本节的内容从 ACPI 的初始化开始。
+"CPU ID" has 2 levels of definition:
 
->SIDE NOTE:
+  1. hardware perspective: it is **APIC ID**;
+  2. software perspective: **logical CPU ID** defined by kernel itself.
 
->问: ACPI table 是 firmware 动态的生成, or 静态的存在(工程师将其与 firmware build 在一起烧写进 ROM)? 最新结论： firmware 动态生成 ACPI table, but w/ prerequisites： firmware is provided device-specific descriptor, 然后 firmware 中的 ACPI agent 根据这些信息构造 ACPI table. 代码自身无法检测硬件平台的信息。  Refer:
+Linux kernel will map **APIC ID** to **logical CPU ID**.
+ 本节的内容从 ACPI 的初始化开始。
 
->1. https://patents.google.com/patent/US7502803B2/en: Abstract
-2. Intel SDM 3a, 8.4.3 MP Initialization Protocol Algorithm for MP Systems: 5. As part of the boot-strap code, the **BSP creates an ACPI table** and/or an MP table and adds its initial APIC ID to these tables as appropriate
+A question: ACPI table 是 firmware 动态生成, or 静态存在(工程师将其与 firmware build 在一起烧写进 ROM)? 最新结论： firmware 动态生成 ACPI table, but w/ prerequisites： firmware is provided device-specific descriptor, 然后 firmware 中的 ACPI agent 根据这些信息构造 ACPI table. 代码自身无法检测硬件平台的信息。  References:
+
+  1. https://patents.google.com/patent/US7502803B2/en: Abstract
+  2. Intel SDM 3a, 8.4.3 MP Initialization Protocol Algorithm for MP Systems: 5. As part of the boot-strap code, the **BSP creates an ACPI table** and/or an MP table and adds its initial APIC ID to these tables as appropriate
 
 setup_arch() 中，CPU & NUMA 相关的初始化函数的出现顺序是：
 
@@ -653,7 +666,7 @@ setup_arch() 中，CPU & NUMA 相关的初始化函数的出现顺序是：
 
 三个函数的名字初看有些困惑，不明白为何要分成 3 个函数进行初始化，他们分别要做什么。待分析完，这个问题便知。首先解惑一点: 这 3 处 ACPI 初始化都处于 kernel booting 阶段,所以函数名中都带有 "acpi", "boot", "init" 字眼。
 
-```
+```c
 /*
  * acpi_boot_table_init() and acpi_boot_init()
  * called from setup_arch(), always.
@@ -794,6 +807,7 @@ int __init acpi_table_init(void)
 	return 0;
 }
 ```
+
 从软件视角看， APIC is a bunch of registers, 其中只有一个是 MSR: IA32_APIC_BASE, 其他都是 memory mapped registers, 即映射在 CPU 物理地址空间，这些 memory mapped registers 有一个 base address, 由 Intel SDM 3a, 10.4.1 知: it defaults to 32-bit APIC_DEFAULT_PHYS_BASE.
 
 >**NOTE**： x2APIC archetecture 既可以工作在  x2APIC mode, 也可以工作在 APIC(xAPIC) mode. x2APIC mode 时，其 APIC registers 都是 MSR.
@@ -844,7 +858,8 @@ int __init early_acpi_boot_init(void)
  * 参考： apic.h 中 apic_driver 的 comments.
  * 所以 booting 阶段需要 probe 当前系统是哪儿一种 APIC. 看起来 acpi_parse_madt -->
  * default_acpi_madt_oem_check 中第一次 probe 当前系统的 APIC. 根据经验，普通 PC 的
- * APIC 应该是 apic_flat_64.c 中的 apic_flat, 下面以他为例分析。*/
+ * APIC 应该是 apic_flat_64.c 中的 apic_flat, 下面以他为例分析。
+ */
 static void __init early_acpi_process_madt(void)
 {
 #ifdef CONFIG_X86_LOCAL_APIC
@@ -883,7 +898,7 @@ static void __init early_acpi_process_madt(void)
  * 某些 CPU 允许更改此寄存器的内容； cpuid 指令得到的是始终是不变的 *initial APIC ID*;
  *
  * 而 ACPI MADT 中的 APIC ID 呢？目前推测，BIOS 生成 ACPI table 时从寄存器拿到 ID 写入。
- * 
+ *
  * Refer:
  *   1. Intel SDM 3a, 8.4.5 Identifying Logical Processors in an MP System
  *   2. Intel SDM 3a, 10.4.6 Local APIC ID
@@ -946,9 +961,10 @@ int __init acpi_boot_init(void)
 	if (acpi_disabled)
 		return 1;
 
-	/* BOOT 在 acpi_boot_table_init() 中已处理，重复. 已发 patch, 但这行代码自 Linux
-	 * kernel 导入 git 就存在, 再加上少有 BOOT table 的环境，不便测试，所以 maintainer
-	 * 很谨慎： https://lore.kernel.org/linux-pm/24266640.LfmLNjZWAc@kreacher/ */
+	/* BOOT 在 acpi_boot_table_init() 中已处理，重复. 这行代码自 Linux kernel 导入 git
+	 * 就存在, 少有 BOOT table 的环境，不便测试。Maintainer seems very cautious:
+	 * https://lore.kernel.org/linux-pm/24266640.LfmLNjZWAc@kreacher/
+	 */
 	acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf);
 
 	/* set sci_int and PM timer address. */

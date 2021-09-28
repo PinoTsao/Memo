@@ -25,9 +25,12 @@ According to tips above, linear(virtual) address bit increase has a pattern: x86
 
 void __init setup_arch(char **cmdline_p)
 {
-	/* detail analysis of __pa_symbol in a separate section below.
+	/* Detail analysis of __pa_symbol in a separate section below.
 	 * Tip: Two "_text" are of absolute addressing, i.e., S + A.
 	 * First appearance of memblock_reserve.
+	 */
+	/* The following memblock reservation work is going to converge into a single
+	 * function via commit a799c2bd29d19c565f.
 	 */
 	/*
 	 * Reserve the memory occupied by the kernel between _text and
@@ -69,10 +72,12 @@ void __init setup_arch(char **cmdline_p)
 	/* 新概念 get: One Laptop Per Child. Open FirmWare. Omit. */
 	olpc_ofw_detect();
 
-	/* 安装 #DB & #BP handler into IDT. 修改 IDT，需要 reload IDTR? */
+	/* Install #DB & #BP handler into IDT.
+	 * Is reloading IDTR necessary after modify IDT? Seems so
+	 */
 	idt_setup_early_traps();
 
-	/* 主要工作：early_identify_cpu() 初始化 boot_cpu_data. Details at below. */
+	/* Main job: Initialize boot_cpu_data via early_identify_cpu(). Details at below. */
 	early_cpu_init();
 	...
 	/* 新概念 get: https://lwn.net/Articles/412072/ */
@@ -264,7 +269,8 @@ void __init setup_arch(char **cmdline_p)
 	if (mtrr_trim_uncached_memory(max_pfn))
 		max_pfn = e820__end_of_ram_pfn();
 
-	/* so, max_pfn is just possible one? */
+	/* so, max_pfn is just possible one? max_possible_pfn will be re-evaluate during
+	 * NUMA initialization. */
 	max_possible_pfn = max_pfn;
 
 	/*
@@ -389,10 +395,18 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	init_mem_mapping();
 
-	/* idt 在 start_kernel 之前已初始化(idt_setup_early_handler)，实际只初始化了
-	 * page fault 的 handler. 这里替换为一个新的 page fault handler 为什么? */
+	/* IDT was initialized in idt_setup_early_handler() before start_kernel, and
+	 * was installed page fault handler only which does page mapping via early_top_pgt,
+	 * since CR3 is replaced with init_top_pgt, it make sense to install a new
+	 * page fault handler.
+	 *
+	 * Details at below.
+	 */
 	idt_setup_early_pf();
 
+	/* mmu_cr4_features is initialized in init_mem_mapping() -> probe_page_size_mask().
+	 * Get back to it later.
+	 */
 	/*
 	 * Update mmu_cr4_features (and, indirectly, trampoline_cr4_features)
 	 * with the current CR4 value.  This may not be necessary, but
@@ -401,68 +415,93 @@ void __init setup_arch(char **cmdline_p)
 	 *
 	 * Mask off features that don't work outside long mode (just
 	 * PCIDE for now).
-	 * 不明白，get back to it later. mmu_cr4_features 在 init_mem_mapping ->
-	 * probe_page_size_mask 中有赋值操作。*/
+	 */
 	mmu_cr4_features = __read_cr4() & ~X86_CR4_PCIDE;
 
-	/* 上次 set limit 为 1M, 这次设为 max physical address, 用意? */
+	/* Used to be set to 1M, since direct page mapping has been done, it seems
+	 * memblock can be fully utilized with max_pfn_mapped.
+	 */
 	memblock_set_current_limit(get_max_mapped());
 
-	/* Allocate bigger log buffer. 略过 */
+	/* printk deserves a big separate chapter, TBD. */
+	/* Allocate bigger log buffer. */
 	setup_log_buf(1);
 
 	if (efi_enabled(EFI_BOOT)) {
 		/* SKIP... */
 	}
 
-	/* 详细分析在下文。*/
+	/* Details at below. */
 	reserve_initrd();
 
-	/* Documentation/admin-guide/acpi/initrd_table_override.rst 介绍了此 feature.
-	 * For me, 打开了新的大门：initramfs, cpio. 理解函数 find_cpio_data 的前提： 理解
-	 * cpio archive format via `man 5 cpio`.
-	 * Tip: 此函数在 acpi_boot_table_init 初始化之前也就 make sense 了。 */
+	/* Documentation/admin-guide/acpi/initrd_table_override.rst has the introduction.
+	 * Understanding cpio archive format via `man 5 cpio` is necessary for understanding
+	 * find_cpio_data().
+	 *
+	 * It start to make sense why it locates before acpi_boot_table_init().
+	 */
 	acpi_table_upgrade();
 
-	/* 特定 x86 platform 的初始化。                         Quick knowledge:
+	/* Initialization for specific x86 vendor: ScaleMP(similiar to domestic 浪潮).
+	 *
+	 * Quick knowledge:
 	 * ScaleMP developed the versatile SMP (vSMP) architecture, a unique approach
 	 * that enables server vendors to create industry-standard, high-end x86-based
 	 * symmetric multiprocessor (SMP) systems.
-	 * "ScaleMP", a X86 server vendor，可用国内品牌“浪潮”等价理解。  */
+	 */
 	vsmp_init();
 
 	/* TBD */
 	io_delay_init();
 
-	/* 通过 DMI 确认 kernel 当前是否运行在 Apple 的硬件上 */
+	/* Confirm whether we are running Apple through DMI. */
 	early_platform_quirks();
 
+	/* There are several "acpi" "init" functions which are confusing at first glance,
+	 * but will be unraveled after analyzing them all.
+	 *
+	 * Initialize ACPI table in boot process.
+	 */
 	/* Parse the ACPI tables for possible boot-time SMP configuration. */
-	/* 有数个名字带 "acpi", "init" 的函数，初看会困惑，待分析后来解惑。
-	/* 解惑: Booting 阶段的 acpi table 初始化。函数名字面意思可理解为：acpi 在 boot
-	 * 阶段的 table 初始化 */
 	acpi_boot_table_init();
 
-	/* 函数名字与其他同类函数不匹配，acpi_boot_early_init 可能比较合适。因为下方还有
-	 * acpi_boot_init. 函数字面意思可理解为： acpi 在 boot 阶段的预(early)初始化。*/
+	/* Different function name style，"acpi_boot_early_init" might be appropriate.
+	 * There is acpi_boot_init() later, so the function name can be interpreted as:
+	 * early ACPI initialization during boot process.
+	 */
 	early_acpi_boot_init();
 
-	/* NUMA, 详见下文。*/
+	/* NUMA initialization, NUMA information derive from ACPI tables.
+	 * details at below. */
 	initmem_init();
+
+	/* Contiguous memory allocator, refer to its file header comments for a quick
+	 * knowledge. Details TBD.
+	 * Simply, reserve a contiguous chunk of memory via memblock, internal initialization.
+	 */
 	dma_contiguous_reserve(max_pfn_mapped << PAGE_SHIFT);
+
+	/* Huge page mixed with CMA? TBD. */
+	if (boot_cpu_has(X86_FEATURE_GBPAGES))
+		hugetlb_cma_reserve(PUD_SHIFT - PAGE_SHIFT);
 
 	/*
 	 * Reserve memory for crash kernel after SRAT is parsed so that it
 	 * won't consume hotpluggable memory.
 	 */
+	/* Just reserve a range of memory from memblock for crash kernel. */
 	reserve_crashkernel();
 
+	/* In the first 16M physical address, find RAM size(because there is memory hold)
+	 * first, then find free RAM size, the delta would be memory reserved by someone,
+	 * set the delta to dma_reserve.
+	 */
 	memblock_find_dma_reserve();
 
 	if (!early_xdbc_setup_hardware())
 		early_xdbc_register_console();
 
-	/* Under X86_64, it is paging_init() in init_64.c */
+	/* It is paging_init() in init_64.c under X86_64. Details at below. */
 	x86_init.paging.pagetable_init();
 
 	kasan_init();
@@ -833,7 +872,7 @@ enum fixed_addresses {
 	/* Kernel 初始化过程中，常需要临时 map 访问某些物理地址，访问结束便 unmap.
 	 * Will see a lot of it later.
 	 *
-	 * 将下面巨长的 conditional expression 简化为：
+	 * For intelligibility, simplify the following conditional expression to:
 	 *
 	 *    x ^ (x + 0x1FF)
 	 *	  &
@@ -1976,7 +2015,9 @@ void __init init_mem_mapping(void)
 	load_cr3(swapper_pg_dir);
 	/* native_flush_tlb_local：reload CR3.
 	 * native_flush_tlb_global: re-write CR4 with PGE on & off.
-	 * flush TLB: a topic TBD.
+	 *
+	 * Reference for flushing TLB: Intel SDM 3a, 4.10.4 Invalidation of TLBs and
+	 * Paging-Structure Caches.
 	 */
 	__flush_tlb_all();
 
@@ -1985,7 +2026,6 @@ void __init init_mem_mapping(void)
 	/* Only available under CONFIG_MEMTEST. Seems quite time consuming. */
 	early_memtest(0, max_pfn_mapped << PAGE_SHIFT);
 }
-
 
 /*
  * Tip: We could take 4Kb aligned parameters(start & end) for granted.  Actually,
@@ -2028,8 +2068,6 @@ unsigned long __ref init_memory_mapping(unsigned long start,
 	 * 费了好大劲儿终于看懂这个函数TAT。 Details at below. */
 	nr_range = split_mem_range(mr, 0, start, end);
 
-	/* 拿到 split ranges, 可以 page table mapping 了。mapping code 太复杂，下文只能
-	 * 先简略分析。 */
 	for (i = 0; i < nr_range; i++)
 		ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
 						   mr[i].page_size_mask);
@@ -2537,13 +2575,245 @@ Originally, 32-bit X86 CPU only supports 4Kb page with address capability of 32-
 
 When CPU support PSE-36, linear address space is still 32-bit with physical address space expanded to 36-bit, the page directory entry structure is illustrated as in [Wikipedia](https://en.wikipedia.org/wiki/PSE-36#Activation_and_use) & *Figure 4-4. Formats of CR3 and Paging-Structure Entries with 32-Bit Paging* of Intel SDM 3a, which also implies, 4Kb granularity page is only available under 4Gb, because the bits in the middle of the structure is used for indexing the page table to find the 4Kb page, which also implies the highest address bit(M - 32) of a page frame will be 0.
 
+## idt_setup_early_pf
+
+As the name tells, install a new page fault handler. But the definition of handler **asm_exc_page_fault** is tricky.
+
+```c
+/*
+ * Early traps running on the DEFAULT_STACK because the other interrupt
+ * stacks work only after cpu_init().
+ */
+static const __initconst struct idt_data early_pf_idts[] = {
+	INTG(X86_TRAP_PF,		asm_exc_page_fault),
+};
+```
+
+A simple search won't find definition of **asm_exc_page_fault**. Intuition tells me searching **exc_page_fault** may work, and yes it does:
+
+In *arch/x86/include/asm/idtentry.h*:
+```c
+DECLARE_IDTENTRY_RAW_ERRORCODE(X86_TRAP_PF,	exc_page_fault);
+
+#define DECLARE_IDTENTRY_RAW_ERRORCODE(vector, func)			\
+	DECLARE_IDTENTRY_ERRORCODE(vector, func)
+
+#ifndef __ASSEMBLY__
+	#define DECLARE_IDTENTRY_ERRORCODE(vector, func)			\
+		asmlinkage void asm_##func(void);				\
+		asmlinkage void xen_asm_##func(void);				\
+		__visible void func(struct pt_regs *regs, unsigned long error_code)
+#else
+	#define DECLARE_IDTENTRY_ERRORCODE(vector, func)			\
+		idtentry vector asm_##func func has_error_code=1
+#endif
+```
+
+In *arch/x86/mm/fault.c*:
+```c
+DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+{
+	...
+}
+```
+
+But still don't know the definition, trying search **idtentry** and find in *arch/x86/entry/entry_64.S*:
+
+```assembly
+.macro idtentry vector asmsym cfunc has_error_code:req
+SYM_CODE_START(\asmsym)
+	...
+SYM_CODE_END(\asmsym)
+.endm
+```
+
+It involves some basic knowledge to finally find how **asm_exc_page_fault** is defined. Check file: *arch/x86/entry/.entry_64.o.cmd* & *arch/x86/mm/.fault.o.cmd*, both include *arch/x86/include/asm/idtentry.h*. The pre-processed *fault.c* will be something like:
+
+```c
+DECLARE_IDTENTRY_RAW_ERRORCODE(X86_TRAP_PF,	exc_page_fault);
+
+#define DECLARE_IDTENTRY_RAW_ERRORCODE(vector, func)			\
+	DECLARE_IDTENTRY_ERRORCODE(vector, func)
+
+#define DECLARE_IDTENTRY_ERRORCODE(vector, func)			\
+	asmlinkage void asm_##func(void);				\
+	asmlinkage void xen_asm_##func(void);				\
+	__visible void func(struct pt_regs *regs, unsigned long error_code)
+
+#define DEFINE_IDTENTRY_RAW_ERRORCODE(func)				\
+__visible noinstr void func(struct pt_regs *regs, unsigned long error_code)
+
+DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+{
+	...
+}
+```
+
+which declares **asm_exc_page_fault** & defined **exc_page_fault**. The pre-processed *entry_64.S* will be something like:
+
+```
+DECLARE_IDTENTRY_RAW_ERRORCODE(X86_TRAP_PF,	exc_page_fault);
+
+#define DECLARE_IDTENTRY_RAW_ERRORCODE(vector, func)			\
+	DECLARE_IDTENTRY_ERRORCODE(vector, func)
+
+#define DECLARE_IDTENTRY_ERRORCODE(vector, func)			\
+	idtentry vector asm_##func func has_error_code=1
+
+.macro idtentry vector asmsym cfunc has_error_code:req
+SYM_CODE_START(\asmsym)
+	...
+SYM_CODE_END(\asmsym)
+.endm
+```
+
+which defines **asm_exc_page_fault**, and linker will find it when linking.
+
+**idt_setup_early_pf** is pretty simple by itself, it only worth to take a look at the descriptor in **early_pf_idts** which is also simple after have the background knowledge from Intel SDM. The interesting part for now is that how page fault handler is executed.(Not include page mapping details)
+
+```c
+.macro idtentry_body cfunc has_error_code:req
+
+	call	error_entry
+	UNWIND_HINT_REGS
+
+	movq	%rsp, %rdi			/* pt_regs pointer into 1st argument*/
+
+	.if \has_error_code == 1
+		movq	ORIG_RAX(%rsp), %rsi	/* get error code into 2nd argument*/
+		movq	$-1, ORIG_RAX(%rsp)	/* no syscall to restart */
+	.endif
+
+	call	\cfunc
+
+	jmp	error_return
+.endm
+
+.macro idtentry vector asmsym cfunc has_error_code:req
+SYM_CODE_START(\asmsym)
+	UNWIND_HINT_IRET_REGS offset=\has_error_code*8
+	ASM_CLAC
+
+	.if \has_error_code == 0
+		pushq	$-1			/* ORIG_RAX: no syscall to restart */
+	.endif
+
+	.if \vector == X86_TRAP_BP
+		/*
+		 * If coming from kernel space, create a 6-word gap to allow the
+		 * int3 handler to emulate a call instruction.
+		 */
+		testb	$3, CS-ORIG_RAX(%rsp)
+		jnz	.Lfrom_usermode_no_gap_\@
+		.rept	6
+		pushq	5*8(%rsp)
+		.endr
+		UNWIND_HINT_IRET_REGS offset=8
+.Lfrom_usermode_no_gap_\@:
+	.endif
+
+	idtentry_body \cfunc \has_error_code
+
+_ASM_NOKPROBE(\asmsym)
+SYM_CODE_END(\asmsym)
+.endm
+
+error_entry)
+	UNWIND_HINT_FUNC
+	cld
+	PUSH_AND_CLEAR_REGS save_ret=1
+	ENCODE_FRAME_POINTER 8
+	testb	$3, CS+8(%rsp)
+	jz	.Lerror_kernelspace
+
+	/*
+	 * We entered from user mode or we're pretending to have entered
+	 * from user mode due to an IRET fault.
+	 */
+	SWAPGS
+	FENCE_SWAPGS_USER_ENTRY
+	/* We have user CR3.  Change to kernel CR3. */
+	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+
+.Lerror_entry_from_usermode_after_swapgs:
+	/* Put us onto the real thread stack. */
+	popq	%r12				/* save return addr in %12 */
+	movq	%rsp, %rdi			/* arg0 = pt_regs pointer */
+	call	sync_regs
+	movq	%rax, %rsp			/* switch stack */
+	ENCODE_FRAME_POINTER
+	pushq	%r12
+	ret
+
+.Lerror_entry_done_lfence:
+	FENCE_SWAPGS_KERNEL_ENTRY
+.Lerror_entry_done:
+	ret
+
+	/*
+	 * There are two places in the kernel that can potentially fault with
+	 * usergs. Handle them here.  B stepping K8s sometimes report a
+	 * truncated RIP for IRET exceptions returning to compat mode. Check
+	 * for these here too.
+	 */
+.Lerror_kernelspace:
+	leaq	native_irq_return_iret(%rip), %rcx
+	cmpq	%rcx, RIP+8(%rsp)
+	je	.Lerror_bad_iret
+	movl	%ecx, %eax			/* zero extend */
+	cmpq	%rax, RIP+8(%rsp)
+	je	.Lbstep_iret
+	cmpq	$.Lgs_change, RIP+8(%rsp)
+	jne	.Lerror_entry_done_lfence
+
+	/*
+	 * hack: .Lgs_change can fail with user gsbase.  If this happens, fix up
+	 * gsbase and proceed.  We'll fix up the exception and land in
+	 * .Lgs_change's error handler with kernel gsbase.
+	 */
+	SWAPGS
+	FENCE_SWAPGS_USER_ENTRY
+	jmp .Lerror_entry_done
+
+.Lbstep_iret:
+	/* Fix truncated RIP */
+	movq	%rcx, RIP+8(%rsp)
+	/* fall through */
+
+.Lerror_bad_iret:
+	/*
+	 * We came from an IRET to user mode, so we have user
+	 * gsbase and CR3.  Switch to kernel gsbase and CR3:
+	 */
+	SWAPGS
+	FENCE_SWAPGS_USER_ENTRY
+	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
+
+	/*
+	 * Pretend that the exception came from user mode: set up pt_regs
+	 * as if we faulted immediately after IRET.
+	 */
+	mov	%rsp, %rdi
+	call	fixup_bad_iret
+	mov	%rax, %rsp
+	jmp	.Lerror_entry_from_usermode_after_swapgs
+SYM_CODE_END(error_entry)
+
+DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+{
+	...
+}
+```
 
 ## reserve_initrd
-```
+
+Get the direct page mapped address of initrd in *initrd_start* & *initrd_end* for future use since direct page mapping has been done.
+
+	Note: in the begaining of setup_arch(), early_reserve_initrd() has
+	reserved ramdisk space in memblock.reserved.
+
+```c
 #ifdef CONFIG_BLK_DEV_INITRD
-/* 目的：使用 direct page mapped 的虚拟地址访问 initrd. direct page mapping 在上面
- * 刚完成。 Tip: setup_arch 函数开始的地方调用了 early_reserve_initrd(), 将 ramdisk
- * 占据的物理 RAM 空间记录在 memblock.reserved. */
 static void __init reserve_initrd(void)
 {
 	/* Assume only end is not page aligned */
@@ -2559,30 +2829,16 @@ static void __init reserve_initrd(void)
 
 	initrd_start = 0;
 
-	/* 经过 setup_arch 中前面的处理， 目前 memblock.memory 中保存着 kernel 可用的所有
-	 * RAM 物理地址信息。重点：这些 RAM 空间可能是 non-continuous. 遍历(Iterate)计算
-	 * 所有可用 RAM 的 size, 因为刚刚在虚拟地址空间已做 direct mapping, 所以这里变量名
-	 * 叫 "mapped_size".
-	 * 知识点：若 ramdisk size 大于可用 RAM size 的一半, 则 too large to handle. */
-	mapped_size = memblock_mem_size(max_pfn_mapped);
-	if (ramdisk_size >= (mapped_size>>1))
-		panic("initrd too large to handle, "
-		       "disabling initrd (%lld needed, %lld available)\n",
-		       ramdisk_size, mapped_size>>1);
-
 	printk(KERN_INFO "RAMDISK: [mem %#010llx-%#010llx]\n", ramdisk_image,
 			ramdisk_end - 1);
 
-	/* init_mem_mapping 中记录了已 directly mapped 的 RAM pfn ranges. 若 ramdisk
-	 * 所在 pfn range 在上述 ranges 中，则可直接通过 __va() 用虚拟地址访问(虽然这里直接
-	 * 展开了 __va())；*/
+	/* init_mem_mapping() has recorded direct page mapped PFN ranges, if ramdisk space
+	 * exits there，it can be accessed directly by virtual address returned by __va(),
+	 * which is the ease case.
+	 */
 	if (pfn_range_is_mapped(PFN_DOWN(ramdisk_image),
 				PFN_DOWN(ramdisk_end))) {
 		/* All are mapped, easy case */
-		/* Easy indeed, 记下 ramdisk 的虚拟地址即可。这应是正常情况的 code path, 推理：
-		 * BIOS is not aware of ramdisk, 它被 boot loader 加载到 E820_TYPE_RAM
-		 * 类型的物理地址空间, 该类型空间被 memblock 管理, 且在上面的函数中被 direct
-		 * mapping.*/
 		initrd_start = ramdisk_image + PAGE_OFFSET;
 		initrd_end = initrd_start + ramdisk_size;
 		return;
@@ -2593,7 +2849,7 @@ static void __init reserve_initrd(void)
 	 * allocated 空间的虚拟地址。*/
 	relocate_initrd();
 
-	/* So, ramdisk 原来占据的 RAM 空间可以在 memblock.reserved 中释放了。*/
+	/* So, original ramdisk space can be freed. */
 	memblock_free(ramdisk_image, ramdisk_end - ramdisk_image);
 }
 #else
@@ -2603,19 +2859,28 @@ static void __init reserve_initrd(void)
 
 ## acpi_boot_table_init
 
-这是ACPI初始化的第一个函数。有多个 ACPI init 函数，他们的名字让人困惑，现在开始 demystify. 这里的 **boot** 强调这是 OS booting 阶段的初始化，和 later initialization 有什么不同呢？TBD.
-```
+This is the first ACPI initialization function out of several one. **boot** indicates this is initialization during OS booting. **table** indicates this is initialization is for ACPI  table, in other words, transform the pristine ACPI table into style of kernel itself.
+
+So there should be other later initialization semantically, what's the difference? TBD.
+
+```c
 acpi_boot_table_init()
 {
-	/* 特定型号的 PC 不支持 acpi, 或 acpi 中的部分功能，被 blacklisted 在
-	 * acpi_dmi_table, 通过 DMI 信息识别这些 PC.*/
+	/* Specific type of PC doesn't support ACPI or support it well, which are
+	 * blacklisted in acpi_dmi_table. In case Linux running on these platform,
+	 * the corresponding platform quirks must be executed first, which is actually
+	 * disable ACPI or part of its functions.
+	 */
 	dmi_check_system(acpi_dmi_table);
 
 	/* If acpi_disabled, bail out */
-	/* 若 acpi 被 disable, 就用不着数量庞大的 ACPI 代码了，省事儿了，这是 bail out 的含义。
-	 * 此刻正要初始化 ACPI，什么情况下会 acpi_disabled?
-	 *  1. 特定型号的 PC: acpi_dmi_table 中第一项
-	 *  2. acpi=off, kernel parameter */
+	/* 若 ACPI 功能被禁用, 就不需 care 数量庞大的 ACPI 代码，省事儿了，this is the
+	 * meaning of "bail out" 的含义：纾困。
+	 *
+	 * In which case ACPI will be disabled?
+	 *  1. Specific platform: 1st item of acpi_dmi_table.
+	 *  2. kernel parameter: acpi=off
+	 */
 	if (acpi_disabled)
 		return;
 
@@ -2625,20 +2890,30 @@ acpi_boot_table_init()
 		return;
 	}
 
-	/* Simple Boot Flag Table: 别处定义的 Industry spec, simply reserved by ACPI.
-	 * 下笔时最新版本是 2.1. 很简单，找到 table, 用 handler 处理一下。
+	/* Simple Boot Flag Table is a industry spec defined elsewhere, which is simply
+	 * reserved by ACPI. (下笔时最新版本是 2.1)
+	 *
 	 * Quick knowledge:
 	 * On PC-AT BIOS computer, a BOOT register is defined in main CMOS memory.
 	 * (typically accessed through I/O ports 70h/71h on Intel Architecture platforms)
 	 * The location of the BOOT register in CMOS is indicated by a BOOT table
 	 * found via the ACPI RSDT table.
-	 * 是一个 OS 通知 firmware 的机制, 在 CMOS 中的 1-byte register 写数据, firmware
-	 * 运行时检查其中的 bit. */
+	 * 一个 OS 与 firmware 交换信息的机制。(待确认：在 CMOS 中的 1-byte register 写数据,
+	 * firmware 运行时检查其中的 bit.)
+	 *
+	 * Handler just to get the I/O ports.
+	 */
 	acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf);
 
 	/* blacklist may disable ACPI entirely */
-	/* 又是特定型号 and/or 特定版本 BIOS 的 ACPI 不能正常工作. Besides, 还有其他 ACPI
-	 * 兼容性的 check, 忽略。*/
+	/* acpi_dmi_table above lists a group of platforms who knowingly don't support ACPI
+	 * or support it well. While acpi_blacklist lists the specific revision of specific
+	 * table of specific platform who has serious bugs which need to disable ACPI totally,
+	 * so it is going to check against ACPI tables which is parsed just before.
+	 *
+	 * Besides, there are also other ACPI compatibility check: ACPI OSI, ACPI REV override,
+	 * these are not serious bugs which can be work around. TBD.
+	 */
 	if (acpi_blacklisted()) {
 		if (acpi_force) {
 			printk(KERN_WARNING PREFIX "acpi=force override\n");
@@ -2653,7 +2928,7 @@ acpi_boot_table_init()
 /* acglobal.h */
 ACPI_GLOBAL(struct acpi_table_list, acpi_gbl_root_table_list);
 
-/* Tip: 此函数位于 driver/acpi/table.c. 如函数名所说， table initialization.  */
+/* In driver/acpi/table.c. */
 int __init acpi_table_init(void)
 {
 	acpi_status status;
@@ -2667,47 +2942,56 @@ int __init acpi_table_init(void)
 		acpi_gbl_enable_table_validation = FALSE;
 	}
 
-	/* kernel 内部用 struct acpi_table_desc 来描述一个 ACPI table. Linux kernel
-	 * 静态分配了 root table array, 其他 OS 未必。ACPI 内部用 acpi_gbl_root_table_list
-	 * 管理 root table array.
-	 * 首先自然是寻找 rsdp, for x86, it is via function: x86_default_get_root_pointer,
-	 * 原来这个 callback 是个空函数，自从 team member 的 patch 进去后，就可通过它的快捷
-	 * 方式拿到 rsdp.
-	 * 寻找 rsdp 的过程也很简单，按照 spec 说明即可。对 BIOS 来说: EBDA 的 first 1k, or
-	 * BIOS read-only memory space [0xE0000h, 0xFFFFF). 代码在 get_rsdp_addr().
-	 * 值得注意的是：后面的地址在 BIOS ROM memory，不仅 ACPI table, SMBIOS 也可能在这里，
-	 * 所以这隐约透露的信息：这些 table data 并不是 BIOS 动态生成，而是事先准备好，与 BIOS
-	 * firmware build 在一起，烧进 BIOS ROM, 这些内容可能被 memory shadow 到 RAM 中。
-	 * 若快捷方式中没有 rsdp, acpi 就自己动手找(acpi_find_root_pointer)，仍然要用到
-	 * fixmap 中的 __early_ioremap, 将待搜寻物理地址 map 为虚拟地址才好访问，访问结束
-	 * unmap.  实际代码过程比较复杂，暂无需深究。
-	 * 找到 rsdp 后按部就班解析各 tables(acpi_tb_parse_root_table), 可以想象因为都是
-	 * 物理地址，需要 map 为虚拟地址才能读取 memory. 过程依然繁琐，也无需深究。*/
+	/* ACPI driver use struct acpi_table_desc to describe an ACPI table, it statically
+	 * allocates a root table array, which is managed by acpi_gbl_root_table_list in
+	 * ACPI driver.
+	 *
+	 * First step is surely finding RSDP via x86_default_get_root_pointer(), it is
+	 * empty before, since team member's patch is merged, it can be got easily.
+	 *
+	 * Refer to get_rsdp_addr() for finding RSDP. Quick knowledge: for BIOS, RSDP exists
+	 * in either first 1k of EBDA, or BIOS read-only memory space [0xE0000h, 0xFFFFF).
+	 * It is worth to note: [0xE0000h, 0xFFFFF) belongs to BIOS ROM, SMBIOS may also be
+	 * here. For me, it also implies that these tables are prepared beforehand, bundled
+	 * with firmware, flashed into BIOS ROM together.
+	 * (Might be memory shadowed into RAM?)
+	 *
+	 * If RSDP can't be obtained by shortcut, ACPI driver will search it manually via
+	 * acpi_find_root_pointer(), which involves fixmap's __early_ioremap().
+	 *
+	 * After getting RSDP, parse tables via acpi_tb_parse_root_table().
+	 */
 	status = acpi_initialize_tables(initial_tables, ACPI_MAX_TABLES, 0);
 	if (ACPI_FAILURE(status))
 		return -EINVAL;
-	/* initrd 带来的 ACPI tables 也要初始化到 ACPI 内部管理数据结构。*/
+
+	/* ACPI tables from initrd is subsumed into ACPI driver's management. */
 	acpi_table_initrd_scan();
 
 	/* 吐槽：不得不说，acpi 的代码写的太太繁琐了！想找到变量赋值的地方要绕很久！*/
 
-	/* ACPI 中有 validate/invalidate table 的概念，其实是 ACPI 管理 table reference
-	 * 的机制。Simply speaking: 使用 table 时，通过其虚拟地址访问，table reference count
-	 * ++； 使用结束需显式释放: count--, count 为 0 时表示无人使用它，将 unmap 其虚拟地址。
+	/* ACPI employs concept of validate/invalidate table to manage table reference.
+	 * Simply: 访问 table 时需 page mapping with fixmap range, then table reference
+	 * count++; 访问结束则 count--. count = 0 means table is not used, then unmap.
 	 * 好像这里是 early use ACPI, 所以要释放？以后会将 ACPI table 映射到永久使用区域？
 	 *
-	 * table 的虚拟地址记录在 acpi_table_desc.pointer, IIRC, 此地址在 fixmap 区域。*/
+	 * Table's virtual address is recorded in acpi_table_desc.pointer, which is in
+	 * fixmap area IIRC.
+	 */
 
-	/* acpi_apic_instance 是 kernel parameter, default to 0. Quick reference:
-	 * 2: use 2nd APIC table, if available; 1,0: use 1st APIC table. */
+	/* acpi_apic_instance is kernel parameter, default to 0.
+	 * Quick reference:
+	 *     2: use 2nd APIC table, if available; 1,0: use 1st APIC table.
+	 */
 	check_multiple_madt();
 	return 0;
 }
 ```
 ## early_acpi_boot_init
 
-第二个 acpi init 函数。
-```
+2nd ACPI initialization during boot process. Mainly for get APIC register base address from MADT. According to Intel SDM 3a, 10.4.1, APIC register initial starting address defaults to APIC_DEFAULT_PHYS_BASE, but Pentium 4, Intel Xeon, and P6 family processors permit relocating its starting address by modifying the value in the base address field of the IA32_APIC_BASE MSR.
+
+```c
 int __init early_acpi_boot_init(void)
 {
 	/* If acpi_disabled, bail out */
@@ -2726,30 +3010,41 @@ int __init early_acpi_boot_init(void)
 	return 0;
 }
 
-/* 变量名顾名思义：从 ACPI 表中读来的 local APIC 地址。*/
+/* Self-documented name: record local APIC register base address from ACPI. */
 #ifdef CONFIG_X86_LOCAL_APIC
 static u64 acpi_lapic_addr __initdata = APIC_DEFAULT_PHYS_BASE;
 #endif
 
-/* Time to 解析 MADT.*/
+/* Find APIC register base address from MADT. In case Linux kernel doesn't support
+ * APIC, the function is null.
+ *
+ * But code logic is really confusing(to me), check my un-merged patch:
+ *     https://lkml.org/lkml/2020/1/22/1500
+ */
 static void __init early_acpi_process_madt(void)
 {
 #ifdef CONFIG_X86_LOCAL_APIC
 	int error;
 
-	/* For x86, 此时要从 MADT 中找到 APIC 寄存器的基地址。由 Intel SDM 3a, 10.4.1
-	 * 可知，其物理地址 defaults to APIC_DEFAULT_PHYS_BASE, 但新型 Intel CPU 支持将
-	 * 该地址 relocate. 该地址存在 IA32_APIC_BASE MSR 中。
-	 * acpi_parse_madt 读取 MADT header 中 APIC 的物理地址放在 acpi_lapic_addr 中。
-	 * 但 MADT 中 structure entry “Local APIC Address Override” 可覆写此地址。
-	 * Tips: MADT header 中的地址是 32-bit, Override 中的地址是 64-bit; 只可以有一个
-	 * "Local APIC Address Override Structure", 若有 override structure, 则必须
-	 * 使用 override 的地址。
-	 * 代码繁琐，只有函数 register_lapic_address 值得一看。*/
+	/*
+	 * MADT header has "Local Interrupt Controller Address" field which records
+	 * 32-bit physical base address for APIC register; MADT also has structure entry
+	 * “Local APIC Address Override” who has 64-bit physical address overriding the
+	 * APIC's base address;
+	 *
+	 * Only one "Local APIC Address Override Structure" maybe defined, if defined, its
+	 * 64-bit address will be used for all local APICs.
+	 *
+	 * acpi_parse_madt() read 32-bit address from MADT header into acpi_lapic_addr.
+	 *
+	 * Complicated code, only register_lapic_address() worth to take a look.
+	 */
 	if (!acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)) {
 
 		/* Parse MADT LAPIC entries */
-		/* 返回值的变量名 confusing, 返回的是处理的 structure entry 数。*/
+		/* "error" is confusing, it also indicates the number of processed
+		 * structure entry.
+		 */
 		error = early_acpi_parse_madt_lapic_addr_ovr();
 		if (!error) {
 			acpi_lapic = 1; /* 说明 ACPI 中有正确的 lapic 信息? */
@@ -2771,14 +3066,14 @@ void __init register_lapic_address(unsigned long address)
 {
 	mp_lapic_addr = address;
 
-	/* x2apic_mode 在 check_x2apic 已初始化。
-	 * 根据 APIC 是否支持 x2apic mode, 有2个情况：
-	 *   - 不支持 x2apic： APIC registers are accessed via mapped to physical
-	 *     address; then, registers are accessed in code via virtual address
-	 *     of page-mapping.
-	 *     fixmap 区域已为 APCI 预留 virtual address range: FIX_APIC_BASE.
+	/* x2apic_mode is initialized early in check_x2apic().
+	 * Depending on having x2apic mode or not, 有2个情况：
+	 *   - Not having x2apic mode: APIC registers are mapped into CPU's physical
+	 *     address; then in code, they are accessed via virtual address. FIXMAP area
+	 *     has reserved space for it: FIX_APIC_BASE.
 	 *
-	 *   - 支持 x2apic: register 都是 MSR. 通过指令 wrmsr/rdmsr 访问，不需 memory map.
+	 *   - Having x2apic mode: APIC registers are MSR. They are accessed via instruction
+	 *     wrmsr/rdmsr.
 	 *
 	 *  Refer: Intel SDM 3a, 10.12.1.2 x2APIC Register Address Space
 	 */
@@ -2788,16 +3083,20 @@ void __init register_lapic_address(unsigned long address)
 			    APIC_BASE, address);
 	}
 
-	/* 这个变量名有讲究，因为 MADT 中也有 APIC ID，但目前不清楚它和硬件根据拓扑初始化来的
-	 * apic id 有何不同，理论上他们应该相等，but if not? 这里取自 boot cpu 的 APIC ID
-	 * register, 由不同的 apic driver extract actual ID from register value.
-	 * Refer: Intel SDM 3a, Figure 10-6. Local APIC ID Register;
-	 *                      Figure 10-7. Local APIC Version Register
+	/* The value are extracted directly from register, maybe that is what "physical" mean.
+	 * Refer Intel SDM 3a, Figure 10-6. Local APIC ID Register & Figure 10-7. Local APIC
+	 * Version Register for format.
 	 *
-	 * 埋个问题：目前看到 3 个 APIC ID: Power on 时硬件初始化，根据拓扑得到 initial APIC
-	 * ID; cpuid 指令也可以得到 APIC ID； ACPI/MADT 中也有 APIC ID。三者的关系？
-	 * 目前已知： cpuid 指令得到的是 initial APIC ID; 硬件初始化得到 initial ID 写入
-	 * APIC ID 寄存器， 但可以更改。 Refer: Intel SDM 3a, 10.4.6 Local APIC ID */
+	 * NOTE: there are 3 APIC ID source so far: initial APIC ID assigned by hardware
+	 * during Power on; APIC ID from CPUID instruction; APIC ID from ACPI/MADT's "Processor
+	 * Local APIC" structure entry. What's the difference/relation?
+	 *
+	 * Known facts: CPUID returns initial APIC ID; initial ID is written into APIC ID
+	 * register, specific processor model allows software to modify this register.
+	 * Refer to Intel SDM 3a, 10.4.6 Local APIC ID.
+	 *
+	 * Theoretically, all three APIC ID should be the same? What if not?
+	 */
 	if (boot_cpu_physical_apicid == -1U) {
 		boot_cpu_physical_apicid  = read_apic_id();
 		boot_cpu_apic_version = GET_APIC_VERSION(apic_read(APIC_LVR));
@@ -2806,9 +3105,17 @@ void __init register_lapic_address(unsigned long address)
 ```
 ## initmem_init
 
-initmem_init 根据 32-bit or 64-bit, NUMA 架构 or not, 实现各不相同。现代系统上 NUMA 一般是默认 Yes, 所以我们分析 64-bit + NUMA 下的实现。
+initmem_init() has different versions: 32-bit, 64-bit, NUMA, non-NUMA. Take (64-bit + NUMA)  for analysis. Refer to Documentation/vm/numa.rst for a general introduction of NUMA.
 
-```
+Tip: NUMA is acronym of Non-uniform memory access, which emphasize **memory**, then excerpt:
+
+>For some architectures, such as x86, Linux will "hide" any node representing a physical cell that has no memory attached, and reassign any CPUs attached to that cell to a node representing a cell that does have memory. so when node doesn't have memory
+
+start to make sense.
+
+NUMA initialization is also analyzed in a [separate document](https://github.com/PinoTsao/Memo/blob/master/boot/numa_x86.mkd), but I forget had ever doing so ... And I find that until almost re-analyzed this function ... Please refer to it for extra info that is not in this document.
+
+```c
 void __init initmem_init(void)
 {
 	x86_numa_init();
@@ -2825,7 +3132,7 @@ void __init x86_numa_init(void)
 {
 	if (!numa_off) {
 #ifdef CONFIG_ACPI_NUMA
-		/* OS 只有通过 ACPI(SRAT & SLIT) 才知道硬件上的 NUMA 拓扑 */
+		/* Hardware NUMA topology information is from ACPI(SRAT & SLIT). */
 		if (!numa_init(x86_acpi_numa_init))
 			return;
 #endif
@@ -2843,33 +3150,38 @@ static int __init numa_init(int (*init_func)(void))
 	int i;
 	int ret;
 
-	/* 初始化似乎多余？因为声明处已初始化。*/
+	/* Redundant? Already initialized at when define. Probably a patch? */
 	for (i = 0; i < MAX_LOCAL_APIC; i++)
 		set_apicid_to_node(i, NUMA_NO_NODE);
 
-	/* 清零各 bitmask 变量。后两个变量等同于二维指针 */
+	/* Tip: kernel max supported nodes number is defined by CONFIG_NODES_SHIFT. */
 	nodes_clear(numa_nodes_parsed);
 	nodes_clear(node_possible_map);
 	nodes_clear(node_online_map);
 
-	/* struct numa_meminfo 的定义很简单。NR_NODE_MEMBLKS 的定义看起来 Linux 认为一个
-	 * numa node 最多有 2 个 memblock region? 但 E820_MAX_ENTRIES 认为有 3 个 range.*/
+	/* NR_NODE_MEMBLKS exist since Linux kernel imported into git. According to its
+	 * X86 definition, seems only 2 memory regions on a node are allowed by Linux kernel?
+	 * But E820_MAX_ENTRIES think it can has 3 range?
+	 */
 	memset(&numa_meminfo, 0, sizeof(numa_meminfo));
 
-	/* 初始化所有 regions' node number 为 MAX_NUMNODES. */
+	/* Self-documented. */
 	WARN_ON(memblock_set_node(0, ULLONG_MAX, &memblock.memory,
 				  MAX_NUMNODES));
 	WARN_ON(memblock_set_node(0, ULLONG_MAX, &memblock.reserved,
 				  MAX_NUMNODES));
 
-	/* In case that parsing SRAT failed. Clear 所有 region's MEMBLOCK_HOTPLUG flag??? */
+	/* In case that parsing SRAT failed. */
+	/* Parsing SRAT failure means NUMA will not work, so does memory hotplug. */
 	WARN_ON(memblock_clear_hotplug(0, ULLONG_MAX));
 
-	/* numa_distance[] 中的数据来自 SLIT's matrix entry, 表示 node 之间距离。
-	 * 但是，似乎没必要 reset 嘛？初始化之前还有人 set 它吗？ */
+	/* Data of numa_distance[] derive from SLIT's matrix entry, denotes distance
+	 * between node.
+	 * Seems no necessary to reset? Anybody set it before?
+	 */
 	numa_reset_distance();
 
-	/* ACPI's SRAT & SLIT 初始化，见下文 */
+	/* ACPI's SRAT & SLIT initialization. */
 	ret = init_func();
 	if (ret < 0)
 		return ret;
@@ -2884,20 +3196,41 @@ static int __init numa_init(int (*init_func)(void))
 	 */
 	memblock_set_bottom_up(false);
 
-	/* SRAT 中 memory affinity 的信息放在 numa_meminfo 中，现在 sanitize?
-	 * 删除不在 memblock 中的 range, merge 相邻 range. */
+	/* numa_meminfo is initialized during parsing ACPI_SRAT_TYPE_MEMORY_AFFINITY entry
+	 * via acpi_numa_memory_affinity_init(), but sanitize until now? In initialization,
+	 * only hotplug flags of raw NUMA data is used for marking it in memblock. The
+	 * sanitization here only deal with memory range.
+	 *
+	 * Detail of sanitizing numa_meminfo:
+	 *   1. move numa_memblk which is not in memblock.memory to numa_reserved_meminfo,
+	 *      remove empty(start >= end) numa_memblk.  USAGE?
+	 *   2. It can be inferred that Linux kernel regard ACPI_SRAT_TYPE_MEMORY_AFFINITY
+	 *      structure's range to be canonical, which means the ranges are adjacent in
+	 *      ascending order, whether overlapping or there is hole between ranges.
+	 *   3. Overlapped ranges with different NID means the whole raw data is
+	 *      unreliable, results in NUMA initialization failure.
+	 *   4. Merging overlapped neighbor code is quite old & complex, skip.
+	 */
 	ret = numa_cleanup_meminfo(&numa_meminfo);
 	if (ret < 0)
 		return ret;
 
-	/* 不支持 NUMA node 的 hardware 可以打开 NUMA_EMU, debug NUMA 用。默认关闭? Skip.*/
+	/* Emulate NUMA node on platform that doesn't support NUMA.
+	 * *ONLY FOR* debugging NUMA.   Details at below.
+	 */
 	numa_emulation(&numa_meminfo, numa_distance_cnt);
 
-	/* sanitized numa_meminfo 注册到 memblock 中 */
+	/* Allocate memory for NODE_DATA & set node online. details at below. */
 	ret = numa_register_memblks(&numa_meminfo);
 	if (ret < 0)
 		return ret;
 
+	/* nr_cpu_ids is defined in smp.c as CONFIG_NR_CPUS, but could be updated by
+	 * early parameter "nr_cpus=".
+	 * Early PerCPU variable x86_cpu_to_node_map is initialized with NUMA_NO_NODE
+	 * in definition, refer to chapter "Early PerCPU variable & PerCPU variable"
+	 * in [boot link] for some insights of early PerCPU variable.
+	 */
 	for (i = 0; i < nr_cpu_ids; i++) {
 		int nid = early_cpu_to_node(i);
 
@@ -2906,12 +3239,15 @@ static int __init numa_init(int (*init_func)(void))
 		if (!node_online(nid))
 			numa_clear_node(i);
 	}
+
+	/* Initialize x86_cpu_to_node_map from onlined node ID in round-robin way.
+	 * Not get the idea behind even read the comments. Wait to see.
+	 */
 	numa_init_array();
 
 	return 0;
 }
 
-/* 解析 ACPI 中 NUMA 相关的 table: SRAT & SLIT. */
 int __init x86_acpi_numa_init(void)
 {
 	int ret;
@@ -2923,6 +3259,12 @@ int __init x86_acpi_numa_init(void)
 	return srat_disabled() ? -EINVAL : 0;
 }
 
+/*
+ * Linux kernel defines logical node ID for internal use, which is mapped to
+ * "proximity ID" defined by ACPI. Kernel's node ID *is* continuous.
+ * Any chance that PXM ID is not continuous? According to SLIT, who has number of PXM
+ * & distance matrix, PXM ID SHOULD be continuous from 0, or else it is buggy.
+ */
 /* drivers/acpi/numa.c */
 int __init acpi_numa_init(void)
 {
@@ -2931,40 +3273,48 @@ int __init acpi_numa_init(void)
 	if (acpi_disabled)
 		return -EINVAL;
 
-	/* Should not limit number with cpu num that is from NR_CPUS or nr_cpus=
+	/*
+	 * Should not limit number with cpu num that is from NR_CPUS or nr_cpus=
 	 * SRAT cpu entries could have different order with that in MADT.
-	 * So go over all cpu entries in SRAT to get apicid to node mapping. */
-	/* Kernel 配置的 cpu 数目(config 或 parameter) 不应限制这里 SRAT 的解析。也有
-	 * 道理，因为这二者完全不相关，OS 自己不会知道当前系统上的 cpu 数量。*/
+	 * So go over all cpu entries in SRAT to get apicid to node mapping.
+	 */
+	/* Kernel 配置的 CPU 数目(config 或 parameter) 不应限制这里 SRAT 的解析 */
 
 	/* SRAT: System Resource Affinity Table */
-	/* SRAT handler acpi_parse_srat does nothing but get acpi_srat_revision.
+	/*
+	 * SRAT handler acpi_parse_srat does nothing but get acpi_srat_revision.
 	 * Leave all the work to following subtable handler.
-	 * SRAT 的 subtable 中只定义了 4 种 structure: 3 CPU & 1 memory*/
+	 *
+	 * SRAT's sub-table has 2 CPU types & 1 memory type for x86. GICC(Generic Interrupt
+	 * Controller CPU) is of ARM.  This is drivers/acpi, so it covers all architecture.
+	 */
 	if (!acpi_table_parse(ACPI_SIG_SRAT, acpi_parse_srat)) {
 		struct acpi_subtable_proc srat_proc[3];
 
-		/* 此初始化函数位于 drivers/acpi, 所有 system 通用，所以 sub-table handler
-		 * 覆盖所有 possible CPU, 当前 CPU 只可能是其中一种。
-		 * GICC(Generic Interrupt Controller CPU) 属于 ARM.
+		 /*
+		 * Take ACPI_SRAT_TYPE_CPU_AFFINITY for example, the sub-table has APIC ID &
+		 * corresponding proximity domain ID.  PXM ID(32-bit) is defined by ACPI, its
+		 * counterpart in kernel is NUMA node ID(MAX_NUMNODES), the handler maps them up
+		 * via pxm_to_node_map[] & node_to_pxm_map[].
+		 * Mapping strategy:
+		 * For each PXM ID, first unset bit's index in nodes_found_map is taken as its
+		 * node ID. So actually a PXM's node ID is determined by appearance sequence
+		 * of ACPI_SRAT_TYPE_CPU_AFFINITY structure.
 		 *
-		 * Sub-table is easy，以 ACPI_SRAT_TYPE_CPU_AFFINITY 为例，列出了 APIC ID
-		 * & ID 所属 proximity domain ID.
-		 * PXM ID 是 ACPI 的定义(32-bit), kernel 对应的定义是 numa node ID(MAX_NUMNODES),
-		 * 所以 kernel 要将二者 map 起来，这是 handler 要做的。Obviously, ACPI's
-		 * 32-bit PXM ID should not be great than kernel's MAX_NUMNODES. PXM ID
-		 * 与 numa node ID 互相 mapping: pxm_to_node_map[] & node_to_pxm_map[].
-		 * Mapping 的初始化也简单：对于每一个 PXM ID, nodes_found_map 中 first unset
-		 * bit's index 即是对应的 numa node ID. 一个 PXM ID 对应一个 numa node ID,
-		 * 所以变量 nodes_found_map 的名中的 found 是 find from ACPI 之意.
+		 * Obviously, 32-bit PXM ID should not be great than kernel's MAX_NUMNODES,
+		 * or else "node ID" won't enough for mapping "PXM ID", that is why:
 		 *
-		 * 同时，SRAT 中的 APIC ID(逻辑CPU) 也要 map 到 kernel 的 numa node ID:
-		 * __apicid_to_node[]. Mapping 后 set numa_nodes_parsed, 表示此 numa
-		 * node ID 上已经 parse 过 APIC ID?
-		 * NOTE: 一个 PXM/numa node 上可有多个逻辑 CPU, 即 APIC ID!!!
+		 *         #define MAX_PXM_DOMAINS MAX_NUMNODES
 		 *
-		 * In other words: kernel 用 numa node ID 来 identify ACPI 中的 PXM ID;
-		 * SRAT 中每个 APIC ID 也属于 kernel 中确定的某 numa node id.*/
+		 * If PXM ID does is great than MAX_NUMNODES, then it is omitted.
+		 *
+		 * After getting NUMA node ID，physical APIC ID is also mapped to it via
+		 * __apicid_to_node[]. Usage of numa_nodes_parsed is tricky, it is also set
+		 * when parsing memory affinity structure, considering node may have no memory,
+		 * things start to look complex.
+		 *
+		 * NOTE: one node could have multiple logical CPUs, i.e., APIC ID.
+		 */
 		memset(srat_proc, 0, sizeof(srat_proc));
 		srat_proc[0].id = ACPI_SRAT_TYPE_CPU_AFFINITY;
 		srat_proc[0].handler = acpi_parse_processor_affinity;
@@ -2977,39 +3327,39 @@ int __init acpi_numa_init(void)
 					sizeof(struct acpi_table_srat),
 					srat_proc, ARRAY_SIZE(srat_proc), 0);
 
-		/* Turn to parse memory affinity. Its sub-table is easy too, certain
-		 * physical address range belongs to a PXM; and a flag told range's
-		 * property: the memory under the range is hotpluggable? or is volatile?
+		/*
+		 * Memory Affinity Structure is handled separately, because node ID is needed,
+		 * which is obtained during APIC structure processing.
 		 *
-		 * 同样，SRAT 中的 memory range 也要 map 到 kernel's numa node ID.
-		 * Get node ID from PXM ID via the same routine as above, then store
-		 * into numa_meminfo, easy, no need for verbiage. 而且，parsing 结束同样
-		 * 会 set numa_nodes_parsed 一下。
-		 * 此外，若 memory range is hot pluggable, mark it in memblock region's
-		 * flag. 重要！会再次 evaluate max_possible_pfn, 看起来之前的 evaluation
-		 * 只是在机器的默认 node 上，或者说那个 unpluggable node 上。*/
+		 * store range data into numa_meminfo. Set set numa_nodes_parsed again after
+		 * parsing.	Re-evaluate max_possible_pfn after parsing each range.
+		 */
 		cnt = acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
 					    acpi_parse_memory_affinity, 0);
 	}
 
-	/* After processing SRAT, now kernel is aware: concrete APIC IDs & memory
-	 * ranges that a numa node has. */
+	/* After processing SRAT, now kernel is aware of APIC IDs & memory ranges
+	 * that each node has. */
 
 	/* SLIT: System Locality Information Table */
-	/* distance 意味着 memory latency, ACPI 中用一个 byte 表示它。0xFF 表示 2 个
-	 * node 间不可达; node 自己到自己的距离是 10. 所以 distance 有效范围是 [10 - 255).
-	 * slit_valid() 根据 ACPI spec 对 matrix  做了简单验证：
-	 *   1. 自己到自己的 distance 必须是 LOCAL_DISTANCE;
-	 *   2. PXM 之间的距离必须大于 LOCAL_DISTANCE;
+	/*
+	 * Distance between nodes means memory latency, which is a one-byte value in ACPI.
+	 * Value 0xFF means unreachable between two nodes; value 10 is the distance of a
+	 * node to itself; valid distance is [10 - 255); distance values [0-9] are reserved
+	 * and have no meaning.
 	 *
-	 * SLIT parsing 的目的：拿到 matrix entry 中的 value, set 到 numa_distance[],
-	 * 并将 system locality number/PXM number? 记在 numa_distance_cnt 中。
+	 * slit_valid() verify SLIT matrix data to make sure it is valid in following way:
+	 *     1. distance of node to itself must be LOCAL_DISTANCE(10);
+	 *     2. distance between nodes must be great than LOCAL_DISTANCE(10);
+	 *
+	 * It can be seen from acpi_numa_slit_init() that PXM ID is considered continuous.
+	 *
+	 * SLIT parsing is to initialize numa_distance[] from matrix entry, and record
+	 * node count into numa_distance_cnt.
+	 *
 	 * 有必要再次分析 numa_alloc_distance, 因为产生了和 474aeffd88b8 一样的想法，但它
-	 * 又被 b678c91aefa7 revert.
-	 *
-	 * Documentation/vm/numa.rst 说：若 node 中没有 memory, Linux kernel 将 hide
-	 * this node for physical cell(ACPI PXM). 看来有 memory 的 node 才被 kernel
-	 * 看作真 numa node.  */
+	 * 又被 b678c91aefa7 revert. Details at: https://lkml.org/lkml/2017/3/13/1231
+	 */
 	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
 
 	if (cnt < 0)
@@ -3019,6 +3369,374 @@ int __init acpi_numa_init(void)
 	return 0;
 }
 ```
+
+numa_register_memblks() aims for allocate NODE_DATA.
+
+>Tips:
+**memblock.memory** is initialized from E820 info but with only range info & is not aware of NUMA info, i.e., memory range <-> nid,  memory hot pluggable property. Thus certain memblock region may have both hot-pluggable & non-hot-pluggable part.
+
+```c
+static int __init numa_register_memblks(struct numa_meminfo *mi)
+{
+	int i, nid;
+
+	/* First initialization of node_possible_map.
+	 * Perplexity as 474aeffd88b8 told still exist ...
+	 */
+	/* Account for nodes with cpus and no memory */
+	node_possible_map = numa_nodes_parsed;
+	numa_nodemask_from_meminfo(&node_possible_map, mi);
+	if (WARN_ON(nodes_empty(node_possible_map)))
+		return -EINVAL;
+
+	for (i = 0; i < mi->nr_blks; i++) {
+		struct numa_memblk *mb = &mi->blk[i];
+		/* Must read its comments. */
+		memblock_set_node(mb->start, mb->end - mb->start,
+				  &memblock.memory, mb->nid);
+	}
+
+	/* Quite straightforward code & comments, no need for verbiage. */
+	/*
+	 * At very early time, the kernel have to use some memory such as
+	 * loading the kernel image. We cannot prevent this anyway. So any
+	 * node the kernel resides in should be un-hotpluggable.
+	 *
+	 * And when we come here, alloc node data won't fail.
+	 */
+	numa_clear_kernel_node_hotplug();
+
+	/* Need more background knowledge, get back later. */
+	/*
+	 * If sections array is gonna be used for pfn -> nid mapping, check
+	 * whether its granularity is fine enough.
+	 */
+	if (IS_ENABLED(NODE_NOT_IN_PAGE_FLAGS)) {
+		unsigned long pfn_align = node_map_pfn_alignment();
+
+		if (pfn_align && pfn_align < PAGES_PER_SECTION) {
+			pr_warn("Node alignment %LuMB < min %LuMB, rejecting NUMA config\n",
+				PFN_PHYS(pfn_align) >> 20,
+				PFN_PHYS(PAGES_PER_SECTION) >> 20);
+			return -EINVAL;
+		}
+	}
+
+	/* Just do the sanity check.
+	 *
+	 * Tip: both ranges in memblock.memroy & numa_meminfo are sanitized.
+	 * memblock.memory has *all* available RAM range info for kernel which is from e820,
+	 * memory allocation doesn't affect the range info inside.
+	 */
+	if (!numa_meminfo_cover_memory(mi))
+		return -EINVAL;
+
+	/* Finally register nodes. */
+	for_each_node_mask(nid, node_possible_map) {
+		u64 start = PFN_PHYS(max_pfn);
+		u64 end = 0;
+
+		/* Get the start & end address from all ranges of a node for the reason stated
+		 * in the comments below. Hole?
+		 */
+		for (i = 0; i < mi->nr_blks; i++) {
+			if (nid != mi->blk[i].nid)
+				continue;
+			start = min(mi->blk[i].start, start);
+			end = max(mi->blk[i].end, end);
+		}
+
+		if (start >= end)
+			continue;
+
+		/*
+		 * Don't confuse VM with a node that doesn't have the
+		 * minimum amount of memory:
+		 */
+		if (end && (end - start) < NODE_MIN_SIZE)
+			continue;
+
+		/* NODE_DATA is allocated as locally as possible, i.e., in the node it represents.
+		 * Just allocate the memory.  Refer to bd5cfb8977fbb49 for extra info.
+		 * NOTE: Node has NODE_DATA allocated is set to online state right away.
+		 */
+		alloc_node_data(nid);
+	}
+
+	/* Dump memblock with node info and return. */
+	memblock_dump_all();
+	return 0;
+}
+
+/*
+ * Sanity check to catch more bad NUMA configurations (they are amazingly
+ * common).  Make sure the nodes cover all memory.
+ */
+static bool __init numa_meminfo_cover_memory(const struct numa_meminfo *mi)
+{
+	u64 numaram, e820ram;
+	int i;
+
+	/* Linux kernel regard the range info in memblock.memory is reliable for the reason
+	 * stated in comments above. Check memory range info from NUMA against it to get
+	 * real RAM size from NUMA perspective by trimming memory hole ranges.
+	 */
+	numaram = 0;
+	for (i = 0; i < mi->nr_blks; i++) {
+		u64 s = mi->blk[i].start >> PAGE_SHIFT;
+		u64 e = mi->blk[i].end >> PAGE_SHIFT;
+		numaram += e - s;
+		numaram -= __absent_pages_in_range(mi->blk[i].nid, s, e);
+		if ((s64)numaram < 0)
+			numaram = 0;
+	}
+
+	/* Get real RAM size info from e820 perspective. */
+	e820ram = max_pfn - absent_pages_in_range(0, max_pfn);
+
+	/* If the delta is more than 1M, Linux kernel regard ACPI NUMA memory info is
+	 * un-reliable, fail the initialization and fall back to dummy_numa_init().
+	 */
+	/* We seem to lose 3 pages somewhere. Allow 1M of slack. */
+	if ((s64)(e820ram - numaram) >= (1 << (20 - PAGE_SHIFT))) {
+		printk(KERN_ERR "NUMA: nodes only cover %LuMB of your %LuMB e820 RAM. Not used.\n",
+		       (numaram << PAGE_SHIFT) >> 20,
+		       (e820ram << PAGE_SHIFT) >> 20);
+		return false;
+	}
+	return true;
+}
+```
+
+It worth to take a look when ACPI NUMA initialization fail and fall back to dummy_numa_init:
+
+```c
+/**
+ * dummy_numa_init - Fallback dummy NUMA init
+ *
+ * Used if there's no underlying NUMA architecture, NUMA initialization
+ * fails, or NUMA is disabled on the command line.
+ *
+ * Must online at least one node and add memory blocks that cover all
+ * allowed memory.  This function must not fail.
+ */
+static int __init dummy_numa_init(void)
+{
+	printk(KERN_INFO "%s\n",
+	       numa_off ? "NUMA turned off" : "No NUMA configuration found");
+	printk(KERN_INFO "Faking a node at [mem %#018Lx-%#018Lx]\n",
+	       0LLU, PFN_PHYS(max_pfn) - 1);
+
+	node_set(0, numa_nodes_parsed);
+	numa_add_memblk(0, 0, PFN_PHYS(max_pfn));
+
+	return 0;
+}
+```
+
+## x86_64's paging_init
+
+Defined in *init_64.c*:
+
+```c
+void __init paging_init(void)
+{
+	sparse_init();
+
+	/*
+	 * clear the default setting with node 0
+	 * note: don't use nodes_clear here, that is really clearing when
+	 *	 numa support is not compiled in, and later node_set_state
+	 *	 will not set it back.
+	 */
+	node_clear_state(0, N_MEMORY);
+	node_clear_state(0, N_NORMAL_MEMORY);
+
+	zone_sizes_init();
+}
+```
+
+It involves initialization of sparse memory model & concept of memory zone. Refer to *Documentation/vm/memory-model.rst* for introduction of sparse memory model, which is a must-read before reading the code.
+
+Following analysis will base on CONFIG_SPARSEMEM_EXTREME & CONFIG_SPARSEMEM_VMEMMAP. Section size is 128Mb under x86_64.
+
+```c
+/*
+ * Allocate the accumulated non-linear sections, allocate a mem_map
+ * for each and record the physical to section mapping.
+ */
+void __init sparse_init(void)
+{
+	unsigned long pnum_end, pnum_begin, map_count = 1;
+	int nid_begin;
+
+	/* Iterate through all RAM ranges, allocate & initialize all mem_section
+	 * structure.  Details analyzed below. */
+	memblocks_present();
+
+	/* "p" might means "present". */
+	pnum_begin = first_present_section_nr();
+	nid_begin = sparse_early_nid(__nr_to_section(pnum_begin));
+
+	/* Setup pageblock_order for HUGETLB_PAGE_SIZE_VARIABLE */
+	set_pageblock_order();
+
+	for_each_present_section_nr(pnum_begin + 1, pnum_end) {
+		int nid = sparse_early_nid(__nr_to_section(pnum_end));
+
+		if (nid == nid_begin) {
+			map_count++;
+			continue;
+		}
+		/* Init node with sections in range [pnum_begin, pnum_end) */
+		/* Section range [pnum_begin, pnum_end -1] belongs to the same node. */
+		sparse_init_nid(nid_begin, pnum_begin, pnum_end, map_count);
+		nid_begin = nid;
+		pnum_begin = pnum_end;
+		map_count = 1;
+	}
+
+	sparse_init_nid(nid_begin, pnum_begin, pnum_end, map_count);
+	vmemmap_populate_print_last();
+}
+
+static void __init memblocks_present(void)
+{
+	unsigned long start, end;
+	int i, nid;
+
+	for_each_mem_pfn_range(i, MAX_NUMNODES, &start, &end, &nid)
+		memory_present(nid, start, end);
+}
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+    #define SECTIONS_PER_ROOT       (PAGE_SIZE / sizeof (struct mem_section))
+#else
+    /* Actually one-dimensional array in vertical way. */
+    #define SECTIONS_PER_ROOT       1
+#endif
+
+#define SECTION_NR_TO_ROOT(sec) ((sec) / SECTIONS_PER_ROOT)
+#define NR_SECTION_ROOTS        DIV_ROUND_UP(NR_MEM_SECTIONS, SECTIONS_PER_ROOT)
+#define SECTION_ROOT_MASK       (SECTIONS_PER_ROOT - 1)
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+    struct mem_section **mem_section;
+#else
+    struct mem_section mem_section[NR_SECTION_ROOTS][SECTIONS_PER_ROOT]
+            ____cacheline_internodealigned_in_smp;
+#endif
+
+/* Record a memory area against a node. */
+static void __init memory_present(int nid, unsigned long start, unsigned long end)
+{
+	unsigned long pfn;
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+	/* Allocate memory for the row of 2-dimensional array of mem_section.  As
+	 * it is only allocated once, that is how "unlikely()" make sense.
+	 */
+	if (unlikely(!mem_section)) {
+		unsigned long size, align;
+
+		size = sizeof(struct mem_section *) * NR_SECTION_ROOTS;
+		align = 1 << (INTERNODE_CACHE_SHIFT);
+		mem_section = memblock_alloc(size, align);
+		if (!mem_section)
+			panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
+			      __func__, size, align);
+	}
+#endif
+
+	/* section number, also is the 1st PFN of current section. Ideally, start PFN of
+	 * range should be at the start boundary of a section.
+	 */
+	start &= PAGE_SECTION_MASK;
+	mminit_validate_memmodel_limits(&start, &end);
+
+	/* "start" is forced at the start boundary of section, but what if "end" is
+	 * not at the end boundary? Assume range size is always multitude of section
+	 * size(128Mb) for now, then there will be no lost pages.
+	 */
+	for (pfn = start; pfn < end; pfn += PAGES_PER_SECTION) {
+		unsigned long section = pfn_to_section_nr(pfn);
+		struct mem_section *ms;
+
+		/* Find column index according to section number in 2-dimensional array,
+		 * allocate for whole column in current node.
+		 * 找到 section 所在 column(从上到下，从走到右), 在当前 node 分配该 column 表示
+		 * 的所有 mem_section.
+		 */
+		sparse_index_init(section, nid);
+		/* Map section number to its node ID. */
+		set_section_nid(section, nid);
+
+			/* Get the exact struct mem_section according to section number. */
+		ms = __nr_to_section(section);
+		if (!ms->section_mem_map) {
+			ms->section_mem_map = sparse_encode_early_nid(nid) |
+							SECTION_IS_ONLINE;
+			/* 二维数组中，section number 是从上到下，从左到右 数。*/
+			section_mark_present(ms);
+		}
+	}
+}
+
+/*
+ * Initialize sparse on a specific node. The node spans [pnum_begin, pnum_end)
+ * And number of present sections in this node is map_count.
+ */
+static void __init sparse_init_nid(int nid, unsigned long pnum_begin,
+				   unsigned long pnum_end,
+				   unsigned long map_count)
+{
+	/* Section is divided into 2Mb sub-sections. */
+	struct mem_section_usage *usage;
+	unsigned long pnum;
+	struct page *map;
+
+	usage = sparse_early_usemaps_alloc_pgdat_section(NODE_DATA(nid),
+			mem_section_usage_size() * map_count);
+	if (!usage) {
+		pr_err("%s: node[%d] usemap allocation failed", __func__, nid);
+		goto failed;
+	}
+	sparse_buffer_init(map_count * section_map_size(), nid);
+	for_each_present_section_nr(pnum_begin, pnum) {
+		unsigned long pfn = section_nr_to_pfn(pnum);
+
+		if (pnum >= pnum_end)
+			break;
+
+		map = __populate_section_memmap(pfn, PAGES_PER_SECTION,
+				nid, NULL);
+		if (!map) {
+			pr_err("%s: node[%d] memory map backing failed. Some memory will not be available.",
+			       __func__, nid);
+			pnum_begin = pnum;
+			sparse_buffer_fini();
+			goto failed;
+		}
+		check_usemap_section_nr(nid, usage);
+		sparse_init_one_section(__nr_to_section(pnum), pnum, map, usage,
+				SECTION_IS_EARLY);
+		usage = (void *) usage + mem_section_usage_size();
+	}
+	sparse_buffer_fini();
+	return;
+failed:
+	/* We failed to allocate, mark all the following pnums as not present */
+	for_each_present_section_nr(pnum_begin, pnum) {
+		struct mem_section *ms;
+
+		if (pnum >= pnum_end)
+			break;
+		ms = __nr_to_section(pnum);
+		ms->section_mem_map = 0;
+	}
+}
+```
+
 
 ## acpi_boot_init
 
@@ -3034,7 +3752,9 @@ int __init acpi_boot_init(void)
 	if (acpi_disabled)
 		return 1;
 
-	/* 重复了，已发 patch. Wait to see. */
+	/* Duplicate. Check it out:
+	 * https://lore.kernel.org/linux-pm/24266640.LfmLNjZWAc@kreacher
+	 */
 	acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf);
 
 	/* set sci_int and PM timer address. FADT 在 acpi_boot_table_init - x - x -
@@ -3417,8 +4137,4 @@ static int __init acpi_parse_madt_ioapic_entries(void)
 	return 0;
 }
 ```
-
-
-
-
 

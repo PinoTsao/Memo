@@ -7096,13 +7096,14 @@ ZO 中也有定义 BUILD_BUG_ON, 但 VO 的实现不同，VO 才是正宗的。
 
 #### Task Management in x86
 
-为什么莫名插入这个 topic? 学习 interrupt & 分析中断的详细流程时，不可避免的涉及 task switch, stack switch 等等概念，他们都属于 task management. Intel SDM 3a has whole chapter 7 dedicated for **Task Management**. 本节仅梳理干货，做一个 quick reference.
+Why this topic is inserted here? Interrupt handling entails the concept of task switch, stack switch, etc, and they belong to the domain of task management. Intel SDM 3a has whole chapter 7 dedicated for **Task Management**. 本节仅梳理干货，做一个 quick reference.
 
-Intel X86 在硬件上提供了 multi-tasking 的机制，这种机制仅仅 available 在 protected mode(IA-32). IA-32's task management 机制包括: saving the state of a task, for dispatching tasks for execution, and for switching from one task to another. **当 CPU 运行在 protected mode, 所有 CPU 的运行都源于一个 task.** 虽然 X86 提供了硬件的 multi-tasking 机制，但 OS 也可以实现自己的 software level multi-tasking mechanism.
+Intel X86 support multi-tasking mechanism on hardware, but it is only available in protected mode(IA-32). The IA-32 architecture provides a mechanism for: saving the state of a task, for dispatching tasks for execution, and for switching from one task to another. **When operating in protected mode, all processor execution takes place from
+within a task. Even simple systems must define at least one task**. 虽然 X86 提供了硬件的 multi-tasking 机制，但 OS 也可以实现自己的 software level multi-tasking mechanism.
 
-Task 在概念上包括 2 部分: task execution space & task-state segment (TSS). Task execution space 指代码运行 related 的 code/data/stack segment, 还可能包括 privilege protection mechanism 带来的 stack segment per privilege level; TSS 则是一个 memory segment, 其中描述了 task 执行所需要的所有 segment, 以及提供了保存 task state info 的空间，只能定义在 GDT 中。
+A task is made up of two parts: task execution space & task-state segment (TSS). Task execution space consists of a code segment, a stack segment, and one or more data segments, If an OS or executive uses the processor’s privilege-level protection mechanism, the task execution space also provides a separate stack for each privilege level; The TSS specifies the segments that make up the task execution space and provides a storage place for task state information, it can be defined only in GDT.
 
-A task is identified by the segment selector for its TSS. Task state 指 task 运行的 context, simply speaking: all memory segments, register, etc. 执行 task 的前提是 identify the segment selector that points to a task gate or the TSS for the task.
+A task is identified by the segment selector for its TSS. Task state 指 task 运行的 context, simply speaking: all memory segments, registers, etc. 执行 task 的前提是 identify the segment selector that points to a task gate or the TSS for the task.
 
 X86 定义了 5 种数据结构管理 task:
 
@@ -7174,11 +7175,11 @@ gdt_end:
 
 #### Early Interrupt Initialization
 
-上文分析到 `copy_bootdata(__va(real_mode_data))` 时，又有一个小问题： real_mode_data 是物理地址，代码中要 access 时须使用它的虚拟地址，走 page table，所以使用 __va 进行转换。由 Documentation/x86/x86_64/mm.rst 可知，4-level paging 时，虚拟地址 ffff888000000000 到 ffffc87fffffffff 的 64 TB 用于 direct mapping of all physical memory (page_offset_base), 即物理地址 [0, 64TB) 映射虚拟地址 [ffff888000000000, ffffc87fffffffff)。但是截至 copy_bootdata 函数前，未看到 page table 有做这个 mapping. 调查过程中 accidentally blame 到某个 commit 提示说, Interrupt Descriptor Table(IDT) 中的 page fault handler 会自动做这件事。原本想暂时推后中断代码的分析，看起来天不遂人愿:p
+上文分析 `copy_bootdata(__va(real_mode_data))` 时有一个小问题： real_mode_data 是物理地址，代码中要 access 时须使用它的虚拟地址，走 page table，所以使用 __va 进行转换。由 Documentation/x86/x86_64/mm.rst 可知，4-level paging 时，虚拟地址 ffff888000000000 到 ffffc87fffffffff 的 64 TB 用于 direct mapping of all physical memory (page_offset_base), 即物理地址 [0, 64TB) 映射虚拟地址 [ffff888000000000, ffffc87fffffffff)。但是截至 copy_bootdata 函数前，未看到 page table 有做这个 mapping. 调查过程中 accidentally blame 到某个 commit 提示说, Interrupt Descriptor Table(IDT) 中的 page fault handler 会自动做这件事。原本想暂时推后中断代码的分析，看起来天不遂人愿:(
 
-中断初始化的入口是 idt_setup_early_handler, 一眼看到 set_intr_gate 函数，熟读 Intel SDM 的同学应该可以想到这是在说 gate descriptor. **中断**是一个相对独立的系统，开始之前，有必要温故一些基础知识，就从它开始。
+中断初始化的入口是 idt_setup_early_handler, 一眼看到 set_intr_gate 函数，熟读 Intel SDM 的同学应该可以想到这是在说 gate descriptor. **中断**是一个相对独立的系统，有必要温故一些基础知识。
 
-x86 架构定义了几个 descriptor table: GDT(Global), LDT(Local), IDT. Descriptor table，顾名思义，table 中是一个个 descriptor entry. Descriptor 的基本结构参考 Intel SDM 3a "3.4.5 Segment Descriptors". 根据 descriptor 中的 S flag, 可分类为:
+x86 has several descriptor tables: GDT(Global), LDT(Local), IDT. Descriptor table，顾名思义，has a number of descriptor entry. Descriptor 的基本结构参考 Intel SDM 3a "3.4.5 Segment Descriptors". 根据 descriptor 中的 S flag, 可分类为:
 
   1. system descriptor, includes:
 
@@ -7191,16 +7192,16 @@ x86 架构定义了几个 descriptor table: GDT(Global), LDT(Local), IDT. Descri
 
   2. code or data segment descriptor
 
-system descriptor 的前 2 个描述特殊用途的 memory segment; 后 4 个叫 gate descriptor, to provide controlled access to code segments with different privilege levels(Intel SDM 3a, 5.8.2 Gate Descriptors). Gate descriptor 使用的场景跨越很大，所以它的格式定义散落在 Intel SDM 3a 中: 5.8.3 Call Gates, 6.11 IDT DESCRIPTORS, 7.2.5 Task-Gate Descriptor. 二者的区别，一眼可以看到的: segment descriptor 用于描述 memory segment; 而 gate descriptor 用于描述某 code segment 中特定 procedure 的地址。
+The first 2 system descriptors specify special memory segment; latter 4 个叫 gate descriptor, provide controlled access to code segments with different privilege levels(Intel SDM 3a, 5.8.2 Gate Descriptors). Gate descriptor 使用场景跨度很大，所以它的格式定义散落在 Intel SDM 3a: 5.8.3 Call Gates, 6.11 IDT DESCRIPTORS, 7.2.5 Task-Gate Descriptor. 二者的区别，一眼可以看到的: segment descriptor 用于描述 memory segment; 而 gate descriptor 用于描述某 code segment 中特定 procedure 的地址。
 
-跨 privilege level 的 procedure transfer, 通常是通过指令 call 或 jmp 一个 far pointer(segment selector: segment offset). 根据 far pointer 的不同，可以分为 Direct Calls or Jumps to Code Segments(Intel SDM 3a, 5.8.1), 和 call gate 两种. 两种 far pointer 的区别是： 使用 call gate 时，offset 可以随意填写，processor 不会检查，因为实际的 offset 在 gate descriptor 中。两种方式都会做 privilege level checking, 但肯定是有不同，参考 Intel SDM 3a:
+跨 privilege level 的 procedure transfer, 通常通过指令 call 或 jmp 一个 far pointer(segment selector: segment offset). 根据 far pointer 的不同，可以分为 Direct Calls or Jumps to Code Segments(Intel SDM 3a, 5.8.1), 和 call gate 两种. 两种 far pointer 的区别是： 使用 call gate 时，offset 可以随意填写，processor 不会检查，因为实际的 offset 在 gate descriptor 中。两种方式都会做 privilege level checking, 但肯定是有不同，参考 Intel SDM 3a:
 
   * Figure 5-6. Privilege Check for Control Transfer Without Using a Gate
   * Figure 5-11. Privilege Check for Control Transfer with Call Gate
 
 尤其, call gate 用于 transferring program control between 16-bit and 32-bit code segments.
 
-我个人 prefer 将 descriptor 这样分类：
+Personally, I prefer to classify descriptors as following:
 
   1. segment descriptor: 描述 memory segment. 根据 descriptor 中的 S flag, 又细分为
 
@@ -7216,7 +7217,7 @@ system descriptor 的前 2 个描述特殊用途的 memory segment; 后 4 个叫
 
 上面的背景知识属于 x86 architecture. 下面开始 x86 interrupt 的科普。
 
-Gate descriptor 中, Task gate 用于 multi-tasking 管理, provides an indirect, protected reference to a task; Interrupt gate & trap gate 用于 interrupt 和 exception 的处理, 二者的区别是，interrupt gate 时, processor 会 clear EFLAGS register 中的 IF flag, 屏蔽 maskable external interrupt, 避免干扰当前 handler 的执行，而 trap gate 不会 clear IF flag.
+Gate descriptor 中, Task gate 用于 multi-tasking 管理, provides an indirect, protected reference to a task; Interrupt gate & trap gate are for interrupt & exception handling respectively, the difference is，interrupt gate 时, processor will clear IF flag of EFLAGS register, 屏蔽 maskable external interrupt, 避免干扰当前 handler 的执行，而 trap gate 不会 clear IF flag.
 
 IDT 可以包含三种 descriptor: Task-gate descriptor, Interrupt-gate descriptor, Trap-gate descriptor. 目前猜测 Linux kernel 都是用后 2 种 gate descriptor.
 
@@ -7301,9 +7302,12 @@ static void set_intr_gate(unsigned int n, const void *addr)
 	data.vector	= n;
 	data.addr	= addr;
 
-	/* Tips: VO 自己的 GDT 定义在 arch/x86/kernel/cpu/common.c; head_64.S 已重新 load
-	 * GDTR.
-	 * interrupt/exception handler 与普通 kernel code在同一 code segment. */
+	/* Tips: VO's GDT is defined in arch/x86/kernel/cpu/common.c; head_64.S has
+	 * loaded GDTR.
+	 *
+	 * interrupt/exception handler belongs to the same code segment as other
+	 * kernel code.
+	 */
 	data.segment	= __KERNEL_CS;
 
 	/* type 0xE, 使用 interrupt gate, Why not trap gate for exception? Interrupt
@@ -7323,7 +7327,7 @@ idt_setup_from_table(gate_desc *idt, const struct idt_data *t, int size, bool sy
 	for (; size > 0; t++, size--) {
 		/* 可以看出很简单，一对一填充 descriptor field. */
 		idt_init_desc(&desc, t);
-		/* 在非 paravirt 情况下，此函数最终仅是 memcpy 的动作*/
+		/* 在非 paravirt 情况下，此函数最终仅是 memcpy. */
 		write_idt_entry(idt, t->vector, &desc);
 		/* skip for now. */
 		if (sys)
@@ -7632,7 +7636,7 @@ A gigantic function similar to *start_kernel*. The name tells it is initializati
 
 ### spinlock
 
-early_pfn_to_nid() 中有早期的 spinlock 操作，TBD. Kernel initialization 中很少使用 spinlock, take *init_mm.page_table_lock* for example to analyse how it is implemented.
+numa_register_memblks() --> alloc_node_data() --> early_pfn_to_nid() 中有早期的 spinlock 操作，TBD. Kernel initialization 中很少使用 spinlock, take *init_mm.page_table_lock* for example to analyse how it is implemented.
 
 spinlock data structure is as following:
 
@@ -7797,45 +7801,58 @@ void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 
 ```
 
-### PERCPU variable
+### Early PerCPU variable & PerCPU variable
 
-percpu area 的初始化在 start_kernel -> setup_per_cpu_areas. 但这之前已有几处使用，如 initmem_init -> x86_numa_init -> numa_init -> early_cpu_to_node：
+Early PerCPU variable is not real PerCPU. Before PerCPU initialization, there are some cases which need PerCPU variable, which is why **ealry PerCPU** is needed.
 
+PerCPU is initialized in start_kernel() -> setup_per_cpu_areas(), which is [separately documented elsewhere](https://github.com/PinoTsao/Memo/blob/master/PerCPU.md). While early PerCPU usage takes place at, for example: initmem_init() -> x86_numa_init() -> numa_init() -> early_cpu_to_node():
+
+```c
 	early_per_cpu_ptr(x86_cpu_to_node_map)
+```
 
-再如 generic_processor_info:
+And generic_processor_info():
 
+```c
 	early_per_cpu(x86_cpu_to_apicid, cpu) = apicid;
 	early_per_cpu(x86_bios_cpu_apicid, cpu) = apicid;
-
-I.e, 在 percpu area 初始化前，也有使用 percpu variable 的需求(暂时不知是啥)，这些使用被 mark as  macro: EARLY_PER_CPU. 以上面 2 个例子分析 early percpu 的使用。
-
-Early percpu variable 的定义代码展开如下：
 ```
-/* numa.c */
-/* Kernel 代码只有一处使用这个 macro, 就是本例 = =| */
+
+Commit message of **23ca4bba3e20c6c3** gives a lot of insight of early PerCPU, which also can be read [here](http://lkml.iu.edu/hypermail/linux/kernel/0804.1/3269.html).
+
+Take **x86_cpu_to_node_map**(defined in *numa.c*) for example to see how early PerCPU is implemented.
+
+Definition:
+```c
+/* The only usage of this macro in kernel ... */
 DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
 
-/* percpu.h */
-/* Early percpu variable 的定义原来是数组[NR_CPUS]，同时定义指针 reference 它。这样的话，
- * 目测使用它的确不需要什么初始化。 The peer macro DEFINE_EARLY_PER_CPU_READ_MOSTLY
- * 除放入不同的 percpu sub-section 外，其他完全相同。*/
+/* In percpu.h */
+#ifdef CONFIG_SMP
+/* Code is self-documented except for "DEFINE_PER_CPU", but obviously it is for future
+ * real PerCPU usage, details TBD.
+ */
 #define	DEFINE_EARLY_PER_CPU(_type, _name, _initvalue)			\
 	DEFINE_PER_CPU(_type, _name) = _initvalue;			\
 	__typeof__(_type) _name##_early_map[NR_CPUS] __initdata =	\
 				{ [0 ... NR_CPUS-1] = _initvalue };	\
 	__typeof__(_type) *_name##_early_ptr __refdata = _name##_early_map
 
+#else
+
+#endif
+
 /* percpu-defs.h */
 #define DEFINE_PER_CPU(type, name)					\
 	DEFINE_PER_CPU_SECTION(type, name, "")
 
-/* __typeof__ 是 GCC 对 C 语言的扩展 keyword. */
+/* __typeof__ is GCC extension keyword for C language. */
 #define DEFINE_PER_CPU_SECTION(type, name, sec)				\
 	__PCPU_ATTRS(sec) __typeof__(type) name
 
-/* PER_CPU_ATTRIBUTES 在 x86 下为空，其他 arch 未必。 grep arch/ 发现只有 IA64 有定义。
- * __percpu 仅为 make check 用，可忽略。*/
+/* PER_CPU_ATTRIBUTES is null under x86. `grep arch/` suggests only IA64 has definition.
+ * __percpu is only for `make check`.
+ */
 #define __PCPU_ATTRS(sec)						\
 	__percpu __attribute__((section(PER_CPU_BASE_SECTION sec)))	\
 	PER_CPU_ATTRIBUTES
@@ -7844,33 +7861,34 @@ DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
 #define PER_CPU_BASE_SECTION ".data..percpu"
 ```
 
-Early percpu variable 的使用如下：
-```
-/* reference 数组的 pointer. */
+Usage:
+
+```c
 #define	early_per_cpu_ptr(_name) (_name##_early_ptr)
 
-/* 第 _idx 个数组元素的值。目测只用在 setup_per_cpu_areas 中？ */
+/* Only used in setup_per_cpu_areas(). */
 #define	early_per_cpu_map(_name, _idx) (_name##_early_map[_idx])
 
-/* 第 _cpu 个数组元素的值。功能看起来和上面这位一样，但，是代码内日常使用，如第二个示例。 Why?
- * http://lkml.iu.edu/hypermail/linux/kernel/0804.1/3269.html 中有一点线索，看起来
- * 某些 percpu variable 会在 percpu area 初始化前后都要使用。 Wait to see. */
+/* Certain early PerCPU variables will be used later in PerCPU, wait to see. */
 #define	early_per_cpu(_name, _cpu) 				\
 	*(early_per_cpu_ptr(_name) ?				\
 		&early_per_cpu_ptr(_name)[_cpu] :		\
 		&per_cpu(_name, _cpu))
 
 ```
-Early PERCPU variable 的定义&使用就是这样简单。
 
-Then, time for the real percpu initialization: **setup_per_cpu_areas**. 函数入口的 log 引出另一个 tiny topic: kernel 关于 CPU number 的诸多 variable & macro 之间的区别?
+As the code shows, early PERCPU variable's definition & usage is pretty simple.
 
+Another tiny topic arises seeing log at the start of **setup_per_cpu_areas()**: difference & relationship among many variables & macros about CPU number?
+
+```c
 	/* threads.h */
 	#define NR_CPUS		CONFIG_NR_CPUS
-
-CONFIG_NR_CPUS 定义在 autoconf.h, (明显 autoconf.h 不用作直接 `#include`) **NR_CPUS** 是它的替身，表示 kernel 配置支持的最大 CPU 数量； **nr_cpu_ids** 是变量，对应 kernel parameter "nr_cpus=", 初始化后期根据系统实际情况被修改为系统(hardware)支持的实际 CPU 数量； **nr_cpumask_bits** 因 CONFIG_CPUMASK_OFFSTACK 而存在， cpumask_t 变量的 size 太大(NR_CPUS)，用作局部变量时，占用 stack 太多，所以 `typedef struct cpumask *cpumask_var_t;` 可节约 stack, 这也许就是 "off stack" 的含义。
-
 ```
+
+CONFIG_NR_CPUS 定义在 autoconf.h, (明显 autoconf.h 不用作直接 `#include`) **NR_CPUS** 是它的替身，表示 kernel 配置支持的最大 CPU 数量； **nr_cpu_ids** 是变量，对应 kernel early parameter "nr_cpus=", 初始化后期根据系统实际情况被修改为系统(hardware)支持的实际 CPU 数量； **nr_cpumask_bits** 因 CONFIG_CPUMASK_OFFSTACK 而存在， cpumask_t 变量的 size 太大(NR_CPUS)，用作局部变量时，占用 stack 太多，所以 `typedef struct cpumask *cpumask_var_t;` 可节约 stack, 这也许就 "off stack" 的含义。
+
+```c
 #ifdef CONFIG_CPUMASK_OFFSTACK
 	/* Assuming NR_CPUS is huge, a runtime limit is more efficient.  Also,
 	 * not all bits may be allocated. */
@@ -7879,146 +7897,7 @@ CONFIG_NR_CPUS 定义在 autoconf.h, (明显 autoconf.h 不用作直接 `#includ
 	#define nr_cpumask_bits	((unsigned int)NR_CPUS)
 #endif
 ```
-CONFIG_CPUMASK_OFFSTACK 实现细节待分析。
-
-```c
-/* arch/x86/kernel/setup_percpu.c */
-/* Background Knowledge: head comments in mm/percpu.c */
-
-void __init setup_per_cpu_areas(void)
-{
-	unsigned int cpu;
-	unsigned long delta;
-	int rc;
-
-	pr_info("NR_CPUS:%d nr_cpumask_bits:%d nr_cpu_ids:%u nr_node_ids:%u\n",
-		NR_CPUS, nr_cpumask_bits, nr_cpu_ids, nr_node_ids);
-
-	/*
-	 * Allocate percpu area.  Embedding allocator is our favorite;
-	 * however, on NUMA configurations, it can result in very
-	 * sparse unit mapping and vmalloc area isn't spacious enough
-	 * on 32bit.  Use page in that case.
-	 */
-#ifdef CONFIG_X86_32
-...
-#endif
-
-	/* According to f58dc01ba2ca, FC abbreviates First Chunk.*/
-	rc = -EINVAL;
-	if (pcpu_chosen_fc != PCPU_FC_PAGE) {
-		const size_t dyn_size = PERCPU_MODULE_RESERVE +
-			PERCPU_DYNAMIC_RESERVE - PERCPU_FIRST_CHUNK_RESERVE;
-		size_t atom_size;
-
-		/*
-		 * On 64bit, use PMD_SIZE for atom_size so that embedded
-		 * percpu areas are aligned to PMD.  This, in the future,
-		 * can also allow using PMD mappings in vmalloc area.  Use
-		 * PAGE_SIZE on 32bit as vmalloc space is highly contended
-		 * and large vmalloc area allocs can easily fail.
-		 */
-#ifdef CONFIG_X86_64
-		atom_size = PMD_SIZE;
-#else
-		atom_size = PAGE_SIZE;
-#endif
-		rc = pcpu_embed_first_chunk(PERCPU_FIRST_CHUNK_RESERVE,
-					    dyn_size, atom_size,
-					    pcpu_cpu_distance,
-					    pcpu_fc_alloc, pcpu_fc_free);
-		if (rc < 0)
-			pr_warning("%s allocator failed (%d), falling back to page size\n",
-				   pcpu_fc_names[pcpu_chosen_fc], rc);
-	}
-	if (rc < 0)
-		rc = pcpu_page_first_chunk(PERCPU_FIRST_CHUNK_RESERVE,
-					   pcpu_fc_alloc, pcpu_fc_free,
-					   pcpup_populate_pte);
-	if (rc < 0)
-		panic("cannot initialize percpu area (err=%d)", rc);
-
-	/* alrighty, percpu areas up and running */
-	delta = (unsigned long)pcpu_base_addr - (unsigned long)__per_cpu_start;
-	for_each_possible_cpu(cpu) {
-		per_cpu_offset(cpu) = delta + pcpu_unit_offsets[cpu];
-		per_cpu(this_cpu_off, cpu) = per_cpu_offset(cpu);
-		per_cpu(cpu_number, cpu) = cpu;
-		setup_percpu_segment(cpu);
-		setup_stack_canary_segment(cpu);
-		/*
-		 * Copy data used in early init routines from the
-		 * initial arrays to the per cpu data areas.  These
-		 * arrays then become expendable and the *_early_ptr's
-		 * are zeroed indicating that the static arrays are
-		 * gone.
-		 */
-#ifdef CONFIG_X86_LOCAL_APIC
-		per_cpu(x86_cpu_to_apicid, cpu) =
-			early_per_cpu_map(x86_cpu_to_apicid, cpu);
-		per_cpu(x86_bios_cpu_apicid, cpu) =
-			early_per_cpu_map(x86_bios_cpu_apicid, cpu);
-		per_cpu(x86_cpu_to_acpiid, cpu) =
-			early_per_cpu_map(x86_cpu_to_acpiid, cpu);
-#endif
-#ifdef CONFIG_X86_32
-		per_cpu(x86_cpu_to_logical_apicid, cpu) =
-			early_per_cpu_map(x86_cpu_to_logical_apicid, cpu);
-#endif
-#ifdef CONFIG_NUMA
-		per_cpu(x86_cpu_to_node_map, cpu) =
-			early_per_cpu_map(x86_cpu_to_node_map, cpu);
-		/*
-		 * Ensure that the boot cpu numa_node is correct when the boot
-		 * cpu is on a node that doesn't have memory installed.
-		 * Also cpu_up() will call cpu_to_node() for APs when
-		 * MEMORY_HOTPLUG is defined, before per_cpu(numa_node) is set
-		 * up later with c_init aka intel_init/amd_init.
-		 * So set them all (boot cpu and all APs).
-		 */
-		set_cpu_numa_node(cpu, early_cpu_to_node(cpu));
-#endif
-		/*
-		 * Up to this point, the boot CPU has been using .init.data
-		 * area.  Reload any changed state for the boot CPU.
-		 */
-		if (!cpu)
-			switch_to_new_gdt(cpu);
-	}
-
-	/* indicate the early static arrays will soon be gone */
-#ifdef CONFIG_X86_LOCAL_APIC
-	early_per_cpu_ptr(x86_cpu_to_apicid) = NULL;
-	early_per_cpu_ptr(x86_bios_cpu_apicid) = NULL;
-	early_per_cpu_ptr(x86_cpu_to_acpiid) = NULL;
-#endif
-#ifdef CONFIG_X86_32
-	early_per_cpu_ptr(x86_cpu_to_logical_apicid) = NULL;
-#endif
-#ifdef CONFIG_NUMA
-	early_per_cpu_ptr(x86_cpu_to_node_map) = NULL;
-#endif
-
-	/* Setup node to cpumask map */
-	setup_node_to_cpumask_map();
-
-	/* Setup cpu initialized, callin, callout masks */
-	setup_cpu_local_masks();
-
-	/*
-	 * Sync back kernel address range again.  We already did this in
-	 * setup_arch(), but percpu data also needs to be available in
-	 * the smpboot asm.  We can't reliably pick up percpu mappings
-	 * using vmalloc_fault(), because exception dispatch needs
-	 * percpu data.
-	 *
-	 * FIXME: Can the later sync in setup_cpu_entry_areas() replace
-	 * this call?
-	 */
-	sync_initial_page_table();
-}
-
-```
+CONFIG_CPUMASK_OFFSTACK to be analyzed.
 
 ## APPENDIX
 
