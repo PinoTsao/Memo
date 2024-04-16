@@ -71,7 +71,7 @@ will show
 
 Function **mcount** is from glibc, and the profiling work is done in it.
 
-ftrace works the same way by providing a equivalent tracer function as **mcount**, one can do any tracing work in this function except tracing function call, even for live patching.
+ftrace works the same way by providing a equivalent tracer function as **mcount**, one can do any tracing work in this function besides tracing function call, even for live patching.
 
 The technical knowledge above provides a general idea Linux ftrace depends on. Concretely, x86_64  actually uses following GCC flags for ftrace:
 
@@ -775,7 +775,7 @@ static int ftrace_process_locs(struct module *mod,
 
 	/* [FNST] Involves complicated page count calculation, the intention is,
 	 * as its comments said: to fill as much record as possible in one continuous
-	 * memory allocation, waste as little as memory as possible.
+	 * memory allocation, waste as little memory as possible.
 	 */
 	start_pg = ftrace_allocate_pages(count);
 	if (!start_pg)
